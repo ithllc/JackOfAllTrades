@@ -1,0 +1,62 @@
+﻿Product Requirements Document (PRD): JackOfAllTrades
+Product Name: JackOfAllTrades Target Platform: Progressive Web App (PWA) via Google Cloud Run License: AGPL-3.0 (Affero General Public License) - The strictest open-source license, requiring anyone who modifies and hosts the software over a network to also release their full source code.
+1. Vision & Problem Statement Hardware brands and DIY consumers suffer from a severe physical knowledge gap. Assembly manuals are static, and human support is expensive. JackOfAllTrades is an autonomous, open-source PWA that leverages WebRTC and the Gemini 4 API to visually diagnose physical problems, guide assemblies, and prevent human error in real-time, utilizing a self-updating physical interaction graph.
+2. Core Features
+* Universal Access: PWA architecture enabling access across iOS, Android, and WebXR-enabled smart glasses without app store friction.
+* Adaptive Media Ingest: Real-time WebRTC streaming that gracefully downgrades to high-contrast burst photography when device thermal limits or bandwidth constraints are reached.
+* Zero-Token Decision Routing: Integration with Gemini Decisions API to monitor streams for physical cues (e.g., lack of hand movement, hazard proximity) before waking the heavier reasoning models.
+* Live Spatial Output: Generates Picture-in-Picture (PiP) video loops or WebXR bounding boxes to show users exactly how to manipulate the object in their frame.
+* Graph-Driven Feedback Loop: User corrections to AI diagnoses automatically update a relational ontology graph, immediately improving fleet-wide reasoning via Retrieval-Augmented Generation (RAG).
+3. Flywheel Mechanisms
+* Data: Every user correction builds the custom ontology graph. The more edge cases JackOfAllTrades sees, the more robust its diagnostic capabilities become across all users.
+* Revenue (B2B2C): Brands sponsor specific product manuals in the system. The platform charges a bounty (e.g., $30) for every successful assembly or repair that averts a customer support call or hardware return.
+Architecture Decision Record (ADR)
+ADR 001: Selection of Knowledge Graph Database
+* Context: JackOfAllTrades requires a relational ontology graph to map visual signatures, physical components, and corrective actions. The previous iteration used Neo4j, but the current open-source constraints require moving to a standard relational database.
+* Decision: We will use PostgreSQL.
+* Rationale: PostgreSQL supports recursive Common Table Expressions (CTEs) to traverse tree/graph relationships natively. Furthermore, using the pgvector extension allows us to store Gemini 4's multimodal embeddings right alongside the graph ontology. This satisfies the graph requirement without the overhead of a dedicated graph database like Neo4j, while playing perfectly with Google Cloud Run's stateless nature (unlike SQLite, which would require managing persistent disk volumes).
+ADR 002: Infrastructure & Compute
+* Context: The app must scale from zero, handle real-time WebRTC streams, and interface with Gemini 4.
+* Decision: We will deploy a containerized Node.js/Express backend and React PWA frontend to Google Cloud Run.
+* Rationale: Cloud Run provides auto-scaling down to zero (saving costs) and handles WebSockets/WebRTC signaling natively.
+ADR 003: Model Routing Strategy
+* Context: Continuous video streaming to a heavy LLM causes context bloat and massive API costs.
+* Decision: Implement a WebAssembly (Wasm) motion-detection script on the client. Only stream to the Gemini Decisions API (gemini-decision-1) when user hesitation is detected. Only trigger gemini-4-neon when the Decisions API flags a critical step.
+Technical Implementation Document
+1. System Architecture
+* Frontend (PWA): React with Vite. Uses the browser's MediaDevices API for WebRTC/Camera access and WebXR API for AR overlay rendering.
+* Backend (API & Signaling): Node.js with Express. Acts as a proxy to the Gemini API (protecting the API keys) and handles WebRTC signaling.
+* Database (Ontology & Memory): PostgreSQL (managed via Google Cloud SQL or a self-hosted Docker container) using recursive CTEs for hierarchical component mapping and pgvector for embedding search.
+2. PostgreSQL Ontology Schema (Simplified)
+
+
+
+
+
+
+SQL
+CREATE TABLE components (
+   id SERIAL PRIMARY KEY,
+   name VARCHAR(255) NOT NULL,
+   visual_signature_embedding vector(768),
+   parent_id INT REFERENCES components(id) -- Enables Graph/Tree traversal
+);
+
+CREATE TABLE repair_actions (
+   id SERIAL PRIMARY KEY,
+   component_id INT REFERENCES components(id),
+   action_type VARCHAR(50), -- e.g., 'tighten', 'replace'
+   tool_required VARCHAR(100),
+   success_rate DECIMAL
+);
+
+3. Test Cases (Quality Assurance)
+Test Case 1: Adaptive Degradation
+* Action: Throttle device network speed to 3G in Chrome DevTools. Start a JackOfAllTrades session.
+* Expected Result: The PWA detects high latency, drops the WebRTC video stream, and prompts the user via audio to take three still burst photos.
+Test Case 2: Ontology Graph Feedback Loop
+* Action: Show the camera an M4 screw. The AI misidentifies it as an M6 screw. Tap the bounding box and correct it to "M4".
+* Expected Result: A POST request is sent to the backend. The PostgreSQL database updates the visual_signature_embedding for the M4 component. A subsequent scan of the exact same screw by a different simulated user correctly identifies it as M4 based on the RAG query.
+Test Case 3: Decisions API Routing
+* Action: Point the camera at a stationary engine block while keeping hands completely still for 5 seconds.
+* Expected Result: Client-side Wasm triggers a payload to gemini-decision-1. The API returns a boolean true for "user stalled". The backend then routes the 15-second buffer to gemini-4-neon to generate the next instruction.

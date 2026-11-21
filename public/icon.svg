@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="96" fill="#0D1117"/>
+  <rect x="36" y="36" width="440" height="440" rx="68" stroke="#30363D" stroke-width="6"/>
+  <!-- Calibrated optical viewfinder corners -->
+  <path d="M116 176V132C116 123.163 123.163 116 132 116H176" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
+  <path d="M396 176V132C396 123.163 388.837 116 380 116H336" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
+  <path d="M116 336V380C116 388.837 123.163 396 132 396H176" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
+  <path d="M396 336V380C396 388.837 388.837 396 380 396H336" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
+  <!-- Precision hex fastener + caliper axis -->
+  <polygon points="256,162 337,209 337,303 256,350 175,303 175,209" stroke="#F8FAFC" stroke-width="16" stroke-linejoin="round" fill="#161B22"/>
+  <circle cx="256" cy="256" r="38" stroke="#F59E0B" stroke-width="16"/>
+  <line x1="256" y1="194" x2="256" y2="218" stroke="#F59E0B" stroke-width="10" stroke-linecap="round"/>
+  <line x1="256" y1="294" x2="256" y2="318" stroke="#F59E0B" stroke-width="10" stroke-linecap="round"/>
+</svg>

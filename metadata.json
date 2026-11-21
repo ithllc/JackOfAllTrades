@@ -1,0 +1,6 @@
+{
+  "name": "JackOfAllTrades",
+  "description": "Open-source AGPL-3.0 Progressive Web App visual assistant for physical assembly, repair, and diagnostics powered by WebRTC, PostgreSQL pgvector ontology graphs, and the Gemini 4 API.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
