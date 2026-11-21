@@ -1,6 +1,7 @@
-# JackOfAllTrades (MakerLens) — System Architecture Blueprint
+# Jack of All Trades — System Architecture Blueprint
 
 **License:** GNU Affero General Public License v3.0 (`AGPL-3.0-only`)  
+**Brand Mark:** Jack of Spades playing card emblem with the Jack holding a claw hammer (`BrandMark.tsx` / `public/icon.svg`)  
 **Target Platform:** Progressive Web App (PWA) on Google Cloud Run + Cloud SQL for PostgreSQL (`pgvector`)  
 **AI Stack:** Gemini Decisions API (`gemini-decision-1`) · `gemini-4-neon` · `gemini-3.8-flash-lite-tts` · `gemini-omni-1.2-flash` · `gemini-embedding-2`
 
@@ -10,7 +11,7 @@
 
 ```mermaid
 flowchart TB
-    subgraph Client["MakerLens Universal PWA Client (iOS Safari · Android Chrome · WebXR Glasses)"]
+    subgraph Client["Jack of All Trades Universal PWA Client (iOS Safari · Android Chrome · WebXR Glasses)"]
         DEMO["Interactive DemoMode\nFirst-Visit Safe Onboarding"]
         CAM["MediaDevices API\nFull-Screen Magic Window Camera + Torch"]
         MIC["Push-to-Talk MediaRecorder\nHold to Explain (WebM Opus / MP4)"]
@@ -76,7 +77,7 @@ flowchart TB
 
 ## 2. Zero-Token Decision Routing & 15-Second Buffer Sequence (ADR 003 · Test Case 3)
 
-Continuous 1080p video streaming into a heavy reasoning model causes mobile browser thermal throttling (Break 1) and excessive token spend. JackOfAllTrades gates every continuous-scan inference call through three progressively heavier tiers:
+Continuous 1080p video streaming into a heavy reasoning model causes mobile browser thermal throttling (Break 1) and excessive token spend. Jack of All Trades gates every continuous-scan inference call through three progressively heavier tiers:
 
 1. **Tier 0 (On-Device Wasm Motion Detector):** Computes grayscale pixel delta at 2 Hz. Stays silent while hands are actively moving; emits a trigger only after ≥3.0 seconds of stillness (hesitation) or explicit user tap.
 2. **Tier 1 (`gemini-decision-1` — Zero Output Tokens):** Evaluates the 15-second ring buffer with parallel calibrated `noul` checks (`user_stalled`, `hazard_proximity`, `alignment_anomaly`, `visual_noise_extreme`). Produces `0` output tokens.
@@ -85,7 +86,7 @@ Continuous 1080p video streaming into a heavy reasoning model causes mobile brow
 ```mermaid
 sequenceDiagram
     autonumber
-    participant User as User (MakerLens PWA)
+    participant User as User (Jack of All Trades PWA)
     participant Wasm as Client Wasm Motion Gate
     participant API as Cloud Run Express Proxy
     participant Dec as gemini-decision-1 (v1beta)
@@ -123,7 +124,7 @@ sequenceDiagram
 
 ## 3. Native Two-Way Multilingual Voice Pipeline (ADR 004)
 
-MakerLens enables hands-free troubleshooting in any language through the **"Hold to Explain"** push-to-talk control on the Magic Window camera UI (`LiveCameraView.tsx` / `App.jsx`). The backend (`POST /api/voice-assist` in `server.ts` and `server.js`) automatically detects the exact spoken language from the raw microphone audio and synthesizes the spoken mechanic response in that same language—never forcing English.
+Jack of All Trades enables hands-free troubleshooting in any language through the **"Hold to Explain"** push-to-talk control on the Magic Window camera UI (`LiveCameraView.tsx` / `App.jsx`). The backend (`POST /api/voice-assist` in `server.ts` and `server.js`) automatically detects the exact spoken language from the raw microphone audio and synthesizes the spoken mechanic response in that same language—never forcing English.
 
 ### Encoding, Detection & Synthesis Flow
 
@@ -143,7 +144,7 @@ MakerLens enables hands-free troubleshooting in any language through the **"Hold
 sequenceDiagram
     autonumber
     participant User as User (Hold to Explain)
-    participant PWA as MakerLens PWA (MediaRecorder + <audio>)
+    participant PWA as Jack of All Trades PWA (MediaRecorder + <audio>)
     participant API as Express POST /api/voice-assist
     participant Neon as gemini-4-neon (Structured JSON)
     participant TTS as gemini-3.8-flash-lite-tts

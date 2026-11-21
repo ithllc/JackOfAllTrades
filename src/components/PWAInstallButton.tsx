@@ -50,7 +50,7 @@ export const PWAInstallButton: React.FC = () => {
             <div className="w-full max-w-sm rounded-xl border border-slate-200 bg-white p-6 shadow-xl">
               <div className="flex items-start justify-between gap-4">
                 <h3 id="ios-install-title" className="text-base font-semibold text-slate-900">
-                  Install JackOfAllTrades on iOS
+                  Install Jack of All Trades on iOS
                 </h3>
                 <button
                   type="button"
@@ -64,7 +64,7 @@ export const PWAInstallButton: React.FC = () => {
               <ol className="mt-3 space-y-2 text-sm text-slate-600 list-decimal pl-5">
                 <li>Tap the <strong>Share</strong> button in the Safari toolbar.</li>
                 <li>Scroll down and choose <strong>Add to Home Screen</strong>.</li>
-                <li>Launch JackOfAllTrades full-screen offline from your home screen.</li>
+                <li>Launch Jack of All Trades full-screen offline from your home screen.</li>
               </ol>
               <button
                 type="button"

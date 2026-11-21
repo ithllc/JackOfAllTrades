@@ -15,9 +15,9 @@ export default defineConfig(() => {
         includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
         manifest: {
           id: '/',
-          name: 'JackOfAllTrades — Visual Repair & Assembly Assistant',
-          short_name: 'JackTrades',
-          description: 'Open-source AGPL-3.0 PWA for real-time visual hardware diagnostics, adaptive burst capture, and spatial repair guidance.',
+          name: 'Jack of All Trades — Visual Repair & Assembly Assistant',
+          short_name: 'Jack of All Trades',
+          description: 'Open-source AGPL-3.0 PWA for real-time visual hardware diagnostics, multilingual voice repair assistance, and spatial repair guidance.',
           theme_color: '#0D1117',
           background_color: '#F7F8FA',
           display: 'standalone',

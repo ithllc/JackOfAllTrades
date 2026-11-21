@@ -1,14 +1,29 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
-  <rect width="512" height="512" rx="96" fill="#0D1117"/>
-  <rect x="36" y="36" width="440" height="440" rx="68" stroke="#30363D" stroke-width="6"/>
-  <!-- Calibrated optical viewfinder corners -->
-  <path d="M116 176V132C116 123.163 123.163 116 132 116H176" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
-  <path d="M396 176V132C396 123.163 388.837 116 380 116H336" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
-  <path d="M116 336V380C116 388.837 123.163 396 132 396H176" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
-  <path d="M396 336V380C396 388.837 388.837 396 380 396H336" stroke="#F59E0B" stroke-width="18" stroke-linecap="round"/>
-  <!-- Precision hex fastener + caliper axis -->
-  <polygon points="256,162 337,209 337,303 256,350 175,303 175,209" stroke="#F8FAFC" stroke-width="16" stroke-linejoin="round" fill="#161B22"/>
-  <circle cx="256" cy="256" r="38" stroke="#F59E0B" stroke-width="16"/>
-  <line x1="256" y1="194" x2="256" y2="218" stroke="#F59E0B" stroke-width="10" stroke-linecap="round"/>
-  <line x1="256" y1="294" x2="256" y2="318" stroke="#F59E0B" stroke-width="10" stroke-linecap="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <rect width="128" height="128" rx="28" fill="#0D1117"/>
+  <rect x="24" y="12" width="80" height="104" rx="10" fill="#FAF6EE" stroke="#111318" stroke-width="3"/>
+  <rect x="33" y="22" width="62" height="84" rx="4" fill="none" stroke="#111318" stroke-width="2.5"/>
+  <!-- Top-left J & Spade -->
+  <text x="29" y="31" font-family="Georgia, serif" font-size="14" font-weight="700" fill="#111318">J</text>
+  <path d="M34 34 C30 39 29 42 34 43 C39 42 38 39 34 34 Z M33 43 L35 43 L35.8 47 L32.2 47 Z" fill="#111318"/>
+  <!-- Jack Court Portrait Silhouette -->
+  <path d="M46 41 L54 34 L64 38 L74 34 L82 41 L78 48 L50 48 Z" fill="#2A333D" stroke="#111318" stroke-width="2"/>
+  <circle cx="64" cy="34" r="3" fill="#D4A13E" stroke="#111318" stroke-width="1.5"/>
+  <ellipse cx="64" cy="56" rx="10" ry="10.5" fill="#FAF6EE" stroke="#111318" stroke-width="2"/>
+  <circle cx="60.5" cy="54.5" r="1.4" fill="#111318"/>
+  <circle cx="67.5" cy="54.5" r="1.4" fill="#111318"/>
+  <path d="M61 60 Q64 62 67 60" stroke="#111318" stroke-width="1.5" stroke-linecap="round"/>
+  <!-- Craftsman Tunic -->
+  <path d="M43 96 C43 76 51 67 64 67 C77 67 85 76 85 96 Z" fill="#1F2937" stroke="#111318" stroke-width="2"/>
+  <path d="M56 68 L64 95 L72 68" fill="#111318" stroke="#D4A13E" stroke-width="2"/>
+  <!-- Raised Claw Hammer in Jack's Hand -->
+  <rect x="77" y="54" width="5" height="32" rx="2" fill="#C4923B" stroke="#111318" stroke-width="1.8"/>
+  <path d="M68 48 H87 C90 48 93 52 91 57 L85 54 H68 Z" fill="#6B7280" stroke="#111318" stroke-width="1.8" stroke-linejoin="round"/>
+  <circle cx="79.5" cy="76" r="5" fill="#FAF6EE" stroke="#111318" stroke-width="1.8"/>
+  <!-- Accent Spade inside portrait -->
+  <path d="M46 52 C41 58 40 62 46 63 C52 62 51 58 46 52 Z M44.8 63 L47.2 63 L48.2 67.5 L43.8 67.5 Z" fill="#111318"/>
+  <!-- Bottom-right inverted J & Spade -->
+  <g transform="rotate(180 94 97)">
+    <text x="90" y="96" font-family="Georgia, serif" font-size="14" font-weight="700" fill="#111318">J</text>
+    <path d="M94 99 C90 104 89 107 94 108 C99 107 98 104 94 99 Z M93 108 L95 108 L95.8 112 L92.2 112 Z" fill="#111318"/>
+  </g>
 </svg>

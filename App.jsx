@@ -421,18 +421,32 @@ function DemoMode({ onComplete }) {
       <div className="pointer-events-none absolute inset-x-0 top-0 h-32 bg-gradient-to-b from-black/80 via-black/35 to-transparent" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-44 bg-gradient-to-t from-black/85 via-black/40 to-transparent" />
 
-      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between px-5 pt-5 sm:px-8 sm:pt-6">
-        <div className="flex flex-col">
-          <span className="text-lg font-bold tracking-tight text-white">MakerLens</span>
-          <span className="text-xs text-neutral-300">Quick Interactive Practice</span>
+      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-2 px-4 pt-5 sm:px-8 sm:pt-6">
+        <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
+          <img
+            src="/src/assets/images/jack_of_spades_logo_1795301467945.jpg"
+            alt="Jack of All Trades logo — Jack of Spades card holding a hammer"
+            referrerPolicy="no-referrer"
+            className="h-10 w-[30px] sm:h-11 sm:w-[33px] shrink-0 rounded-[5px] border border-white/30 object-cover shadow-md shadow-black/50"
+          />
+          <div className="flex flex-col min-w-0">
+            <span className="text-[15px] sm:text-lg font-bold tracking-tight text-white leading-tight whitespace-nowrap">
+              Jack of All Trades
+            </span>
+            <span className="text-[11px] sm:text-xs text-neutral-300 leading-tight whitespace-nowrap">
+              Practice Guide
+            </span>
+          </div>
         </div>
 
         <button
           type="button"
           onClick={onComplete}
-          className="inline-flex min-h-[44px] items-center gap-1.5 rounded-full bg-black/55 border border-white/15 px-4 py-2 text-xs font-semibold text-white backdrop-blur-md hover:bg-white/15 transition-colors whitespace-nowrap"
+          aria-label="Skip to Live Camera"
+          className="inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded-full bg-black/55 border border-white/15 px-3.5 sm:px-4 py-2 text-xs font-semibold text-white backdrop-blur-md hover:bg-white/15 transition-colors whitespace-nowrap"
         >
-          Skip to Camera
+          <span className="sm:hidden">Skip</span>
+          <span className="hidden sm:inline">Skip to Camera</span>
           <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
         </button>
       </header>
@@ -838,9 +852,19 @@ function LiveCameraView({
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-28 bg-gradient-to-b from-black/75 via-black/30 to-transparent" />
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-44 bg-gradient-to-t from-black/85 via-black/40 to-transparent" />
 
-      {/* Top Control: Strictly Flashlight Toggle */}
-      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between px-5 pt-5 sm:px-8 sm:pt-6">
-        <span className="text-base font-bold tracking-tight text-white/95">MakerLens</span>
+      {/* Top Control: Brand Logo + Flashlight Toggle */}
+      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-3 px-5 pt-5 sm:px-8 sm:pt-6">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <img
+            src="/src/assets/images/jack_of_spades_logo_1795301467945.jpg"
+            alt="Jack of All Trades logo — Jack of Spades card holding a hammer"
+            referrerPolicy="no-referrer"
+            className="h-9 w-[27px] shrink-0 rounded-[5px] border border-white/30 object-cover shadow-md shadow-black/50"
+          />
+          <span className="text-base font-bold tracking-tight text-white/95 whitespace-nowrap truncate">
+            Jack of All Trades
+          </span>
+        </div>
         <button
           type="button"
           onClick={onToggleFlashlight}

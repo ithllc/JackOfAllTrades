@@ -1,5 +1,5 @@
 import React from 'react';
-import { CheckCircle2, Play, RotateCcw, Wrench, X } from 'lucide-react';
+import { CheckCircle2, Play, RotateCcw, Volume2, VolumeX, Wrench, X } from 'lucide-react';
 import type { HighlightHotspot } from '../lib/makerLensState';
 
 interface InstructionSheetProps {
@@ -11,11 +11,23 @@ interface InstructionSheetProps {
   motionVideoUrl?: string | null;
   loadingMotionVideo?: boolean;
   onRequestMotionVideo?: () => void;
+  /** Optional 1-based step currently being narrated aloud so text & voice stay in sync */
+  activeStepNumber?: number | null;
+  /** Whether guided voice narration is actively speaking */
+  isSpeaking?: boolean;
+  /** Whether guided voice narration is muted */
+  isAudioMuted?: boolean;
+  /** Toggle guided voice narration on/off */
+  onToggleAudio?: () => void;
+  /** Replay or jump narration to a specific step when tapped */
+  onSelectStep?: (stepNumber: number) => void;
 }
 
 /**
  * Accessible iOS-style bottom sheet presenting plain-English, step-by-step
  * repair instructions once the user taps a highlighted area.
+ * During guided demo narration, highlights the active step in lockstep with
+ * spoken audio and allows tapping any step to replay its voice instruction.
  */
 export const InstructionSheet: React.FC<InstructionSheetProps> = ({
   hotspot,
@@ -26,6 +38,11 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
   motionVideoUrl,
   loadingMotionVideo = false,
   onRequestMotionVideo,
+  activeStepNumber = null,
+  isSpeaking = false,
+  isAudioMuted = false,
+  onToggleAudio,
+  onSelectStep,
 }) => {
   return (
     <div
@@ -40,12 +57,16 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
           <span className="h-1 w-10 rounded-full bg-white/25" />
         </div>
 
-        <div className="px-5 pt-2 pb-5 sm:px-6 sm:pb-6 max-h-[75dvh] overflow-y-auto">
+        <div className="px-5 pt-2 pb-5 sm:px-6 sm:pb-6 max-h-[70dvh] overflow-y-auto">
           {/* Header Row */}
-          <div className="flex items-start justify-between gap-4">
-            <div>
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
               <p className="text-xs font-medium text-amber-400">
-                {isDemo ? 'Guided Practice · Step-by-Step' : 'Repair Guide'}
+                {isDemo
+                  ? isSpeaking && activeStepNumber
+                    ? `Interactive Demo · Speaking Step ${activeStepNumber} of ${hotspot.steps.length}`
+                    : 'Interactive Demo · Step-by-Step Guide'
+                  : 'Repair Guide'}
               </p>
               <h2
                 id="instruction-sheet-title"
@@ -55,14 +76,36 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
               </h2>
             </div>
 
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label="Close instructions"
-              className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400"
-            >
-              <X className="h-5 w-5" aria-hidden="true" />
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {isDemo && onToggleAudio && (
+                <button
+                  type="button"
+                  onClick={onToggleAudio}
+                  aria-label={isAudioMuted ? 'Unmute guided demo voice' : 'Mute guided demo voice'}
+                  aria-pressed={!isAudioMuted}
+                  className={`flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 ${
+                    isAudioMuted
+                      ? 'bg-white/10 text-neutral-400 hover:bg-white/20 hover:text-white'
+                      : 'bg-amber-400/20 text-amber-300 border border-amber-400/40 hover:bg-amber-400/30'
+                  }`}
+                >
+                  {isAudioMuted ? (
+                    <VolumeX className="h-4 w-4" aria-hidden="true" />
+                  ) : (
+                    <Volume2 className="h-4 w-4" aria-hidden="true" />
+                  )}
+                </button>
+              )}
+
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close instructions"
+                className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20 transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400"
+              >
+                <X className="h-5 w-5" aria-hidden="true" />
+              </button>
+            </div>
           </div>
 
           <p className="mt-2.5 text-sm leading-relaxed text-neutral-200">
@@ -91,25 +134,81 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
             </div>
           )}
 
-          {/* Numbered Steps */}
-          <ol className="mt-4 space-y-3.5">
-            {hotspot.steps.map((step) => (
-              <li key={step.number} className="flex items-start gap-3">
-                <span className="mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-amber-400 text-xs font-bold text-neutral-950 tabular-nums">
-                  {step.number}
-                </span>
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-white">{step.title}</p>
-                  <p className="mt-0.5 text-xs leading-relaxed text-neutral-300">
-                    {step.detail}
-                  </p>
-                </div>
-              </li>
-            ))}
+          {/* Numbered Steps — Synchronized with Guided Audio */}
+          <ol className="mt-4 space-y-2.5">
+            {hotspot.steps.map((step) => {
+              const isActive = activeStepNumber === step.number;
+              const isCompleted =
+                activeStepNumber !== null && step.number < activeStepNumber;
+
+              const rowClasses = `flex w-full items-start gap-3 rounded-2xl px-3 py-2.5 text-left transition-all duration-200 ${
+                isActive
+                  ? 'bg-amber-400/14 border border-amber-400/60 shadow-sm'
+                  : 'border border-transparent hover:bg-white/5'
+              }`;
+
+              const content = (
+                <>
+                  <span
+                    className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-xs font-bold tabular-nums transition-colors ${
+                      isActive
+                        ? 'bg-amber-400 text-neutral-950'
+                        : isCompleted
+                          ? 'bg-emerald-400/90 text-neutral-950'
+                          : 'bg-white/15 text-white'
+                    }`}
+                  >
+                    {step.number}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-2">
+                      <p
+                        className={`text-sm font-semibold ${
+                          isActive ? 'text-amber-200' : 'text-white'
+                        }`}
+                      >
+                        {step.title}
+                      </p>
+                      {isActive && isSpeaking && !isAudioMuted && (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-300 whitespace-nowrap shrink-0">
+                          <Volume2 className="h-3.5 w-3.5" aria-hidden="true" />
+                          Speaking
+                        </span>
+                      )}
+                    </div>
+                    <p
+                      className={`mt-0.5 text-xs leading-relaxed ${
+                        isActive ? 'text-neutral-100' : 'text-neutral-300'
+                      }`}
+                    >
+                      {step.detail}
+                    </p>
+                  </div>
+                </>
+              );
+
+              return (
+                <li key={step.number}>
+                  {onSelectStep ? (
+                    <button
+                      type="button"
+                      onClick={() => onSelectStep(step.number)}
+                      aria-current={isActive ? 'step' : undefined}
+                      aria-label={`Play audio for step ${step.number}: ${step.title}`}
+                      className={`${rowClasses} cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400`}
+                    >
+                      {content}
+                    </button>
+                  ) : (
+                    <div className={rowClasses}>{content}</div>
+                  )}
+                </li>
+              );
+            })}
           </ol>
 
           {/* Bottom Actions */}
-          <div className="mt-6 flex flex-col gap-2.5 sm:flex-row">
+          <div className="mt-5 flex flex-col gap-2.5 sm:flex-row">
             {!isDemo && onRequestMotionVideo && !motionVideoUrl && (
               <button
                 type="button"

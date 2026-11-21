@@ -1,7 +1,7 @@
-# JackOfAllTrades (MakerLens) — Production Operations Runbook
+# Jack of All Trades — Production Operations Runbook
 
 **License:** GNU Affero General Public License v3.0 (`AGPL-3.0-only`)  
-**Maintainers:** JackOfAllTrades / MakerLens Open-Source Engineering  
+**Maintainers:** Jack of All Trades Open-Source Engineering  
 **Runtime Stack:** Google Cloud Run (Node.js 22 / Express) · Google Cloud SQL (PostgreSQL 16 + `pgvector`) · Gemini 4 API (`@google/genai >= 2.4.0` / `gemini-4-neon`, `gemini-decision-1`, `gemini-3.8-flash-lite-tts`, `gemini-omni-1.2-flash`)
 
 ---
@@ -124,7 +124,7 @@ Required environment variables (inject credentials via Google Secret Manager on 
 
 ### Test Case 4: Native Two-Way Multilingual Voice Assist (`POST /api/voice-assist`)
 - **Steps:**
-  1. On the MakerLens Magic Window camera screen, press and hold the **Hold to Explain** microphone button and speak a repair question in a non-English language (e.g., Spanish: *"Hola, este tornillo no gira y parece atascado. ¿Qué hago?"* or French/Japanese) even if the browser locale (`preferredLanguage`) is `en-US`.
+  1. On the Jack of All Trades Magic Window camera screen, press and hold the **Hold to Explain** microphone button and speak a repair question in a non-English language (e.g., Spanish: *"Hola, este tornillo no gira y parece atascado. ¿Qué hago?"* or French/Japanese) even if the browser locale (`preferredLanguage`) is `en-US`.
   2. Release the button.
 - **Expected:**
   1. Client stops `MediaRecorder`, Base64-encodes the audio `Blob` + current camera JPEG frame(s), and sends `POST /api/voice-assist` with `Accept: audio/wav`.
@@ -177,7 +177,7 @@ node --check server.js
 
 ## 6. AGPL-3.0 Network Compliance Checklist
 
-Because JackOfAllTrades / MakerLens is licensed under **GNU AGPL-3.0**, any organization modifying and hosting this service over a network (including Google Cloud Run deployments) MUST:
+Because Jack of All Trades is licensed under **GNU AGPL-3.0**, any organization modifying and hosting this service over a network (including Google Cloud Run deployments) MUST:
 - Preserve the `LICENSE` file and AGPL-3.0 copyright notices in all source files.
 - Provide a visible link in the PWA footer and `/api/source-disclosure` endpoint offering the complete Corresponding Source of the deployed revision at no charge.
 

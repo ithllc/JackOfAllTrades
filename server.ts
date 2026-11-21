@@ -37,6 +37,10 @@ import {
   stripAudioDataUrl,
   validateAudioPayload,
 } from './src/lib/audioUtils.ts';
+import {
+  DEMO_NARRATION_CUES,
+  isValidDemoCueId,
+} from './src/lib/demoNarration.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1059,17 +1063,161 @@ async function createApp() {
   });
 
   // ---------------------------------------------------------------------------
+  // GUIDED DEMO NARRATION: Cached Neural Voiceover (`gemini-3.8-flash-lite-tts`)
+  // Synthesizes each onboarding demo cue (`intro`, `step-1`, `step-2`, `step-3`)
+  // once via Gemini TTS and caches the 24kHz RIFF WAV in memory so subsequent
+  // visits and step transitions play with zero latency.
+  // ---------------------------------------------------------------------------
+  const demoNarrationCache = new Map<string, { wavBuffer: Buffer; mimeType: string }>();
+
+  app.get('/api/demo-narration', async (req: Request, res: Response) => {
+    const rawCue = typeof req.query.cue === 'string' ? req.query.cue.trim() : 'intro';
+    if (!isValidDemoCueId(rawCue)) {
+      return res.status(400).json({ error: 'Invalid demo narration cue.' });
+    }
+
+    const cue = DEMO_NARRATION_CUES[rawCue];
+    const cached = demoNarrationCache.get(rawCue);
+    if (cached) {
+      res.setHeader('Content-Type', cached.mimeType);
+      res.setHeader('Content-Length', String(cached.wavBuffer.length));
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('X-Demo-Cue', rawCue);
+      res.setHeader('X-Demo-Cache', 'HIT');
+      return res.status(200).send(cached.wavBuffer);
+    }
+
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: 'GEMINI_API_KEY is not configured on the server.',
+        fallbackText: cue.spokenText,
+      });
+    }
+
+    try {
+      const tts = await clients.interactionsAi.interactions.create({
+        model: 'gemini-3.8-flash-lite-tts',
+        input: [
+          {
+            type: 'text',
+            text: cue.spokenText,
+            annotations: [
+              {
+                type: 'speech_metadata',
+                style:
+                  'Warm, reassuring, natural product guide speaking clearly at a conversational pace',
+              },
+            ],
+          },
+        ],
+        store: false,
+        response_format: { type: 'audio' },
+        generation_config: {
+          speech_config: [{ language: 'en-US', voice: 'Kore' }],
+        },
+      });
+
+      const outputAudio = tts.output_audio;
+      if (!outputAudio?.data) {
+        return res.status(502).json({
+          error: 'Demo narration TTS returned no audio.',
+          fallbackText: cue.spokenText,
+        });
+      }
+
+      const wavBuffer = Buffer.from(outputAudio.data, 'base64');
+      const mimeType = outputAudio.mime_type || 'audio/wav';
+      demoNarrationCache.set(rawCue, { wavBuffer, mimeType });
+
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Length', String(wavBuffer.length));
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('X-Demo-Cue', rawCue);
+      res.setHeader('X-Demo-Cache', 'MISS');
+      return res.status(200).send(wavBuffer);
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Demo narration synthesis failed: ${message}`,
+        fallbackText: cue.spokenText,
+      });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Frontend Serving: Vite Dev Middleware (AI Studio Port 3000) / Static dist/
   // ---------------------------------------------------------------------------
   const httpServer = http.createServer(app);
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
-    const disableHmr = process.env.DISABLE_HMR === 'true';
+    // Disable Vite HMR WebSockets when DISABLE_HMR=true or running behind the
+    // Cloud Run / AI Studio HTTPS preview proxy (K_SERVICE), preventing
+    // "@vite/client: WebSocket closed without opened" console errors.
+    const disableHmr =
+      process.env.DISABLE_HMR === 'true' || Boolean(process.env.K_SERVICE);
+
+    if (disableHmr) {
+      // Serve a lightweight zero-WebSocket /@vite/client shim before vite.middlewares.
+      // Preserves CSS injection (updateStyle/removeStyle) and React Fast Refresh
+      // import.meta.hot stubs while never opening a dev WebSocket connection.
+      const NOOP_VITE_CLIENT_ESM = [
+        'const sheetsMap = new Map();',
+        'export function updateStyle(id, content) {',
+        '  let style = sheetsMap.get(id);',
+        '  if (!style) {',
+        '    style = document.createElement("style");',
+        '    style.setAttribute("type", "text/css");',
+        '    style.setAttribute("data-vite-dev-id", id);',
+        '    style.textContent = content;',
+        '    document.head.appendChild(style);',
+        '    sheetsMap.set(id, style);',
+        '  } else {',
+        '    style.textContent = content;',
+        '  }',
+        '}',
+        'export function removeStyle(id) {',
+        '  const style = sheetsMap.get(id);',
+        '  if (style) {',
+        '    document.head.removeChild(style);',
+        '    sheetsMap.delete(id);',
+        '  }',
+        '}',
+        'export function injectQuery(url, queryToInject) {',
+        '  if (!url || (!url.startsWith(".") && !url.startsWith("/"))) return url;',
+        '  const [pathname, search] = url.split("?");',
+        '  return `${pathname}?${queryToInject}${search ? "&" + search : ""}`;',
+        '}',
+        'export function createHotContext() {',
+        '  return {',
+        '    data: {},',
+        '    accept() {},',
+        '    acceptExports() {},',
+        '    dispose() {},',
+        '    prune() {},',
+        '    decline() {},',
+        '    invalidate() {},',
+        '    on() {},',
+        '    off() {},',
+        '    send() {},',
+        '  };',
+        '}',
+        'export class ErrorOverlay extends HTMLElement {}',
+      ].join('\n');
+
+      app.get('/@vite/client', (_req: Request, res: Response) => {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-store');
+        res.send(NOOP_VITE_CLIENT_ESM);
+      });
+    }
+
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
         hmr: disableHmr ? false : { server: httpServer },
+        ws: disableHmr ? false : undefined,
       },
       appType: 'spa',
     });

@@ -850,6 +850,83 @@ app.post('/api/voice-assist', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// 6c. Guided Demo Narration: Cached Neural Voiceover (`gemini-3.8-flash-lite-tts`)
+// -----------------------------------------------------------------------------
+const DEMO_NARRATION_SCRIPTS = {
+  intro:
+    'Welcome to Jack of All Trades. This is a quick interactive demo showing how visual repair guidance works. Tap the highlighted battery latch on screen to see step-by-step instructions.',
+  'step-1':
+    'Step one: Press down gently with your thumb on the ridged release latch near the top of the cover.',
+  'step-2':
+    'Step two: Keep light pressure and slide the cover straight down toward the molded arrow until it clicks loose.',
+  'step-3':
+    'Step three: Lift the cover up to reveal the batteries. You are all set—tap Got It, Open Camera whenever you are ready for a live repair.',
+};
+const demoNarrationCache = new Map();
+
+app.get('/api/demo-narration', async (req, res) => {
+  const rawCue = typeof req.query.cue === 'string' ? req.query.cue.trim() : 'intro';
+  const spokenText = DEMO_NARRATION_SCRIPTS[rawCue];
+  if (!spokenText) {
+    return res.status(400).json({ error: 'Invalid demo narration cue.' });
+  }
+
+  const cached = demoNarrationCache.get(rawCue);
+  if (cached) {
+    res.setHeader('Content-Type', cached.mimeType);
+    res.setHeader('Content-Length', String(cached.wavBuffer.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('X-Demo-Cue', rawCue);
+    res.setHeader('X-Demo-Cache', 'HIT');
+    return res.status(200).send(cached.wavBuffer);
+  }
+
+  const clients = initGeminiClients();
+  if (!clients) {
+    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured.', fallbackText: spokenText });
+  }
+
+  try {
+    const tts = await clients.interactionsAi.interactions.create({
+      model: 'gemini-3.8-flash-lite-tts',
+      input: [
+        {
+          type: 'text',
+          text: spokenText,
+          annotations: [
+            {
+              type: 'speech_metadata',
+              style: 'Warm, reassuring, natural product guide speaking clearly at a conversational pace',
+            },
+          ],
+        },
+      ],
+      store: false,
+      response_format: { type: 'audio' },
+      generation_config: { speech_config: [{ language: 'en-US', voice: 'Kore' }] },
+    });
+
+    const outputAudio = tts.output_audio;
+    if (!outputAudio?.data) {
+      return res.status(502).json({ error: 'Demo narration TTS returned no audio.', fallbackText: spokenText });
+    }
+
+    const wavBuffer = Buffer.from(outputAudio.data, 'base64');
+    const mimeType = outputAudio.mime_type || 'audio/wav';
+    demoNarrationCache.set(rawCue, { wavBuffer, mimeType });
+
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Length', String(wavBuffer.length));
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.setHeader('X-Demo-Cue', rawCue);
+    res.setHeader('X-Demo-Cache', 'MISS');
+    return res.status(200).send(wavBuffer);
+  } catch (err) {
+    return res.status(502).json({ error: `Demo narration failed: ${err.message}`, fallbackText: spokenText });
+  }
+});
+
+// -----------------------------------------------------------------------------
 // 7. Serve Compiled Vite React PWA (`dist/`) on Google Cloud Run Port 8080
 // -----------------------------------------------------------------------------
 const distDir = path.join(__dirname, 'dist');

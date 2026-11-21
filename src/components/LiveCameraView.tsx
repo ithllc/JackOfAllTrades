@@ -19,6 +19,7 @@ import {
 } from '../lib/audioUtils';
 import { ScanningOverlay } from './ScanningOverlay';
 import { InstructionSheet } from './InstructionSheet';
+import { BrandMark } from './BrandMark';
 
 interface LiveCameraViewProps {
   flashlightOn: boolean;
@@ -680,9 +681,9 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         aria-hidden="true"
       />
 
-      {/* TOP CONTROL: Strictly the Flashlight Toggle (zero technical settings) */}
-      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between px-5 pt-5 sm:px-8 sm:pt-6">
-        <span className="text-base font-bold tracking-tight text-white/95">MakerLens</span>
+      {/* TOP CONTROL: Brand Logo + Flashlight Toggle (zero technical settings) */}
+      <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-3 px-5 pt-5 sm:px-8 sm:pt-6">
+        <BrandMark compact />
 
         <button
           type="button"
