@@ -75,13 +75,13 @@ export function resolveCloudSqlPoolConfig(
     env.SQL_Outgoing_IP ||
     DEFAULT_SQL_OUTGOING_IP
   ).trim();
-  const port = parsePort(env.SQL_PORT, DEFAULT_SQL_PORT);
+  const port = parsePort(env.SQL_PORT || env.DB_PORT, DEFAULT_SQL_PORT);
 
-  const database = env.SQL_DB_NAME?.trim() || '';
-  const user = env.SQL_USER?.trim() || '';
-  const password = env.SQL_PASSWORD;
+  const database = (env.SQL_DB_NAME || env.DB_NAME || '').trim();
+  const user = (env.SQL_USER || env.DB_USER || '').trim();
+  const password = env.SQL_PASSWORD ?? env.DB_PASS;
 
-  const explicitHost = env.SQL_HOST?.trim() || '';
+  const explicitHost = (env.SQL_HOST || env.DB_HOST || '').trim();
   const socketPath = `/cloudsql/${connectionName}`;
   const checkSocketExists = options.socketExists ?? ((p: string) => fs.existsSync(p));
   const useUnixSocket =
@@ -149,8 +149,8 @@ export function resolveCloudSqlPoolConfig(
   //  - If SQL_SSL_CA is provided, enforce strict CA validation.
   //  - If SQL_SSL === 'false', disable TLS explicitly.
   //  - If SQL_SSL === 'true' OR connecting over a non-localhost IP (e.g., Public IP 34.74.102.222), enable TLS.
-  const sslCa = env.SQL_SSL_CA?.trim();
-  const sslFlag = env.SQL_SSL?.trim().toLowerCase();
+  const sslCa = (env.SQL_SSL_CA || env.DB_SSL_CA || '').trim();
+  const sslFlag = (env.SQL_SSL ?? env.DB_SSL)?.trim().toLowerCase();
   const isLocalHost = LOCAL_HOSTS.has(host.toLowerCase());
 
   let ssl: PoolConfig['ssl'] = false;

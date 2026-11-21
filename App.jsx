@@ -5,9 +5,12 @@ import {
   Flashlight,
   FlashlightOff,
   Hand,
+  Mic,
   Play,
   RotateCcw,
   ScanSearch,
+  Square,
+  Volume2,
   Wrench,
   X,
 } from 'lucide-react';
@@ -545,8 +548,30 @@ function LiveCameraView({
       active = false;
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+      if (recordTimerRef.current !== null) window.clearInterval(recordTimerRef.current);
+      if (responseAudioUrlRef.current) URL.revokeObjectURL(responseAudioUrlRef.current);
     };
   }, []);
+
+  // Rolling buffer of recent JPEG frames + MediaRecorder & <audio> refs for Push-to-Talk
+  const frameBufferRef = useRef([]);
+  const micStreamRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recordStartMsRef = useRef(0);
+  const recordTimerRef = useRef(null);
+  const isHoldingRef = useRef(false);
+  const audioPlayerRef = useRef(null);
+  const responseAudioUrlRef = useRef(null);
+
+  const [voicePhase, setVoicePhase] = useState('idle'); // 'idle' | 'recording' | 'thinking' | 'speaking'
+  const [recordingMs, setRecordingMs] = useState(0);
+  const [spokenReply, setSpokenReply] = useState(null);
+  const [spokenLanguage, setSpokenLanguage] = useState(null);
+  const [voiceNotice, setVoiceNotice] = useState(null);
+  const [hasReplyAudio, setHasReplyAudio] = useState(false);
 
   // Sync hardware flashlight torch when supported
   useEffect(() => {
@@ -555,20 +580,184 @@ function LiveCameraView({
     track.applyConstraints({ advanced: [{ torch: flashlightOn }] }).catch(() => {});
   }, [flashlightOn, torchSupported]);
 
+  // Capture a 640x360 JPEG snapshot from the live camera feed
+  const captureFrameDataUrl = useCallback(() => {
+    if (!videoRef.current || videoRef.current.readyState < 2) return null;
+    const canvas = captureCanvasRef.current || document.createElement('canvas');
+    captureCanvasRef.current = canvas;
+    canvas.width = 640;
+    canvas.height = 360;
+    const ctx = canvas.getContext('2d');
+    ctx?.drawImage(videoRef.current, 0, 0, 640, 360);
+    return canvas.toDataURL('image/jpeg', 0.8);
+  }, []);
+
+  // Keep a lightweight rolling buffer of up to 4 frames for Push-to-Talk visual context
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (scanPhase === 'scanning' || voicePhase === 'thinking' || sheetOpen) return;
+      const dataUrl = captureFrameDataUrl();
+      if (!dataUrl) return;
+      frameBufferRef.current = [...frameBufferRef.current, { timestampMs: Date.now(), dataUrl }].slice(-4);
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [captureFrameDataUrl, scanPhase, voicePhase, sheetOpen]);
+
+  // Encode MediaRecorder audio Blob -> Base64 data URL for JSON transport to Express
+  const blobToDataUrl = (blob) =>
+    new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () =>
+        typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Audio encode failed'));
+      reader.onerror = () => reject(new Error('Audio read failed'));
+      reader.readAsDataURL(blob);
+    });
+
+  const stopAudioPlayback = useCallback(() => {
+    if (audioPlayerRef.current) {
+      audioPlayerRef.current.pause();
+      audioPlayerRef.current.currentTime = 0;
+    }
+    setVoicePhase((prev) => (prev === 'speaking' ? 'idle' : prev));
+  }, []);
+
+  const handleReplayAudio = useCallback(async () => {
+    if (!audioPlayerRef.current || !responseAudioUrlRef.current) return;
+    try {
+      audioPlayerRef.current.currentTime = 0;
+      setVoicePhase('speaking');
+      await audioPlayerRef.current.play();
+    } catch {
+      setVoicePhase('idle');
+    }
+  }, []);
+
+  // Package recorded audio Blob + rolling video buffer -> POST /api/voice-assist -> play binary WAV
+  const sendVoiceExplainPayload = useCallback(
+    async (audioBlob) => {
+      setVoicePhase('thinking');
+      setVoiceNotice(null);
+      try {
+        // 1. Encode binary MediaRecorder Blob into a Base64 data URL
+        const audioDataUrl = await blobToDataUrl(audioBlob);
+        const latest = captureFrameDataUrl();
+        const frames = [...frameBufferRef.current, ...(latest ? [{ timestampMs: Date.now(), dataUrl: latest }] : [])].slice(-4);
+
+        // 2. Request a binary `audio/wav` stream directly from Express (`Accept: audio/wav`)
+        const resp = await fetch('/api/voice-assist', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'audio/wav' },
+          body: JSON.stringify({
+            frames,
+            preferredLanguage: typeof navigator !== 'undefined' ? navigator.language : 'en-US',
+            audio: { data: audioDataUrl, mimeType: audioBlob.type || 'audio/webm' },
+          }),
+        });
+        if (!resp.ok) {
+          const errBody = await resp.json().catch(() => ({}));
+          throw new Error(errBody.error || "Couldn't hear that clearly. Hold the button a moment longer.");
+        }
+
+        // 3. Receive binary WAV Blob and bind it to the hidden <audio> player via URL.createObjectURL
+        const wavBlob = await resp.blob();
+        const objectUrl = URL.createObjectURL(wavBlob);
+        const headerTranscript = resp.headers.get('X-MakerLens-Transcript');
+        const headerLangName = resp.headers.get('X-MakerLens-Language-Name');
+        if (headerTranscript) setSpokenReply(decodeURIComponent(headerTranscript));
+        setSpokenLanguage(headerLangName ? decodeURIComponent(headerLangName) : null);
+
+        if (responseAudioUrlRef.current) URL.revokeObjectURL(responseAudioUrlRef.current);
+        responseAudioUrlRef.current = objectUrl;
+        setHasReplyAudio(true);
+
+        if (audioPlayerRef.current) {
+          audioPlayerRef.current.src = objectUrl;
+          setVoicePhase('speaking');
+          await audioPlayerRef.current.play().catch(() => setVoicePhase('idle'));
+        } else {
+          setVoicePhase('idle');
+        }
+      } catch (err) {
+        setVoicePhase('idle');
+        setVoiceNotice(err?.message || 'Hold the button while speaking and try again.');
+      }
+    },
+    [captureFrameDataUrl]
+  );
+
+  // Push-to-Talk PRESS: start capturing microphone audio via MediaRecorder
+  const handleStartTalking = useCallback(async () => {
+    if (isHoldingRef.current || scanPhase === 'scanning' || voicePhase === 'thinking') return;
+    isHoldingRef.current = true;
+    setVoiceNotice(null);
+    stopAudioPlayback();
+
+    try {
+      let micStream = micStreamRef.current;
+      if (!micStream || !micStream.getAudioTracks().some((t) => t.readyState === 'live')) {
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+          video: false,
+        });
+        micStreamRef.current = micStream;
+      }
+      if (!isHoldingRef.current) return;
+
+      const preferredMime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find((m) =>
+        MediaRecorder.isTypeSupported?.(m)
+      );
+      const recorder = preferredMime
+        ? new MediaRecorder(micStream, { mimeType: preferredMime })
+        : new MediaRecorder(micStream);
+
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) audioChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        if (recordTimerRef.current !== null) window.clearInterval(recordTimerRef.current);
+        const elapsed = Date.now() - recordStartMsRef.current;
+        setRecordingMs(0);
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || preferredMime || 'audio/webm' });
+        audioChunksRef.current = [];
+        if (elapsed < 350 || blob.size < 256) {
+          setVoicePhase('idle');
+          setVoiceNotice('Hold the button down while speaking, then release.');
+          return;
+        }
+        void sendVoiceExplainPayload(blob);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recordStartMsRef.current = Date.now();
+      setVoicePhase('recording');
+      recorder.start(150);
+      recordTimerRef.current = window.setInterval(() => setRecordingMs(Date.now() - recordStartMsRef.current), 200);
+    } catch {
+      isHoldingRef.current = false;
+      setVoicePhase('idle');
+      setVoiceNotice('Please allow microphone access to explain the problem out loud.');
+    }
+  }, [scanPhase, sendVoiceExplainPayload, stopAudioPlayback, voicePhase]);
+
+  // Push-to-Talk RELEASE: stop MediaRecorder (triggers onstop -> upload -> WAV speech playback)
+  const handleStopTalking = useCallback(() => {
+    if (!isHoldingRef.current) return;
+    isHoldingRef.current = false;
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    } else {
+      setVoicePhase('idle');
+    }
+  }, []);
+
   const handleScanProblem = async () => {
+    stopAudioPlayback();
+    setVoiceNotice(null);
     setSheetOpen(false);
     onStartScan();
 
-    let frameDataUrl = null;
-    if (videoRef.current && videoRef.current.readyState >= 2) {
-      const canvas = captureCanvasRef.current || document.createElement('canvas');
-      captureCanvasRef.current = canvas;
-      canvas.width = 640;
-      canvas.height = 360;
-      const ctx = canvas.getContext('2d');
-      ctx?.drawImage(videoRef.current, 0, 0, 640, 360);
-      frameDataUrl = canvas.toDataURL('image/jpeg', 0.82);
-    }
+    const frameDataUrl = captureFrameDataUrl();
 
     try {
       const resp = await fetch('/api/analyze-buffer', {
@@ -610,11 +799,24 @@ function LiveCameraView({
   };
 
   const isScanning = scanPhase === 'scanning';
+  const isThinkingVoice = voicePhase === 'thinking';
+  const isRecording = voicePhase === 'recording';
+  const isSpeaking = voicePhase === 'speaking';
+  const isBusy = isScanning || isThinkingVoice;
+  const formattedTimer = `${Math.floor(recordingMs / 60000)}:${String(Math.floor((recordingMs / 1000) % 60)).padStart(2, '0')}`;
 
   return (
     <div className="relative h-dvh w-screen overflow-hidden bg-black text-white select-none">
+      {/* Hidden <audio> element automatically plays the binary WAV stream returned by Express */}
+      <audio
+        ref={audioPlayerRef}
+        className="hidden"
+        onEnded={() => setVoicePhase('idle')}
+        onError={() => setVoicePhase('idle')}
+      />
+
       {/* Full-Screen Camera Viewfinder (blurs cleanly while analyzing) */}
-      <div className={`absolute inset-0 transition-all duration-300 ${isScanning ? 'scale-105 blur-md' : 'scale-100 blur-0'}`}>
+      <div className={`absolute inset-0 transition-all duration-300 ${isBusy ? 'scale-105 blur-md' : 'scale-100 blur-0'}`}>
         <video
           ref={videoRef}
           autoPlay
@@ -634,7 +836,7 @@ function LiveCameraView({
 
       {/* Top & bottom contrast scrims */}
       <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-28 bg-gradient-to-b from-black/75 via-black/30 to-transparent" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-40 bg-gradient-to-t from-black/80 via-black/35 to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-44 bg-gradient-to-t from-black/85 via-black/40 to-transparent" />
 
       {/* Top Control: Strictly Flashlight Toggle */}
       <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between px-5 pt-5 sm:px-8 sm:pt-6">
@@ -678,31 +880,107 @@ function LiveCameraView({
         </div>
       )}
 
-      {/* Human-Readable Blurred Scanning State */}
+      {/* Human-Readable Blurred Scanning / Voice Processing State */}
       {isScanning && <ScanningOverlay />}
+      {isThinkingVoice && <ScanningOverlay customMessage="Listening to your question..." />}
+
+      {/* Live Recording Cue */}
+      {isRecording && (
+        <div
+          role="status"
+          className="pointer-events-none absolute inset-x-4 bottom-28 z-20 mx-auto flex max-w-xs items-center justify-center gap-2.5 rounded-full bg-red-600/95 px-5 py-2.5 text-sm font-semibold text-white shadow-2xl"
+        >
+          <span className="h-2.5 w-2.5 rounded-full bg-white animate-ping" />
+          <span className="tabular-nums">{formattedTimer}</span>
+          <span>Release when finished</span>
+        </div>
+      )}
+
+      {/* Spoken AI Mechanic Caption Card + Replay/Stop Control */}
+      {!sheetOpen && !isRecording && !isBusy && spokenReply && (
+        <div className="absolute inset-x-4 bottom-28 z-20 mx-auto max-w-md rounded-2xl bg-neutral-950/90 border border-white/15 px-4 py-3.5 shadow-2xl backdrop-blur-xl">
+          <div className="flex items-start gap-3">
+            <button
+              type="button"
+              onClick={() => (isSpeaking ? stopAudioPlayback() : void handleReplayAudio())}
+              disabled={!hasReplyAudio}
+              aria-label={isSpeaking ? 'Stop spoken response' : 'Replay spoken response'}
+              className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${
+                isSpeaking ? 'bg-amber-400 text-neutral-950 animate-pulse' : 'bg-white/12 text-amber-400'
+              }`}
+            >
+              {isSpeaking ? <Square className="h-4 w-4 fill-current" /> : <Volume2 className="h-4 w-4" />}
+            </button>
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-amber-400">
+                {isSpeaking ? 'Speaking' : 'Mechanic Guidance'}
+                {spokenLanguage ? ` · ${spokenLanguage}` : ''}
+              </p>
+              <p className="mt-0.5 text-sm leading-snug text-white">{spokenReply}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                stopAudioPlayback();
+                setSpokenReply(null);
+              }}
+              aria-label="Dismiss spoken response"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-neutral-400 hover:text-white"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Plain-English Error Notice */}
-      {scanPhase === 'error' && errorMessage && (
+      {!isRecording && !isBusy && (voiceNotice || (scanPhase === 'error' && errorMessage)) && (
         <div
           role="alert"
           className="absolute inset-x-4 bottom-28 z-20 mx-auto max-w-sm rounded-2xl bg-neutral-950/90 border border-white/15 px-5 py-4 text-center shadow-2xl backdrop-blur-xl"
         >
-          <p className="text-sm font-medium text-white leading-relaxed">{errorMessage}</p>
+          <p className="text-sm font-medium text-white leading-relaxed">{voiceNotice || errorMessage}</p>
         </div>
       )}
 
-      {/* Bottom Control: Strictly Large Pill-Shaped "Scan Problem" Button */}
+      {/* Bottom Dock: "Scan Problem" + Push-to-Talk "Hold to Explain" */}
       {!sheetOpen && (
-        <div className="absolute inset-x-0 bottom-0 z-20 flex flex-col items-center px-6 pb-8 sm:pb-10">
-          <button
-            type="button"
-            onClick={() => void handleScanProblem()}
-            disabled={isScanning}
-            className="inline-flex min-h-[58px] min-w-[230px] items-center justify-center gap-3 rounded-full bg-white px-8 py-4 text-base font-bold tracking-tight text-neutral-950 shadow-2xl hover:bg-neutral-100 active:scale-[0.97] transition-all disabled:opacity-60 whitespace-nowrap"
-          >
-            <ScanSearch className="h-5 w-5 text-neutral-950" aria-hidden="true" />
-            {isScanning ? 'Scanning...' : 'Scan Problem'}
-          </button>
+        <div className="absolute inset-x-0 bottom-0 z-20 flex justify-center px-4 pb-7 sm:px-6 sm:pb-10">
+          <div className="flex w-full max-w-md items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => void handleScanProblem()}
+              disabled={isBusy || isRecording}
+              className="inline-flex min-h-[56px] flex-1 items-center justify-center gap-2.5 rounded-full bg-white px-5 py-3.5 text-sm sm:text-base font-bold tracking-tight text-neutral-950 shadow-2xl hover:bg-neutral-100 active:scale-[0.97] transition-all disabled:opacity-55 whitespace-nowrap"
+            >
+              <ScanSearch className="h-5 w-5 text-neutral-950" aria-hidden="true" />
+              <span>{isScanning ? 'Scanning...' : 'Scan Problem'}</span>
+            </button>
+
+            <button
+              type="button"
+              onPointerDown={(e) => {
+                e.preventDefault();
+                e.currentTarget.setPointerCapture?.(e.pointerId);
+                void handleStartTalking();
+              }}
+              onPointerUp={(e) => {
+                e.preventDefault();
+                handleStopTalking();
+              }}
+              onPointerCancel={() => handleStopTalking()}
+              disabled={isBusy}
+              aria-pressed={isRecording}
+              className={`touch-none inline-flex min-h-[56px] flex-1 items-center justify-center gap-2.5 rounded-full px-5 py-3.5 text-sm sm:text-base font-bold tracking-tight shadow-2xl transition-all disabled:opacity-55 whitespace-nowrap ${
+                isRecording
+                  ? 'scale-[1.03] bg-red-500 text-white shadow-red-500/40 ring-4 ring-red-400/35'
+                  : 'border border-white/25 bg-black/70 text-white backdrop-blur-xl hover:bg-black/85'
+              }`}
+            >
+              <Mic className={`h-5 w-5 ${isRecording ? 'text-white' : 'text-amber-400'}`} aria-hidden="true" />
+              <span>{isRecording ? `Listening ${formattedTimer}` : isThinkingVoice ? 'Thinking...' : 'Hold to Explain'}</span>
+            </button>
+          </div>
         </div>
       )}
 

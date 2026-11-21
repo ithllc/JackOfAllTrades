@@ -14,6 +14,7 @@
 
 import 'dotenv/config';
 import express, { type Request, type Response } from 'express';
+import http from 'node:http';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -29,6 +30,13 @@ import {
   type ScaleAnchorType,
 } from './src/lib/routingLogic.ts';
 import { resolveCloudSqlPoolConfig } from './src/lib/dbConfig.ts';
+import {
+  EXPERT_MECHANIC_SYSTEM_PROMPT,
+  enforceThreeSentenceCap,
+  normalizeBcp47Language,
+  stripAudioDataUrl,
+  validateAudioPayload,
+} from './src/lib/audioUtils.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -155,7 +163,7 @@ async function createApp() {
         outgoingIp: cloudSqlConfig.outgoingIp,
         port: cloudSqlConfig.port,
         message:
-          'Set SQL_DB_NAME, SQL_USER, and SQL_PASSWORD in runtime secrets to enable live Cloud SQL queries. Falling back to InMemoryOntologyGraph.',
+          'Set DB_NAME/DB_USER/DB_PASS (or SQL_DB_NAME/SQL_USER/SQL_PASSWORD) in runtime secrets to enable live Cloud SQL queries. Falling back to InMemoryOntologyGraph.',
       });
     }
 
@@ -787,12 +795,282 @@ async function createApp() {
   });
 
   // ---------------------------------------------------------------------------
+  // NATIVE TWO-WAY AUDIO: Push-to-Talk Visual + Audio -> Generated Speech (WAV)
+  // Audio Pipeline:
+  //   1. Browser MediaRecorder captures microphone Blob (audio/webm or audio/mp4)
+  //      and encodes it to a Base64 data URL alongside recent JPEG video frames.
+  //   2. Express strips the data URL prefix and validates byte length, passing
+  //      BOTH inline visual `image` parts AND the raw inline `audio` part to
+  //      `gemini-4-neon` (`ai.interactions.create`) with the strict mechanic prompt.
+  //   3. Express passes the concise (< 3 sentence) response to
+  //      `gemini-3.8-flash-lite-tts` with `response_format: { type: 'audio' }`,
+  //      which returns a complete 24kHz mono 16-bit WAV file in Base64.
+  //   4. Express decodes `Buffer.from(audio.data, 'base64')` and pipes raw binary
+  //      `audio/wav` bytes directly back to the browser when `Accept: audio/*`
+  //      is requested (or JSON Base64 otherwise).
+  // ---------------------------------------------------------------------------
+  app.post('/api/voice-assist', async (req: Request, res: Response) => {
+    const {
+      frames = [],
+      audio,
+      audioDataUrl,
+      audioBase64,
+      audioMimeType = 'audio/webm',
+      preferredLanguage,
+      format,
+    } = req.body ?? {};
+
+    const rawAudioInput =
+      typeof audio === 'string'
+        ? audio
+        : typeof audio?.data === 'string'
+          ? audio.data
+          : typeof audioDataUrl === 'string'
+            ? audioDataUrl
+            : typeof audioBase64 === 'string'
+              ? audioBase64
+              : '';
+
+    const rawMime =
+      (typeof audio === 'object' && audio?.mimeType) ||
+      (typeof audioMimeType === 'string' ? audioMimeType : 'audio/webm');
+
+    const fallbackLanguage = normalizeBcp47Language(
+      typeof preferredLanguage === 'string' ? preferredLanguage : undefined,
+      'en-US'
+    );
+
+    const { mimeType: cleanAudioMime, base64: cleanAudioBase64 } = stripAudioDataUrl(
+      rawAudioInput,
+      rawMime
+    );
+
+    const validation = validateAudioPayload(cleanAudioBase64);
+    if (!validation.ok) {
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error:
+          'GEMINI_API_KEY is not configured on the server. Configure a valid Gemini 4 API key in Secrets.',
+        code: 'API_KEY_MISSING',
+      });
+    }
+
+    // Sample up to 4 recent video frames from the client's rolling buffer
+    const incomingFrames = Array.isArray(frames) ? (frames as IncomingFrame[]) : [];
+    const stride = Math.max(1, Math.floor(incomingFrames.length / 4));
+    const sampledFrames = incomingFrames.filter((_f, i) => i % stride === 0).slice(0, 4);
+
+    // Build multimodal input combining visual frames + raw inline user audio
+    const multimodalParts: Array<
+      | { type: 'image'; data: string; mime_type: string; resolution: 'low' | 'medium' }
+      | { type: 'audio'; data: string; mime_type: string }
+      | { type: 'text'; text: string }
+    > = [];
+
+    for (const frame of sampledFrames) {
+      if (typeof frame?.dataUrl !== 'string' || frame.dataUrl.length < 32) continue;
+      const { mimeType, base64 } = stripDataUrlPrefix(frame.dataUrl);
+      multimodalParts.push({
+        type: 'image',
+        data: base64,
+        mime_type: mimeType,
+        resolution: 'medium',
+      });
+    }
+
+    // Attach the user's raw recorded microphone audio directly as an inline audio part
+    multimodalParts.push({
+      type: 'audio',
+      data: cleanAudioBase64,
+      mime_type: cleanAudioMime,
+    });
+
+    multimodalParts.push({
+      type: 'text',
+      text:
+        '1. Listen carefully to the attached audio clip. Set speechDetected=true ONLY if intelligible human speech is actually audible; set speechDetected=false if the clip is silent or contains only noise.\n' +
+        '2. If speechDetected=true, write the exact verbatim words heard in userTranscript (in the original spoken language) and set detectedLanguageCode to the matching BCP-47 tag (e.g., "es-ES", "es-MX", "fr-FR", "ja-JP", "de-DE", "pt-BR", "zh-CN", "ar-EG", "hi-IN", "en-US").\n' +
+        '3. If speechDetected=false, set userTranscript="", set detectedLanguageCode="' +
+        fallbackLanguage +
+        '", do NOT invent a repair problem, and write a brief polite prompt in "' +
+        fallbackLanguage +
+        '" asking the user to hold the button and speak closer to the microphone.\n' +
+        '4. Write spokenResponse STRICTLY in detectedLanguageCode — never switch languages. Keep spokenResponse under 3 short, direct, actionable sentences with no markdown.',
+    });
+
+    // STAGE 1: Multimodal Visual + Audio Reasoning + Language Detection via `gemini-4-neon`
+    let spokenText: string;
+    let detectedLanguageCode = fallbackLanguage;
+    let detectedLanguageName = 'Auto';
+    try {
+      const reasoning = await clients.interactionsAi.interactions.create({
+        model: 'gemini-4-neon',
+        system_instruction: EXPERT_MECHANIC_SYSTEM_PROMPT,
+        input: multimodalParts,
+        store: false,
+        generation_config: {
+          thinking_level: 'low',
+        },
+        response_format: {
+          type: Type.OBJECT,
+          properties: {
+            speechDetected: {
+              type: Type.BOOLEAN,
+              description:
+                'True only if intelligible human speech is present in the audio clip; false if silent or unintelligible noise.',
+            },
+            userTranscript: {
+              type: Type.STRING,
+              description:
+                'Verbatim transcription of the user speech in its original spoken language (empty string if speechDetected is false).',
+            },
+            detectedLanguageCode: {
+              type: Type.STRING,
+              description:
+                'BCP-47 locale tag matching userTranscript (e.g., es-ES, fr-FR, ja-JP, pt-BR, en-US), or the fallback locale if speechDetected is false.',
+            },
+            detectedLanguageName: {
+              type: Type.STRING,
+              description: 'Human-readable name of the detected language (e.g., Spanish, French, Japanese, English).',
+            },
+            spokenResponse: {
+              type: Type.STRING,
+              description:
+                'Direct, actionable mechanic guidance written strictly in detectedLanguageCode, under 3 sentences.',
+            },
+          },
+          required: [
+            'speechDetected',
+            'userTranscript',
+            'detectedLanguageCode',
+            'detectedLanguageName',
+            'spokenResponse',
+          ],
+        },
+      });
+
+      const rawOutput = reasoning.output_text || '';
+      try {
+        const parsed = JSON.parse(rawOutput) as {
+          speechDetected?: boolean;
+          userTranscript?: string;
+          detectedLanguageCode?: string;
+          detectedLanguageName?: string;
+          spokenResponse?: string;
+        };
+        const rawCode =
+          parsed.speechDetected === false ? fallbackLanguage : parsed.detectedLanguageCode;
+        detectedLanguageCode = normalizeBcp47Language(rawCode, fallbackLanguage);
+        detectedLanguageName = parsed.detectedLanguageName?.trim() || detectedLanguageCode;
+        spokenText = enforceThreeSentenceCap(parsed.spokenResponse || rawOutput);
+      } catch {
+        spokenText = enforceThreeSentenceCap(rawOutput);
+      }
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Multimodal voice analysis failed: ${message}`,
+        stage: 'gemini-4-neon',
+      });
+    }
+
+    // STAGE 2: Native Multilingual Speech Generation (`gemini-3.8-flash-lite-tts`)
+    // Passes the detected BCP-47 language code directly to `speech_config` so the
+    // synthesized WAV speaks back naturally in the user's exact language.
+    try {
+      const ttsInteraction = await clients.interactionsAi.interactions.create({
+        model: 'gemini-3.8-flash-lite-tts',
+        input: [
+          {
+            type: 'text',
+            text: spokenText,
+            annotations: [
+              {
+                type: 'speech_metadata',
+                style: `Calm, confident, direct expert mechanic speaking naturally in ${detectedLanguageName}`,
+              },
+            ],
+          },
+        ],
+        store: false,
+        response_format: { type: 'audio' },
+        generation_config: {
+          speech_config: [
+            {
+              language: detectedLanguageCode,
+              voice: 'Kore',
+            },
+          ],
+        },
+      });
+
+      const outputAudio = ttsInteraction.output_audio;
+      if (!outputAudio?.data) {
+        return res.status(502).json({
+          error: 'Gemini speech synthesis returned no audio payload.',
+          spokenText,
+          detectedLanguageCode,
+          detectedLanguageName,
+        });
+      }
+
+      const wavMime = outputAudio.mime_type || 'audio/wav';
+      const wantsBinary =
+        format === 'binary' ||
+        (typeof req.headers.accept === 'string' && req.headers.accept.includes('audio/'));
+
+      if (wantsBinary) {
+        // Decode Gemini's Base64 WAV into raw binary bytes and pipe directly to the browser
+        const wavBuffer = Buffer.from(outputAudio.data, 'base64');
+        res.setHeader('Content-Type', wavMime);
+        res.setHeader('Content-Length', String(wavBuffer.length));
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-MakerLens-Transcript', encodeURIComponent(spokenText));
+        res.setHeader('X-MakerLens-Language', detectedLanguageCode);
+        res.setHeader('X-MakerLens-Language-Name', encodeURIComponent(detectedLanguageName));
+        res.setHeader('X-MakerLens-Vision-Model', 'gemini-4-neon');
+        res.setHeader('X-MakerLens-Speech-Model', 'gemini-3.8-flash-lite-tts');
+        return res.status(200).send(wavBuffer);
+      }
+
+      return res.json({
+        spokenText,
+        detectedLanguageCode,
+        detectedLanguageName,
+        audioBase64: outputAudio.data,
+        audioMimeType: wavMime,
+        visionModel: 'gemini-4-neon',
+        speechModel: 'gemini-3.8-flash-lite-tts',
+      });
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Speech synthesis failed: ${message}`,
+        spokenText,
+        detectedLanguageCode,
+        detectedLanguageName,
+        stage: 'gemini-3.8-flash-lite-tts',
+      });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Frontend Serving: Vite Dev Middleware (AI Studio Port 3000) / Static dist/
   // ---------------------------------------------------------------------------
+  const httpServer = http.createServer(app);
+
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: disableHmr ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -804,7 +1082,7 @@ async function createApp() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`[JackOfAllTrades] Express + PWA listening on http://0.0.0.0:${PORT}`);
   });
 }

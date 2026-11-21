@@ -126,3 +126,23 @@ test('uses localhost without SSL by default when SQL_HOST=127.0.0.1', () => {
   assert.equal(localProxy.poolConfig?.port, 5432);
   assert.equal(localProxy.poolConfig?.ssl, false);
 });
+
+test('supports DB_USER, DB_PASS, DB_NAME, and DB_HOST aliases for Cloud Run Unix socket', () => {
+  const result = resolveCloudSqlPoolConfig({
+    DB_USER: 'postgres',
+    DB_PASS: 'test-special-&^#@\\-value',
+    DB_NAME: 'postgres',
+    DB_HOST: '/cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project',
+  });
+  assert.equal(result.transport, 'cloud_sql_socket');
+  assert.equal(result.sslEnabled, false);
+  assert.ok(result.poolConfig);
+  assert.equal(
+    result.poolConfig.host,
+    '/cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project'
+  );
+  assert.equal(result.poolConfig.user, 'postgres');
+  assert.equal(result.poolConfig.database, 'postgres');
+  assert.equal(result.poolConfig.password, 'test-special-&^#@\\-value');
+  assert.equal(result.poolConfig.ssl, false);
+});

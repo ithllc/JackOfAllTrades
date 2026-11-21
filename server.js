@@ -61,16 +61,19 @@ function resolveCloudSqlPoolConfig(env) {
     env.SQL_Outgoing_IP ||
     DEFAULT_SQL_OUTGOING_IP
   ).trim();
-  const parsedPort = Number.parseInt(String(env.SQL_PORT || DEFAULT_SQL_PORT), 10);
+  const parsedPort = Number.parseInt(
+    String(env.SQL_PORT || env.DB_PORT || DEFAULT_SQL_PORT),
+    10
+  );
   const port =
     Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535
       ? parsedPort
       : DEFAULT_SQL_PORT;
 
-  const database = env.SQL_DB_NAME?.trim() || '';
-  const user = env.SQL_USER?.trim() || '';
-  const password = env.SQL_PASSWORD;
-  const explicitHost = env.SQL_HOST?.trim() || '';
+  const database = (env.SQL_DB_NAME || env.DB_NAME || '').trim();
+  const user = (env.SQL_USER || env.DB_USER || '').trim();
+  const password = env.SQL_PASSWORD ?? env.DB_PASS;
+  const explicitHost = (env.SQL_HOST || env.DB_HOST || '').trim();
   const socketPath = `/cloudsql/${connectionName}`;
   const useUnixSocket =
     env.SQL_USE_UNIX_SOCKET?.trim().toLowerCase() === 'true' ||
@@ -128,8 +131,8 @@ function resolveCloudSqlPoolConfig(env) {
     };
   }
 
-  const sslCa = env.SQL_SSL_CA?.trim();
-  const sslFlag = env.SQL_SSL?.trim().toLowerCase();
+  const sslCa = (env.SQL_SSL_CA || env.DB_SSL_CA || '').trim();
+  const sslFlag = (env.SQL_SSL ?? env.DB_SSL)?.trim().toLowerCase();
   const isLocalHost = LOCAL_SQL_HOSTS.has(host.toLowerCase());
   let ssl = false;
   if (sslCa) ssl = { ca: sslCa, rejectUnauthorized: true };
@@ -588,6 +591,261 @@ app.post('/api/generate-pip', async (req, res) => {
     });
   } catch (err) {
     return res.status(502).json({ error: `PiP video generation failed: ${err.message}` });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// 6b. Native Two-Way Audio: Push-to-Talk Visual + Audio -> Generated Speech (WAV)
+//     Audio Encoding/Decoding Flow:
+//       - Client MediaRecorder records microphone audio as a Blob (audio/webm or audio/mp4)
+//         and Base64-encodes it alongside sampled JPEG camera frames.
+//       - Server strips data-URL headers, normalizes MIME (removing `;codecs=opus`),
+//         and sends BOTH inline `image` parts AND the raw inline `audio` part to
+//         `gemini-4-neon` with the strict expert mechanic system prompt.
+//       - Server synthesizes spoken WAV audio via `gemini-3.8-flash-lite-tts` with
+//         `response_format: { type: 'audio' }` (complete 24kHz mono 16-bit RIFF WAV).
+//       - Server decodes the Base64 WAV via `Buffer.from(data, 'base64')` and pipes
+//         raw binary `audio/wav` bytes back when `Accept: audio/*` is sent (or JSON Base64).
+// -----------------------------------------------------------------------------
+const EXPERT_MECHANIC_SYSTEM_PROMPT =
+  "You are an expert mechanic. Detect the exact spoken language of the user's audio query and respond in that exact same language using the visual context provided. Keep your spoken response under 3 sentences. Be direct and actionable.";
+
+const SHORT_LANGUAGE_DEFAULTS = {
+  en: 'en-US',
+  es: 'es-ES',
+  fr: 'fr-FR',
+  de: 'de-DE',
+  it: 'it-IT',
+  pt: 'pt-BR',
+  ja: 'ja-JP',
+  ko: 'ko-KR',
+  zh: 'zh-CN',
+  ar: 'ar-EG',
+  hi: 'hi-IN',
+  ru: 'ru-RU',
+  nl: 'nl-NL',
+  pl: 'pl-PL',
+  tr: 'tr-TR',
+  vi: 'vi-VN',
+  th: 'th-TH',
+  id: 'id-ID',
+  uk: 'uk-UA',
+  sv: 'sv-SE',
+};
+
+function normalizeBcp47Language(rawCode, fallback = 'en-US') {
+  const safeFallback = /^[a-z]{2,3}-[A-Z]{2}$/.test(fallback) ? fallback : 'en-US';
+  if (!rawCode || typeof rawCode !== 'string') return safeFallback;
+  const cleaned = rawCode.trim().replace(/_/g, '-');
+  if (!cleaned) return safeFallback;
+  const lower = cleaned.toLowerCase();
+  if (/^[a-z]{2}$/.test(lower)) {
+    return SHORT_LANGUAGE_DEFAULTS[lower] ?? `${lower}-${lower.toUpperCase()}`;
+  }
+  const parts = cleaned.split('-').filter(Boolean);
+  if (parts.length === 2 && /^[a-z]{2,3}$/i.test(parts[0]) && /^[a-z0-9]{2,4}$/i.test(parts[1])) {
+    return `${parts[0].toLowerCase()}-${parts[1].toUpperCase()}`;
+  }
+  if (parts.length === 3 && /^[a-z]{2,3}$/i.test(parts[0]) && /^[a-z]{2}$/i.test(parts[2])) {
+    return `${parts[0].toLowerCase()}-${parts[2].toUpperCase()}`;
+  }
+  return safeFallback;
+}
+
+function parseBase64Audio(rawInput, fallbackMime = 'audio/webm') {
+  const trimmed = String(rawInput || '').trim();
+  const match = trimmed.match(/^data:([^,]+);base64,(.+)$/i);
+  const rawMime = match ? match[1] : fallbackMime;
+  const base64 = (match ? match[2] : trimmed).replace(/\s+/g, '');
+  const baseMime = String(rawMime || 'audio/webm').split(';')[0].trim().toLowerCase();
+  const mimeType = baseMime === 'audio/x-wav' ? 'audio/wav' : baseMime || 'audio/webm';
+  return { mimeType, base64 };
+}
+
+function capToThreeSentences(rawText) {
+  const clean = String(rawText || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[*_#`>]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean) return 'Hold steady with a little more light and tell me what feels stuck.';
+  const sentences = clean.match(/[^.!?。！？؟।]+[.!?。！？؟।]+|[^.!?。！？؟।]+$/g) ?? [clean];
+  return sentences.map((s) => s.trim()).filter(Boolean).slice(0, 3).join(' ');
+}
+
+app.post('/api/voice-assist', async (req, res) => {
+  const {
+    frames = [],
+    audio,
+    audioDataUrl,
+    audioBase64,
+    audioMimeType = 'audio/webm',
+    preferredLanguage,
+    format,
+  } = req.body ?? {};
+
+  const rawAudio =
+    typeof audio === 'string'
+      ? audio
+      : typeof audio?.data === 'string'
+        ? audio.data
+        : typeof audioDataUrl === 'string'
+          ? audioDataUrl
+          : typeof audioBase64 === 'string'
+            ? audioBase64
+            : '';
+
+  const fallbackLanguage = normalizeBcp47Language(
+    typeof preferredLanguage === 'string' ? preferredLanguage : undefined,
+    'en-US'
+  );
+
+  const { mimeType: cleanAudioMime, base64: cleanAudioBase64 } = parseBase64Audio(
+    rawAudio,
+    (typeof audio === 'object' && audio?.mimeType) || audioMimeType
+  );
+
+  if (cleanAudioBase64.length < 16) {
+    return res.status(400).json({ error: 'Recording was too short. Hold the button while speaking.' });
+  }
+
+  const clients = initGeminiClients();
+  if (!clients) {
+    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
+  }
+
+  // Sample up to 4 recent video frames from the client's rolling buffer
+  const safeFrames = Array.isArray(frames) ? frames : [];
+  const stride = Math.max(1, Math.floor(safeFrames.length / 4));
+  const sampled = safeFrames.filter((_f, i) => i % stride === 0).slice(0, 4);
+
+  const multimodalInput = [
+    ...sampled
+      .filter((f) => typeof f?.dataUrl === 'string' && f.dataUrl.length >= 32)
+      .map((frame) => {
+        const { mimeType, base64 } = parseBase64Frame(frame.dataUrl);
+        return { type: 'image', data: base64, mime_type: mimeType, resolution: 'medium' };
+      }),
+    // Raw microphone audio passed as an inline audio part alongside visual frames
+    { type: 'audio', data: cleanAudioBase64, mime_type: cleanAudioMime },
+    {
+      type: 'text',
+      text:
+        '1. Listen carefully to the attached audio clip. Set speechDetected=true ONLY if intelligible human speech is actually audible; set speechDetected=false if the clip is silent or contains only noise.\n' +
+        '2. If speechDetected=true, write the exact verbatim words heard in userTranscript (in the original spoken language) and set detectedLanguageCode to the matching BCP-47 tag (e.g., "es-ES", "es-MX", "fr-FR", "ja-JP", "de-DE", "pt-BR", "zh-CN", "ar-EG", "hi-IN", "en-US").\n' +
+        `3. If speechDetected=false, set userTranscript="", set detectedLanguageCode="${fallbackLanguage}", do NOT invent a repair problem, and write a brief polite prompt in "${fallbackLanguage}" asking the user to hold the button and speak closer to the microphone.\n` +
+        '4. Write spokenResponse STRICTLY in detectedLanguageCode — never switch languages. Keep spokenResponse under 3 short, direct, actionable sentences with no markdown.',
+    },
+  ];
+
+  let spokenText;
+  let detectedLanguageCode = fallbackLanguage;
+  let detectedLanguageName = 'Auto';
+  try {
+    const reasoning = await clients.interactionsAi.interactions.create({
+      model: 'gemini-4-neon',
+      system_instruction: EXPERT_MECHANIC_SYSTEM_PROMPT,
+      input: multimodalInput,
+      store: false,
+      generation_config: { thinking_level: 'low' },
+      response_format: {
+        type: Type.OBJECT,
+        properties: {
+          speechDetected: { type: Type.BOOLEAN },
+          userTranscript: { type: Type.STRING },
+          detectedLanguageCode: { type: Type.STRING },
+          detectedLanguageName: { type: Type.STRING },
+          spokenResponse: { type: Type.STRING },
+        },
+        required: [
+          'speechDetected',
+          'userTranscript',
+          'detectedLanguageCode',
+          'detectedLanguageName',
+          'spokenResponse',
+        ],
+      },
+    });
+    const rawOutput = reasoning.output_text || '';
+    try {
+      const parsed = JSON.parse(rawOutput);
+      const rawCode =
+        parsed.speechDetected === false ? fallbackLanguage : parsed.detectedLanguageCode;
+      detectedLanguageCode = normalizeBcp47Language(rawCode, fallbackLanguage);
+      detectedLanguageName = parsed.detectedLanguageName?.trim() || detectedLanguageCode;
+      spokenText = capToThreeSentences(parsed.spokenResponse || rawOutput);
+    } catch {
+      spokenText = capToThreeSentences(rawOutput);
+    }
+  } catch (err) {
+    return res.status(502).json({ error: `Multimodal voice analysis failed: ${err.message}` });
+  }
+
+  try {
+    // Request native WAV audio output in the exact detected BCP-47 language
+    const tts = await clients.interactionsAi.interactions.create({
+      model: 'gemini-3.8-flash-lite-tts',
+      input: [
+        {
+          type: 'text',
+          text: spokenText,
+          annotations: [
+            {
+              type: 'speech_metadata',
+              style: `Calm, confident, direct expert mechanic speaking naturally in ${detectedLanguageName}`,
+            },
+          ],
+        },
+      ],
+      store: false,
+      response_format: { type: 'audio' },
+      generation_config: { speech_config: [{ language: detectedLanguageCode, voice: 'Kore' }] },
+    });
+
+    const outputAudio = tts.output_audio;
+    if (!outputAudio?.data) {
+      return res.status(502).json({
+        error: 'Gemini speech synthesis returned no audio.',
+        spokenText,
+        detectedLanguageCode,
+        detectedLanguageName,
+      });
+    }
+
+    const wavMime = outputAudio.mime_type || 'audio/wav';
+    const wantsBinary =
+      format === 'binary' ||
+      (typeof req.headers.accept === 'string' && req.headers.accept.includes('audio/'));
+
+    if (wantsBinary) {
+      const wavBuffer = Buffer.from(outputAudio.data, 'base64');
+      res.setHeader('Content-Type', wavMime);
+      res.setHeader('Content-Length', String(wavBuffer.length));
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-MakerLens-Transcript', encodeURIComponent(spokenText));
+      res.setHeader('X-MakerLens-Language', detectedLanguageCode);
+      res.setHeader('X-MakerLens-Language-Name', encodeURIComponent(detectedLanguageName));
+      res.setHeader('X-MakerLens-Vision-Model', 'gemini-4-neon');
+      res.setHeader('X-MakerLens-Speech-Model', 'gemini-3.8-flash-lite-tts');
+      return res.status(200).send(wavBuffer);
+    }
+
+    return res.json({
+      spokenText,
+      detectedLanguageCode,
+      detectedLanguageName,
+      audioBase64: outputAudio.data,
+      audioMimeType: wavMime,
+      visionModel: 'gemini-4-neon',
+      speechModel: 'gemini-3.8-flash-lite-tts',
+    });
+  } catch (err) {
+    return res.status(502).json({
+      error: `Speech synthesis failed: ${err.message}`,
+      spokenText,
+      detectedLanguageCode,
+      detectedLanguageName,
+    });
   }
 });
 
