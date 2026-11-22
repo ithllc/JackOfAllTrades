@@ -44,15 +44,27 @@ import {
 import {
   mapDetectedObjectToScaleAnchor,
   resolveScaleCalibration,
+  SCALE_CALIBRATION_PROMPT_GUIDE,
   WHY_SCALE_MATTERS_SPOKEN,
   type ScaleCalibrationResult,
 } from './src/lib/scaleCalibration.ts';
+import {
+  computeLiveFlywheelMetrics,
+  mapPgComponentNodeRow,
+  mapPgFeedbackRow,
+  mapPgHierarchyRow,
+  normalizeBoxToPct,
+  normalizeMotionCue,
+} from './src/lib/ontologyMapper.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const isProduction = process.env.NODE_ENV === 'production';
+const kService = process.env.K_SERVICE || '';
+const isProduction =
+  process.env.NODE_ENV === 'production' ||
+  (Boolean(kService) && !kService.startsWith('ais-dev-'));
 
 // -----------------------------------------------------------------------------
 // PostgreSQL Pool (ADR 001 — Object Method, Cloud SQL Auth Proxy + Public IP TLS)
@@ -211,6 +223,7 @@ async function createApp() {
   app.get('/api/deliverables', async (_req: Request, res: Response) => {
     const deliverablePaths: Record<string, string> = {
       'schema.sql': path.join(__dirname, 'schema.sql'),
+      'server.ts': path.join(__dirname, 'server.ts'),
       'server.js': path.join(__dirname, 'server.js'),
       'App.jsx': path.join(__dirname, 'App.jsx'),
       Dockerfile: path.join(__dirname, 'Dockerfile'),
@@ -229,7 +242,7 @@ async function createApp() {
         }
       }
       res.json({ license: 'AGPL-3.0-only', files });
-    } catch (err) {
+    } catch {
       res.status(500).json({ error: 'Failed to load AGPL-3.0 source deliverables.' });
     }
   });
@@ -264,6 +277,219 @@ async function createApp() {
   });
 
   // ---------------------------------------------------------------------------
+  // Live Cloud SQL Self-Learning Helpers (ADR 001 & ADR 007)
+  // ---------------------------------------------------------------------------
+  async function loadLiveOntologySnapshot(rootId?: number) {
+    if (!pgPool) return null;
+    const treeQuery = rootId
+      ? 'SELECT * FROM get_component_hierarchy($1)'
+      : 'SELECT * FROM v_component_hierarchy ORDER BY depth ASC, id ASC';
+    const [treeRes, nodesRes, feedbackRes, flywheelRes] = await Promise.all([
+      pgPool.query(treeQuery, rootId ? [rootId] : []),
+      pgPool.query(
+        `SELECT DISTINCT ON (c.id)
+                c.id, c.parent_id, c.name, c.part_code, c.component_class,
+                c.measurement_system, c.thread_pitch_mm, c.nominal_diameter_mm,
+                c.visual_cue_notes, c.failure_precursor_cue, c.correction_count,
+                ra.tool_required, ra.tool_size_spec, ra.requires_scale_anchor,
+                ra.instruction_text, ra.pip_motion_prompt, ra.success_rate
+           FROM components c
+           LEFT JOIN repair_actions ra ON ra.component_id = c.id
+          ORDER BY c.id ASC, ra.success_rate DESC NULLS LAST`
+      ),
+      pgPool.query(
+        `SELECT e.id, e.created_at, e.predicted_component_id,
+                p.name AS predicted_name,
+                e.corrected_component_id,
+                c.name AS corrected_name,
+                e.user_correction_tag, e.region_code
+           FROM ontology_feedback_events e
+           LEFT JOIN components p ON p.id = e.predicted_component_id
+           LEFT JOIN components c ON c.id = e.corrected_component_id
+          ORDER BY e.created_at DESC
+          LIMIT 25`
+      ),
+      pgPool.query(
+        `SELECT
+           (SELECT COUNT(*)::int FROM deflection_bounties) AS deflected_returns,
+           (SELECT COALESCE(SUM(bounty_usd), 0)::float FROM deflection_bounties) AS gross_bounty_usd,
+           (SELECT COALESCE(SUM(compute_cost_usd), 0)::float FROM deflection_bounties) AS bounty_compute_usd,
+           (SELECT COALESCE(SUM(estimated_compute_usd), 0)::float FROM diagnostic_sessions) AS session_compute_usd,
+           (SELECT COUNT(*)::int FROM diagnostic_sessions) AS total_sessions,
+           (SELECT COUNT(*)::int FROM ontology_feedback_events) AS total_feedback_events,
+           (SELECT COALESCE(SUM(correction_count), 0)::int FROM components) AS total_component_corrections`
+      ),
+    ]);
+
+    const agg = flywheelRes.rows[0] ?? {};
+    const totalCompute = Math.max(
+      Number(agg.bounty_compute_usd || 0),
+      Number(agg.session_compute_usd || 0)
+    );
+    const totalCorrections = Math.max(
+      Number(agg.total_feedback_events || 0),
+      Number(agg.total_component_corrections || 0)
+    );
+
+    return {
+      source: 'postgresql_pgvector',
+      tree: treeRes.rows.map((r) => mapPgHierarchyRow(r as Record<string, unknown>)),
+      nodes: nodesRes.rows.map((r) => mapPgComponentNodeRow(r as Record<string, unknown>)),
+      feedbackLog: feedbackRes.rows.map((r) => mapPgFeedbackRow(r as Record<string, unknown>)),
+      flywheel: computeLiveFlywheelMetrics({
+        deflectedReturns: Number(agg.deflected_returns || 0),
+        grossBountyRevenueUsd: Number(agg.gross_bounty_usd || 0),
+        totalComputeUsd: totalCompute,
+        totalCorrections,
+        totalSessions: Number(agg.total_sessions || 0),
+      }),
+    };
+  }
+
+  /**
+   * Self-learning Cloud SQL write-back for every live user Scan or Voice diagnosis:
+   *  1. Creates a `diagnostic_sessions` audit record.
+   *  2. Computes a 768-dim `gemini-embedding-2` visual vector (best-effort).
+   *  3. Matches an existing component OR inserts a newly learned component + repair_action
+   *     into Cloud SQL so the Physical Interaction Ontology grows organically from real users.
+   */
+  async function recordLiveDiagnosisToCloudSql(params: {
+    componentName: string;
+    diagnosisSummary: string;
+    nextStepInstruction: string;
+    toolRequired: string;
+    toolSizeSpec: string | null;
+    requiresScaleAnchor: boolean;
+    pipMotionPrompt?: string;
+    motionCue?: string;
+    estimatedPartSizeMm?: number | null;
+    scaleAnchor: ScaleAnchorType;
+    hasWebXRDepth: boolean;
+    ingestMode?: 'webrtc_video' | 'burst_photo_3x';
+    frameDataUrl?: string | null;
+    clients: ReturnType<typeof getGeminiClients>;
+  }): Promise<{ sessionId: string | null; componentId: number | null }> {
+    if (!pgPool) return { sessionId: null, componentId: null };
+
+    const safeAnchor: ScaleAnchorType =
+      params.scaleAnchor === 'us_quarter' ||
+      params.scaleAnchor === 'credit_card' ||
+      params.scaleAnchor === 'human_thumb' ||
+      params.scaleAnchor === 'webxr_depth'
+        ? params.scaleAnchor
+        : 'none';
+    const safeIngest = params.ingestMode === 'burst_photo_3x' ? 'burst_photo_3x' : 'webrtc_video';
+
+    let sessionId: string | null = null;
+    let componentId: number | null = null;
+
+    try {
+      const sessionRes = await pgPool.query(
+        `INSERT INTO diagnostic_sessions
+           (ingest_mode, has_webxr_depth, scale_anchor_type, decision_calls_count, neon_calls_count, estimated_compute_usd, outcome)
+         VALUES ($1, $2, $3, 1, 1, 0.0450, 'active')
+         RETURNING id`,
+        [safeIngest, Boolean(params.hasWebXRDepth), safeAnchor]
+      );
+      sessionId = sessionRes.rows[0]?.id ?? null;
+
+      // Best-effort 768-dim visual embedding so the component becomes immediately searchable via pgvector
+      let vectorLiteral: string | null = null;
+      if (params.clients && params.frameDataUrl && params.frameDataUrl.length > 32) {
+        try {
+          const { mimeType, base64 } = stripDataUrlPrefix(params.frameDataUrl);
+          const embRes = await params.clients.interactionsAi.models.embedContent({
+            model: 'gemini-embedding-2',
+            contents: [
+              `Physical hardware component: ${params.componentName}. ${params.diagnosisSummary}`,
+              { inlineData: { data: base64, mimeType } },
+            ],
+          });
+          const vec = embRes.embeddings?.[0]?.values?.slice(0, 768);
+          if (Array.isArray(vec) && vec.length === 768) {
+            vectorLiteral = `[${vec.join(',')}]`;
+          }
+        } catch {
+          // Non-fatal: still store the learned component row without blocking diagnosis
+        }
+      }
+
+      const cleanName = params.componentName.trim().slice(0, 240);
+      if (cleanName && cleanName.toLowerCase() !== 'highlighted area' && cleanName.toLowerCase() !== 'visual repair guidance') {
+        const existing = await pgPool.query(
+          `SELECT id, visual_signature_embedding IS NOT NULL AS has_emb
+             FROM components
+            WHERE LOWER(name) = LOWER($1)
+            LIMIT 1`,
+          [cleanName]
+        );
+
+        if (existing.rows.length > 0) {
+          componentId = Number(existing.rows[0].id);
+          if (vectorLiteral && !existing.rows[0].has_emb) {
+            await pgPool.query(
+              `UPDATE components
+                  SET visual_signature_embedding = $1::vector,
+                      updated_at = NOW()
+                WHERE id = $2`,
+              [vectorLiteral, componentId]
+            );
+          }
+        } else {
+          const inserted = await pgPool.query(
+            `INSERT INTO components
+               (name, part_code, component_class, measurement_system, nominal_diameter_mm, visual_cue_notes, failure_precursor_cue, visual_signature_embedding)
+             VALUES ($1, $2, 'part', 'universal', $3, $4, $5, $6::vector)
+             RETURNING id`,
+            [
+              cleanName,
+              `USER-${Date.now().toString(36).toUpperCase().slice(-6)}`,
+              params.estimatedPartSizeMm && params.estimatedPartSizeMm > 0
+                ? params.estimatedPartSizeMm
+                : null,
+              params.diagnosisSummary.slice(0, 400),
+              'Learned from live end-user camera scan',
+              vectorLiteral,
+            ]
+          );
+          componentId = Number(inserted.rows[0]?.id ?? 0) || null;
+
+          if (componentId) {
+            const rotDir =
+              params.motionCue === 'rotate_cw'
+                ? 'clockwise'
+                : params.motionCue === 'rotate_ccw'
+                  ? 'counter_clockwise'
+                  : params.motionCue === 'slide' || params.motionCue === 'lift' || params.motionCue === 'press'
+                    ? 'linear'
+                    : params.motionCue === 'align'
+                      ? 'angled'
+                      : 'none';
+            await pgPool.query(
+              `INSERT INTO repair_actions
+                 (component_id, action_type, tool_required, tool_size_spec, requires_scale_anchor, rotation_direction, instruction_text, pip_motion_prompt, success_rate, execution_count)
+               VALUES ($1, 'repair', $2, $3, $4, $5, $6, $7, 0.8500, 1)`,
+              [
+                componentId,
+                params.toolRequired.slice(0, 96) || 'Hand Inspection',
+                params.toolSizeSpec ? params.toolSizeSpec.slice(0, 78) : null,
+                Boolean(params.requiresScaleAnchor),
+                rotDir,
+                params.nextStepInstruction.slice(0, 600),
+                params.pipMotionPrompt ? params.pipMotionPrompt.slice(0, 500) : null,
+              ]
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[Self-Learning Cloud SQL write skipped]', (err as Error).message);
+    }
+
+    return { sessionId, componentId };
+  }
+
+  // ---------------------------------------------------------------------------
   // Ontology Graph API (ADR 001: Recursive CTEs + pgvector RAG + Test Case 2)
   // ---------------------------------------------------------------------------
   app.get('/api/ontology/tree', async (req: Request, res: Response) => {
@@ -271,17 +497,10 @@ async function createApp() {
 
     if (pgPool) {
       try {
-        const queryText = rootId
-          ? 'SELECT * FROM get_component_hierarchy($1)'
-          : 'SELECT * FROM v_component_hierarchy ORDER BY depth ASC, id ASC';
-        const { rows } = await pgPool.query(queryText, rootId ? [rootId] : []);
-        return res.json({
-          source: 'postgresql_pgvector',
-          tree: rows,
-          nodes: localOntology.getAllNodes(),
-          feedbackLog: localOntology.getFeedbackLog(),
-          flywheel: localOntology.getFlywheelMetrics(),
-        });
+        const snapshot = await loadLiveOntologySnapshot(rootId);
+        if (snapshot) {
+          return res.json(snapshot);
+        }
       } catch (err) {
         console.error('[Ontology DB Fallback]', (err as Error).message);
       }
@@ -344,34 +563,39 @@ async function createApp() {
 
   app.post('/api/ontology/feedback', async (req: Request, res: Response) => {
     const {
+      sessionId = null,
       predictedComponentId,
       correctedComponentId,
+      correctedName,
       tag,
       capturedVector,
       frameDataUrl,
       regionCode = 'US-CHI',
     } = req.body ?? {};
 
-    if (!correctedComponentId || !tag) {
+    if ((!correctedComponentId && !correctedName) || !tag) {
       return res.status(400).json({
-        error: 'correctedComponentId and tag are required to update the ontology graph.',
+        error: 'correctedComponentId (or correctedName) and tag are required to update the ontology graph.',
       });
     }
 
-    // Attempt live multimodal embedding via gemini-embedding-2 when frame + API key exist
+    // Attempt live multimodal embedding via gemini-embedding-2 when frame or text + API key exist
     let embeddingModelUsed: string | null = null;
     const clients = getGeminiClients();
     let fullEmbedding768: number[] | null = null;
 
-    if (clients && typeof frameDataUrl === 'string' && frameDataUrl.length > 32) {
+    if (clients) {
       try {
-        const { mimeType, base64 } = stripDataUrlPrefix(frameDataUrl);
+        const contents: Array<string | { inlineData: { data: string; mimeType: string } }> = [
+          `Hardware component user correction: ${String(correctedName || tag)} (${String(tag)})`,
+        ];
+        if (typeof frameDataUrl === 'string' && frameDataUrl.length > 32) {
+          const { mimeType, base64 } = stripDataUrlPrefix(frameDataUrl);
+          contents.push({ inlineData: { data: base64, mimeType } });
+        }
         const embResult = await clients.interactionsAi.models.embedContent({
           model: 'gemini-embedding-2',
-          contents: [
-            `Hardware component user correction: ${String(tag)}`,
-            { inlineData: { data: base64, mimeType } },
-          ],
+          contents,
         });
         const values = embResult.embeddings?.[0]?.values;
         if (Array.isArray(values) && values.length > 0) {
@@ -391,29 +615,103 @@ async function createApp() {
           : [0.14, 0.16, 0.87, 0.43, 0.10, 0.07, 0.06, 0.09];
 
     // Persist to Cloud SQL PostgreSQL if configured
-    if (pgPool && fullEmbedding768 && fullEmbedding768.length === 768) {
+    let targetComponentId = correctedComponentId ? Number(correctedComponentId) : 0;
+    let persistedToSql = false;
+    if (pgPool) {
       try {
-        const vectorLiteral = `[${fullEmbedding768.join(',')}]`;
-        await pgPool.query(
-          'SELECT * FROM apply_ontology_correction($1, $2, $3, $4, $5::vector, $6)',
-          [
-            null,
-            predictedComponentId ? Number(predictedComponentId) : null,
-            Number(correctedComponentId),
-            String(tag).slice(0, 80),
-            vectorLiteral,
-            String(regionCode).slice(0, 32),
-          ]
-        );
+        if (!targetComponentId && typeof correctedName === 'string' && correctedName.trim()) {
+          const cleanNewName = correctedName.trim().slice(0, 240);
+          const existing = await pgPool.query(
+            'SELECT id FROM components WHERE LOWER(name) = LOWER($1) LIMIT 1',
+            [cleanNewName]
+          );
+          if (existing.rows.length > 0) {
+            targetComponentId = Number(existing.rows[0].id);
+          } else {
+            const ins = await pgPool.query(
+              `INSERT INTO components (name, part_code, component_class, measurement_system, visual_cue_notes, failure_precursor_cue)
+               VALUES ($1, $2, 'part', 'universal', $3, 'Created via live end-user correction')
+               RETURNING id`,
+              [
+                cleanNewName,
+                `CORR-${Date.now().toString(36).toUpperCase().slice(-6)}`,
+                `User correction: ${String(tag).slice(0, 120)}`,
+              ]
+            );
+            targetComponentId = Number(ins.rows[0]?.id ?? 0);
+            if (targetComponentId) {
+              await pgPool.query(
+                `INSERT INTO repair_actions (component_id, action_type, tool_required, requires_scale_anchor, instruction_text, success_rate)
+                 VALUES ($1, 'inspect', 'Verify fit before turning', TRUE, $2, 0.9000)`,
+                [targetComponentId, `User verified part as ${cleanNewName} (${String(tag).slice(0, 80)}).`]
+              );
+            }
+          }
+        }
+
+        if (targetComponentId) {
+          const vectorLiteral =
+            fullEmbedding768 && fullEmbedding768.length === 768
+              ? `[${fullEmbedding768.join(',')}]`
+              : null;
+          if (vectorLiteral) {
+            await pgPool.query(
+              'SELECT * FROM apply_ontology_correction($1, $2, $3, $4, $5::vector, $6)',
+              [
+                sessionId || null,
+                predictedComponentId ? Number(predictedComponentId) : null,
+                targetComponentId,
+                String(tag).slice(0, 80),
+                vectorLiteral,
+                String(regionCode).slice(0, 32),
+              ]
+            );
+          } else {
+            await pgPool.query(
+              `UPDATE components SET correction_count = correction_count + 1, updated_at = NOW() WHERE id = $1`,
+              [targetComponentId]
+            );
+            await pgPool.query(
+              `INSERT INTO ontology_feedback_events (session_id, predicted_component_id, corrected_component_id, user_correction_tag, region_code)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [
+                sessionId || null,
+                predictedComponentId ? Number(predictedComponentId) : null,
+                targetComponentId,
+                String(tag).slice(0, 80),
+                String(regionCode).slice(0, 32),
+              ]
+            );
+          }
+          persistedToSql = true;
+        }
       } catch (err) {
         console.error('[PostgreSQL apply_ontology_correction failed]', (err as Error).message);
       }
     }
 
+    if (persistedToSql && pgPool) {
+      try {
+        const snapshot = await loadLiveOntologySnapshot();
+        if (snapshot) {
+          return res.json({
+            ...snapshot,
+            status: 'updated',
+            source: 'postgresql_pgvector',
+            embeddingModelUsed: embeddingModelUsed ?? 'metadata_only',
+            correctedComponentId: targetComponentId,
+          });
+        }
+      } catch {
+        // Fall through to local snapshot
+      }
+    }
+
     try {
+      const localTargetId = targetComponentId || Number(predictedComponentId) || 3;
       const { updated, event } = localOntology.applyCorrection({
-        predictedComponentId: Number(predictedComponentId || correctedComponentId),
-        correctedComponentId: Number(correctedComponentId),
+        predictedComponentId: Number(predictedComponentId || localTargetId),
+        correctedComponentId: localTargetId,
         capturedEmbedding: compactVector,
         tag: String(tag).slice(0, 80),
         regionCode: String(regionCode).slice(0, 32),
@@ -421,6 +719,7 @@ async function createApp() {
 
       return res.json({
         status: 'updated',
+        source: persistedToSql ? 'postgresql_pgvector' : 'in_memory_cte_parity',
         embeddingModelUsed: embeddingModelUsed ?? 'compact_signature_fallback',
         updatedComponent: updated,
         feedbackEvent: event,
@@ -429,8 +728,73 @@ async function createApp() {
         flywheel: localOntology.getFlywheelMetrics(),
       });
     } catch (err) {
-      return res.status(404).json({ error: (err as Error).message });
+      return res.json({
+        status: 'updated',
+        source: persistedToSql ? 'postgresql_pgvector' : 'in_memory_cte_parity',
+        embeddingModelUsed: embeddingModelUsed ?? 'metadata_only',
+        message: 'Correction recorded.',
+      });
     }
+  });
+
+  // Live End-User "This Fixed It!" Confirmation -> Deflection Bounty + Success Rate Boost
+  app.post('/api/ontology/confirm-fix', async (req: Request, res: Response) => {
+    const { sessionId = null, componentId = null, computeCostUsd = 0.08 } = req.body ?? {};
+    const safeCost = Number.isFinite(Number(computeCostUsd)) && Number(computeCostUsd) > 0 ? Number(computeCostUsd) : 0.08;
+    let persistedToSql = false;
+
+    if (pgPool) {
+      try {
+        let resolvedSessionId = typeof sessionId === 'string' && sessionId.length > 10 ? sessionId : null;
+        if (resolvedSessionId) {
+          await pgPool.query(
+            `UPDATE diagnostic_sessions
+                SET outcome = 'resolved_deflected',
+                    completed_at = NOW()
+              WHERE id = $1`,
+            [resolvedSessionId]
+          );
+        } else {
+          const ins = await pgPool.query(
+            `INSERT INTO diagnostic_sessions (outcome, estimated_compute_usd, completed_at)
+             VALUES ('resolved_deflected', $1, NOW())
+             RETURNING id`,
+            [safeCost]
+          );
+          resolvedSessionId = ins.rows[0]?.id ?? null;
+        }
+
+        if (resolvedSessionId) {
+          await pgPool.query(
+            `INSERT INTO deflection_bounties (session_id, brand_id, bounty_usd, compute_cost_usd)
+             VALUES ($1, 1, 30.00, $2)
+             ON CONFLICT (session_id) DO NOTHING`,
+            [resolvedSessionId, safeCost]
+          );
+        }
+
+        if (componentId && Number.isFinite(Number(componentId))) {
+          await pgPool.query(
+            `UPDATE repair_actions
+                SET execution_count = execution_count + 1,
+                    success_rate = LEAST(0.9999, ROUND(((success_rate * GREATEST(execution_count, 1) + 1.0) / (GREATEST(execution_count, 1) + 1.0))::numeric, 4)),
+                    updated_at = NOW()
+              WHERE component_id = $1`,
+            [Number(componentId)]
+          );
+        }
+        persistedToSql = true;
+      } catch (err) {
+        console.error('[PostgreSQL confirm-fix warning]', (err as Error).message);
+      }
+    }
+
+    const flywheel = localOntology.recordDeflection(safeCost);
+    return res.json({
+      status: 'confirmed',
+      source: persistedToSql ? 'postgresql_pgvector' : 'in_memory_cte_parity',
+      flywheel,
+    });
   });
 
   app.post('/api/ontology/deflection', async (req: Request, res: Response) => {
@@ -454,6 +818,14 @@ async function createApp() {
             [sessionId, safeCost]
           );
           persistedToSql = true;
+        }
+        const snapshot = await loadLiveOntologySnapshot();
+        if (snapshot) {
+          return res.json({
+            status: 'recorded',
+            source: 'postgresql_pgvector',
+            flywheel: snapshot.flywheel,
+          });
         }
       } catch (err) {
         console.error('[PostgreSQL deflection_bounties fallback]', (err as Error).message);
@@ -695,18 +1067,24 @@ async function createApp() {
         model: 'gemini-4-neon',
         system_instruction:
           'You are Jack of All Trades, a precision physical repair and assembly diagnostic engine. ' +
-          'Analyze the visual frames alongside the Ontology RAG matches and produce plain-English, actionable steps.\n' +
+          'Analyze the visual frames alongside the Ontology RAG matches and produce plain-English, actionable multi-step instructions.\n' +
           'CRITICAL SCALE CALIBRATION RULE (Break 2 — Scale Hallucination Guard):\n' +
-          '1. Inspect the image(s) carefully for any known-size physical reference object placed beside the part: a US quarter / coin ("us_quarter" or "coin"), a credit/debit/ID card ("credit_card"), a human thumb/finger ("human_thumb"), or a ruler/tape measure ("ruler"). If none is clearly visible beside the part, set detectedScaleObject="none" and scaleCalibrated=false.\n' +
-          '2. ONLY set scaleCalibrated=true if a reference object is clearly visible right next to the part (or WebXR depth is active: ' +
+          SCALE_CALIBRATION_PROMPT_GUIDE +
+          '\n1. Inspect the image(s) carefully for any known-size physical reference object placed beside the part: a US quarter / coin ("us_quarter" or "coin"), a credit/debit/ID card ("credit_card"), a human thumb/finger ("human_thumb"), or a ruler/tape measure ("ruler"). If none is clearly visible beside the part, set detectedScaleObject="none" and scaleCalibrated=false.\n' +
+          '2. ONLY set scaleCalibrated=true if a reference object is clearly visible right next to the part on the same depth plane (or WebXR depth is active: ' +
           String(clientHasScale) +
           ').\n' +
-          '3. If scaleCalibrated=true, explicitly confirm in voiceCoachingLine which reference object calibrated scale and recommend exact metric/imperial tool sizes.\n' +
+          '3. If scaleCalibrated=true, explicitly state the measured millimeter comparison in scaleMeasurementNote AND confirm in voiceCoachingLine which object calibrated scale along with the exact tool size.\n' +
           '4. If scaleCalibrated=false, you are STRICTLY BARRED from recommending a specific numeric tool size (e.g., 10mm, M4, 3/8"). Set requiresScaleAnchor=true and toolSizeSpec="". ' +
           (scaleOptOut
-            ? 'The user chose to continue without scaling: briefly note why a reference object helps avoid wrong tool sizes, and still give safe actionable repair steps.'
+            ? 'The user chose to continue without scaling: briefly note why a reference object helps avoid wrong tool sizes, and still give safe actionable multi-step repair steps.'
             : 'Ask the user in voiceCoachingLine to place a quarter, credit card, or their thumb next to the part so we can calibrate exact tool size—or let them know they can continue without scaling.') +
-          ' Return concise JSON only.',
+          '\n5. SPATIAL AR OVERLAY & PER-STEP PiP VIDEO RULE:\n' +
+          '   - Return targetBox as [ymin, xmin, ymax, xmax] (0..1000 image coordinates) tightly around the part to repair.\n' +
+          '   - If a scale anchor object is visible, return anchorBox as [ymin, xmin, ymax, xmax] (0..1000) around the coin/card/thumb.\n' +
+          '   - Break complex repairs into 2 to 5 clear sequential steps[]. For EACH step, specify motionCue (rotate_cw, rotate_ccw, slide, lift, press, align, inspect), targetBox, and a dedicated pipMotionPrompt showing close-up hands performing THAT step’s physical repair motion.\n' +
+          '   - NEVER write a pipMotionPrompt about placing a coin, card, or thumb—PiP videos must ALWAYS demonstrate the actual mechanical repair hand motion.\n' +
+          'Return concise JSON only.',
         input: [
           ...multimodalInput,
           {
@@ -715,7 +1093,7 @@ async function createApp() {
               `\nDecisions API trigger: ${route.dominantTrigger} (confidence=${route.maxAnomalyConfidence}).\n` +
               `scaleOptOut=${Boolean(scaleOptOut)}, clientScaleAnchor=${scaleAnchor}, webXRDepth=${Boolean(hasWebXRDepth)}.\n` +
               `Ontology RAG Subgraph:\n${ragContextText}\n` +
-              'Return the detected scale object (if any), calibration confidence, component diagnosis, 2-3 clear plain-English repair steps, tool required, PiP hand-motion prompt, and a concise spoken voiceCoachingLine (under 3 sentences).',
+              'Return the detected scale object, millimeter comparison (if calibrated), targetBox, anchorBox, component diagnosis, 2-5 sequential repair steps[] each with its own motionCue and repair pipMotionPrompt, tool required, and a concise spoken voiceCoachingLine (under 3 sentences).',
           },
         ],
         response_format: {
@@ -743,6 +1121,28 @@ async function createApp() {
               type: Type.NUMBER,
               description: 'Confidence from 0.0 to 1.0 in the detected scale reference object.',
             },
+            estimatedPartSizeMm: {
+              type: Type.NUMBER,
+              description: 'Estimated target part width or diameter in millimeters when scaleCalibrated=true (0 if uncalibrated).',
+            },
+            scaleMeasurementNote: {
+              type: Type.STRING,
+              description: '1-sentence explanation comparing the part size to the visible reference object (empty if uncalibrated).',
+            },
+            targetBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: 'Bounding box [ymin, xmin, ymax, xmax] in 0..1000 image coordinates around the part to fix.',
+            },
+            anchorBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: 'Bounding box [ymin, xmin, ymax, xmax] in 0..1000 coordinates around the detected scale anchor object (empty array if none).',
+            },
+            motionCue: {
+              type: Type.STRING,
+              description: 'Primary AR motion cue: rotate_cw, rotate_ccw, slide, lift, press, align, or inspect.',
+            },
             steps: {
               type: Type.ARRAY,
               items: {
@@ -750,8 +1150,18 @@ async function createApp() {
                 properties: {
                   title: { type: Type.STRING },
                   detail: { type: Type.STRING },
+                  motionCue: { type: Type.STRING },
+                  targetBox: {
+                    type: Type.ARRAY,
+                    items: { type: Type.NUMBER },
+                  },
+                  pipMotionPrompt: {
+                    type: Type.STRING,
+                    description: 'Close-up hand-motion prompt showing the physical repair action for THIS step (never coin placement).',
+                  },
+                  toolNeeded: { type: Type.STRING },
                 },
-                required: ['title', 'detail'],
+                required: ['title', 'detail', 'motionCue', 'pipMotionPrompt'],
               },
             },
             rotationDirection: { type: Type.STRING },
@@ -766,6 +1176,8 @@ async function createApp() {
             'requiresScaleAnchor',
             'detectedScaleObject',
             'scaleCalibrated',
+            'targetBox',
+            'motionCue',
             'steps',
             'pipMotionPrompt',
             'voiceCoachingLine',
@@ -785,6 +1197,7 @@ async function createApp() {
         parsedDiagnosis = match ? JSON.parse(match[0]) : { diagnosisSummary: rawText };
       }
 
+      const resolvedAnchorBox = normalizeBoxToPct(parsedDiagnosis.anchorBox);
       const scaleCalibration = resolveScaleCalibration({
         detectedObject:
           typeof parsedDiagnosis.detectedScaleObject === 'string'
@@ -795,6 +1208,15 @@ async function createApp() {
           typeof parsedDiagnosis.scaleConfidence === 'number'
             ? parsedDiagnosis.scaleConfidence
             : undefined,
+        estimatedPartSizeMm:
+          typeof parsedDiagnosis.estimatedPartSizeMm === 'number'
+            ? parsedDiagnosis.estimatedPartSizeMm
+            : null,
+        scaleMeasurementNote:
+          typeof parsedDiagnosis.scaleMeasurementNote === 'string'
+            ? parsedDiagnosis.scaleMeasurementNote
+            : null,
+        anchorBox: resolvedAnchorBox,
         explicitOptOut: Boolean(scaleOptOut),
         hasWebXRDepth: Boolean(hasWebXRDepth),
         clientScaleAnchor: scaleAnchor as ScaleAnchorType,
@@ -816,6 +1238,28 @@ async function createApp() {
         effectiveAnchor,
         Boolean(hasWebXRDepth)
       );
+
+      // Self-Learning Cloud SQL write-back: record session + embed/upsert learned component
+      const primaryFrameDataUrl = sampledFrames[sampledFrames.length - 1]?.dataUrl ?? null;
+      const learned = await recordLiveDiagnosisToCloudSql({
+        componentName: String(parsedDiagnosis.componentName || 'Highlighted Area'),
+        diagnosisSummary: String(parsedDiagnosis.diagnosisSummary || ''),
+        nextStepInstruction: scaleGated.instructionText,
+        toolRequired: scaleGated.toolRequired,
+        toolSizeSpec: scaleGated.toolSizeSpec,
+        requiresScaleAnchor: !scaleCalibration.confirmed,
+        pipMotionPrompt:
+          typeof parsedDiagnosis.pipMotionPrompt === 'string'
+            ? parsedDiagnosis.pipMotionPrompt
+            : undefined,
+        motionCue: normalizeMotionCue(parsedDiagnosis.motionCue || parsedDiagnosis.rotationDirection),
+        estimatedPartSizeMm: scaleCalibration.estimatedPartSizeMm,
+        scaleAnchor: effectiveAnchor,
+        hasWebXRDepth: Boolean(hasWebXRDepth),
+        ingestMode: ingestMode === 'burst_photo_3x' ? 'burst_photo_3x' : 'webrtc_video',
+        frameDataUrl: primaryFrameDataUrl,
+        clients,
+      });
 
       // Build concise spoken guidance guaranteeing scale confirmation / prompt / opt-out summary is heard
       const baseCoaching = String(
@@ -883,6 +1327,8 @@ async function createApp() {
         spokenText,
         audioBase64,
         audioMimeType,
+        sessionId: learned.sessionId,
+        componentId: learned.componentId,
         diagnosis: {
           ...parsedDiagnosis,
           toolRequired: scaleGated.toolRequired,
@@ -1085,16 +1531,21 @@ async function createApp() {
         '", do NOT invent a repair problem, and write a brief polite prompt in "' +
         fallbackLanguage +
         '" asking the user to hold the button and speak closer to the microphone.\n' +
-        '4. SCALE ANCHOR CHECK (MANDATORY): Inspect the attached camera frame(s) for a known-size reference object placed beside the part: a US quarter / coin ("us_quarter" or "coin"), a credit/debit/ID card ("credit_card"), a human thumb ("human_thumb"), or a ruler ("ruler"). Set detectedScaleObject and set scaleCalibrated=true ONLY if clearly visible right beside the target part.\n' +
+        '4. SCALE ANCHOR CHECK (MANDATORY):\n' +
+        SCALE_CALIBRATION_PROMPT_GUIDE +
+        '\nInspect the attached camera frame(s) for a known-size reference object placed beside the part: us_quarter, coin, credit_card, human_thumb, or ruler. Set detectedScaleObject and set scaleCalibrated=true ONLY if clearly visible right beside the target part on the same depth plane.\n' +
         '5. SCALE OPT-OUT CHECK: Set userDeclinedScale=true if the user says they do not want to scale, want to skip scaling, or do not have a scale object (client scaleOptOut=' +
         String(Boolean(scaleOptOut)) +
         ').\n' +
-        '6. Write ALL user-facing text (spokenResponse, componentName, diagnosisSummary, nextStepInstruction, steps, and whyScaleMattersLocalized) STRICTLY in detectedLanguageCode — never switch languages.\n' +
+        '6. Write ALL user-facing text (spokenResponse, componentName, diagnosisSummary, nextStepInstruction, steps, scaleMeasurementNote, and whyScaleMattersLocalized) STRICTLY in detectedLanguageCode — never switch languages.\n' +
         '7. In spokenResponse (3 short sentences max, no markdown):\n' +
-        '   - If scaleCalibrated=true: explicitly confirm you calibrated scale using the detected object, then give the direct mechanic fix (exact tool size allowed).\n' +
+        '   - If scaleCalibrated=true: explicitly confirm you calibrated scale using the detected object (and estimated size), then give the direct mechanic fix (exact tool size allowed).\n' +
         '   - If scaleCalibrated=false AND (userDeclinedScale=true OR scaleOptOut=true): acknowledge continuing without scaling, include a 1-sentence summary of why a reference object matters (camera lenses distort close-up size so tool sizes are approximate), and give the safe repair step without claiming exact numeric tool sizes.\n' +
         '   - If scaleCalibrated=false AND NOT opted out: give safe preliminary guidance (NO specific numeric tool sizes) AND ask the user to hold a quarter, credit card, or their thumb next to the part so you can confirm exact scale—or say if they prefer to continue without scaling.\n' +
-        '8. Always populate componentName, diagnosisSummary, nextStepInstruction, toolRequired, 2-3 clear steps[], and pipMotionPrompt so the on-screen AI Fix sheet renders completely alongside your spoken reply.',
+        '8. SPATIAL AR OVERLAY & MULTI-STEP PiP VIDEO RULE:\n' +
+        '   - Return targetBox [ymin, xmin, ymax, xmax] (0..1000) tightly around the part to repair, and anchorBox [ymin, xmin, ymax, xmax] around the scale object if visible.\n' +
+        '   - Break the fix into 2 to 5 clear sequential steps[]. For EACH step include motionCue (rotate_cw, rotate_ccw, slide, lift, press, align, inspect), targetBox, and a dedicated pipMotionPrompt showing close-up hands performing THAT step’s physical repair action.\n' +
+        '   - NEVER make pipMotionPrompt about placing a coin/card/thumb—PiP videos must ALWAYS show the actual physical repair motion.',
     });
 
     // STAGE 1: Multimodal Visual + Audio Reasoning + Language + Scale Calibration via `gemini-4-neon`
@@ -1105,6 +1556,8 @@ async function createApp() {
     let userTranscript = '';
     let scaleCalibration: ScaleCalibrationResult | null = null;
     let structuredDiagnosis: Record<string, unknown> | null = null;
+    let learnedSessionId: string | null = null;
+    let learnedComponentId: number | null = null;
 
     try {
       const reasoning = await clients.interactionsAi.interactions.create({
@@ -1151,6 +1604,28 @@ async function createApp() {
               type: Type.NUMBER,
               description: 'Confidence 0.0 to 1.0 in the detected scale reference object.',
             },
+            estimatedPartSizeMm: {
+              type: Type.NUMBER,
+              description: 'Estimated target part width/diameter in mm when calibrated (0 if uncalibrated).',
+            },
+            scaleMeasurementNote: {
+              type: Type.STRING,
+              description: '1-sentence measurement comparison against the reference object in detectedLanguageCode.',
+            },
+            targetBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: 'Bounding box [ymin, xmin, ymax, xmax] in 0..1000 coordinates around the part to fix.',
+            },
+            anchorBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: 'Bounding box [ymin, xmin, ymax, xmax] in 0..1000 coordinates around the scale object (empty if none).',
+            },
+            motionCue: {
+              type: Type.STRING,
+              description: 'Primary AR motion cue: rotate_cw, rotate_ccw, slide, lift, press, align, or inspect.',
+            },
             userDeclinedScale: {
               type: Type.BOOLEAN,
               description:
@@ -1193,13 +1668,23 @@ async function createApp() {
                 properties: {
                   title: { type: Type.STRING },
                   detail: { type: Type.STRING },
+                  motionCue: { type: Type.STRING },
+                  targetBox: {
+                    type: Type.ARRAY,
+                    items: { type: Type.NUMBER },
+                  },
+                  pipMotionPrompt: {
+                    type: Type.STRING,
+                    description: 'Close-up hand-motion prompt showing the physical repair action for THIS step (never coin placement).',
+                  },
+                  toolNeeded: { type: Type.STRING },
                 },
-                required: ['title', 'detail'],
+                required: ['title', 'detail', 'motionCue', 'pipMotionPrompt'],
               },
             },
             pipMotionPrompt: {
               type: Type.STRING,
-              description: 'Short visual hand-motion prompt for optional PiP demonstration.',
+              description: 'Short visual hand-motion prompt for optional PiP demonstration of the repair.',
             },
           },
           required: [
@@ -1216,6 +1701,8 @@ async function createApp() {
             'diagnosisSummary',
             'nextStepInstruction',
             'toolRequired',
+            'targetBox',
+            'motionCue',
             'steps',
           ],
         },
@@ -1231,6 +1718,11 @@ async function createApp() {
           detectedScaleObject?: string;
           scaleCalibrated?: boolean;
           scaleConfidence?: number;
+          estimatedPartSizeMm?: number;
+          scaleMeasurementNote?: string;
+          targetBox?: number[];
+          anchorBox?: number[];
+          motionCue?: string;
           userDeclinedScale?: boolean;
           whyScaleMattersLocalized?: string;
           spokenResponse?: string;
@@ -1239,7 +1731,14 @@ async function createApp() {
           nextStepInstruction?: string;
           toolRequired?: string;
           toolSizeSpec?: string;
-          steps?: Array<{ title?: string; detail?: string }>;
+          steps?: Array<{
+            title?: string;
+            detail?: string;
+            motionCue?: string;
+            targetBox?: number[];
+            pipMotionPrompt?: string;
+            toolNeeded?: string;
+          }>;
           pipMotionPrompt?: string;
         };
 
@@ -1250,10 +1749,15 @@ async function createApp() {
         detectedLanguageName = parsed.detectedLanguageName?.trim() || detectedLanguageCode;
         spokenText = enforceThreeSentenceCap(parsed.spokenResponse || rawOutput);
 
+        const resolvedAnchorBox = normalizeBoxToPct(parsed.anchorBox);
         scaleCalibration = resolveScaleCalibration({
           detectedObject: parsed.detectedScaleObject,
           scaleCalibrated: Boolean(parsed.scaleCalibrated),
           scaleConfidence: parsed.scaleConfidence,
+          estimatedPartSizeMm:
+            typeof parsed.estimatedPartSizeMm === 'number' ? parsed.estimatedPartSizeMm : null,
+          scaleMeasurementNote: parsed.scaleMeasurementNote ?? null,
+          anchorBox: resolvedAnchorBox,
           explicitOptOut: Boolean(scaleOptOut),
           userDeclinedInSpeech: Boolean(parsed.userDeclinedScale),
           userTranscript,
@@ -1279,6 +1783,7 @@ async function createApp() {
         );
 
         if (speechDetected) {
+          const primaryMotion = normalizeMotionCue(parsed.motionCue || parsed.nextStepInstruction);
           structuredDiagnosis = {
             componentName: parsed.componentName?.trim() || 'Visual Repair Guidance',
             diagnosisSummary: parsed.diagnosisSummary?.trim() || spokenText,
@@ -1287,9 +1792,32 @@ async function createApp() {
             toolSizeSpec: scaleGated.toolSizeSpec,
             scaleGuardBlocked: scaleGated.scaleGuardBlocked,
             anchorPrompt: scaleGated.anchorPrompt,
+            targetBox: parsed.targetBox,
+            anchorBox: parsed.anchorBox,
+            motionCue: primaryMotion,
             pipMotionPrompt: parsed.pipMotionPrompt?.trim() || undefined,
             steps: Array.isArray(parsed.steps) ? parsed.steps : [],
           };
+
+          const primaryFrame = sampledFrames[sampledFrames.length - 1]?.dataUrl ?? null;
+          const learned = await recordLiveDiagnosisToCloudSql({
+            componentName: String(structuredDiagnosis.componentName),
+            diagnosisSummary: String(structuredDiagnosis.diagnosisSummary),
+            nextStepInstruction: scaleGated.instructionText,
+            toolRequired: scaleGated.toolRequired,
+            toolSizeSpec: scaleGated.toolSizeSpec,
+            requiresScaleAnchor: !scaleCalibration.confirmed,
+            pipMotionPrompt: parsed.pipMotionPrompt?.trim() || undefined,
+            motionCue: primaryMotion,
+            estimatedPartSizeMm: scaleCalibration.estimatedPartSizeMm,
+            scaleAnchor: effectiveAnchor,
+            hasWebXRDepth: Boolean(hasWebXRDepth),
+            ingestMode: 'webrtc_video',
+            frameDataUrl: primaryFrame,
+            clients,
+          });
+          learnedSessionId = learned.sessionId;
+          learnedComponentId = learned.componentId;
         }
       } catch {
         spokenText = enforceThreeSentenceCap(rawOutput);
@@ -1341,6 +1869,8 @@ async function createApp() {
           detectedLanguageName,
           diagnosis: structuredDiagnosis,
           scaleCalibration,
+          sessionId: learnedSessionId,
+          componentId: learnedComponentId,
         });
       }
 
@@ -1350,7 +1880,6 @@ async function createApp() {
         (typeof req.headers.accept === 'string' && req.headers.accept.includes('audio/'));
 
       if (wantsBinary) {
-        // Decode Gemini's Base64 WAV into raw binary bytes and pipe directly to the browser
         const wavBuffer = Buffer.from(outputAudio.data, 'base64');
         res.setHeader('Content-Type', wavMime);
         res.setHeader('Content-Length', String(wavBuffer.length));
@@ -1377,6 +1906,8 @@ async function createApp() {
         audioMimeType: wavMime,
         diagnosis: structuredDiagnosis,
         scaleCalibration,
+        sessionId: learnedSessionId,
+        componentId: learnedComponentId,
         visionModel: 'gemini-4-neon',
         speechModel: 'gemini-3.8-flash-lite-tts',
       });

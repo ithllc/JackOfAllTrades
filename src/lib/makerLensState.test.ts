@@ -82,3 +82,48 @@ test('buildHotspotFromDiagnosis maps backend diagnosis into plain-English steps'
   assert.equal(hotspot.toolNeeded, 'Phillips Screwdriver (#2 Phillips)');
   assert.equal(hotspot.steps.length, 2);
 });
+
+test('buildHotspotFromDiagnosis preserves multi-step AR boxes, filters coin-placement PiP prompts, and passes Cloud SQL IDs', () => {
+  const hotspot = buildHotspotFromDiagnosis({
+    diagnosis: {
+      componentName: 'Sink P-Trap Slip Nut',
+      diagnosisSummary: 'The plastic slip nut under the sink is weeping slightly.',
+      nextStepInstruction: 'Turn the slip nut clockwise by hand one quarter turn.',
+      toolRequired: 'Channel-lock pliers',
+      toolSizeSpec: '1.5 inch',
+      scaleGuardBlocked: false,
+      targetBox: [200, 300, 500, 700],
+      anchorBox: [600, 100, 750, 250],
+      steps: [
+        {
+          number: 1,
+          title: 'Place towel and dry the joint',
+          detail: 'Wipe the slip nut dry so you can spot any remaining drip.',
+          motionCue: 'inspect',
+          pipMotionPrompt: 'Place a quarter next to the pipe to calibrate scale.',
+        },
+        {
+          number: 2,
+          title: 'Tighten slip nut clockwise',
+          detail: 'Grip the ridged nut and turn clockwise one quarter turn until snug.',
+          motionCue: 'rotate_cw',
+          targetBox: [220, 320, 480, 680],
+          pipMotionPrompt: 'Close-up hands turning a white PVC P-trap slip nut clockwise one quarter turn.',
+        },
+      ],
+    },
+    sessionId: 'sess-123',
+    componentId: 42,
+  });
+
+  assert.equal(hotspot.steps.length, 2);
+  assert.equal(hotspot.sessionId, 'sess-123');
+  assert.equal(hotspot.componentId, 42);
+  assert.equal(hotspot.xPct, 30);
+  assert.equal(hotspot.yPct, 20);
+  assert.ok(hotspot.anchorBox);
+  assert.equal(hotspot.steps[1].motionCue, 'rotate_cw');
+  assert.doesNotMatch(hotspot.steps[0].pipMotionPrompt || '', /place a quarter/i);
+  assert.match(hotspot.steps[1].pipMotionPrompt || '', /turning a white PVC P-trap/i);
+});
+

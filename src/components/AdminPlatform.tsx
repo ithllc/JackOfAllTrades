@@ -132,15 +132,27 @@ const API_ENDPOINTS = [
   },
   {
     method: 'POST',
+    path: '/api/speak-notice',
+    service: 'gemini-3.8-flash-lite-tts',
+    purpose: 'Synthesizes on-demand WAV voice guidance for single steps or scale opt-out notices',
+  },
+  {
+    method: 'POST',
     path: '/api/ontology/feedback',
-    service: 'gemini-embedding-2 + SQL',
-    purpose: 'Updates component embeddings on user bounding-box corrections',
+    service: 'gemini-embedding-2 + Cloud SQL',
+    purpose: 'Updates or learns component nodes & pgvector embeddings from user corrections',
+  },
+  {
+    method: 'POST',
+    path: '/api/ontology/confirm-fix',
+    service: 'Cloud SQL Flywheel Ledger',
+    purpose: 'Marks session resolved_deflected, updates repair success_rate, and logs $30 bounty',
   },
   {
     method: 'GET',
     path: '/api/deliverables',
     service: 'AGPL-3.0 Disclosure',
-    purpose: 'Serves schema.sql, server.js, App.jsx, Dockerfile, docs, and LICENSE',
+    purpose: 'Serves schema.sql, server.ts, server.js, App.jsx, Dockerfile, docs, and LICENSE',
   },
 ];
 
@@ -187,31 +199,29 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
   const loadSystemData = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [healthRes, dbRes, treeRes] = await Promise.all([
-        fetchJsonSafe<HealthPayload>('/api/health'),
-        fetchJsonSafe<DbStatusPayload>('/api/db/status'),
-        fetchJsonSafe<{
-          source?: string;
-          tree?: OntologyHierarchyRow[];
-          nodes?: OntologyComponentNode[];
-          feedbackLog?: OntologyFeedbackRecord[];
-          flywheel?: FlywheelMetrics;
-        }>('/api/ontology/tree'),
-      ]);
+      const healthPromise = fetchJsonSafe<HealthPayload>('/api/health').then((healthRes) => {
+        if (healthRes) setHealth(healthRes);
+      });
+      const dbPromise = fetchJsonSafe<DbStatusPayload>('/api/db/status').then((dbRes) => {
+        if (dbRes) setDbStatus(dbRes);
+      });
+      const treePromise = fetchJsonSafe<{
+        source?: string;
+        tree?: OntologyHierarchyRow[];
+        nodes?: OntologyComponentNode[];
+        feedbackLog?: OntologyFeedbackRecord[];
+        flywheel?: FlywheelMetrics;
+      }>('/api/ontology/tree').then((treeRes) => {
+        if (treeRes) {
+          setOntologySource(treeRes.source || 'in_memory_cte_parity');
+          setTree(Array.isArray(treeRes.tree) ? treeRes.tree : []);
+          setNodes(Array.isArray(treeRes.nodes) ? treeRes.nodes : []);
+          setFeedbackLog(Array.isArray(treeRes.feedbackLog) ? treeRes.feedbackLog : []);
+          if (treeRes.flywheel) setFlywheel(treeRes.flywheel);
+        }
+      });
 
-      if (healthRes) {
-        setHealth(healthRes);
-      }
-      if (dbRes) {
-        setDbStatus(dbRes);
-      }
-      if (treeRes) {
-        setOntologySource(treeRes.source || 'in_memory_cte_parity');
-        setTree(Array.isArray(treeRes.tree) ? treeRes.tree : []);
-        setNodes(Array.isArray(treeRes.nodes) ? treeRes.nodes : []);
-        setFeedbackLog(Array.isArray(treeRes.feedbackLog) ? treeRes.feedbackLog : []);
-        if (treeRes.flywheel) setFlywheel(treeRes.flywheel);
-      }
+      await Promise.allSettled([healthPromise, dbPromise, treePromise]);
     } finally {
       setRefreshing(false);
     }
@@ -220,16 +230,14 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
   const loadDeliverables = useCallback(async () => {
     setDeliverablesLoading(true);
     try {
-      const data = await fetch('/api/deliverables').then((r) => r.json());
+      const data = await fetchJsonSafe<{ files?: Record<string, string> }>('/api/deliverables');
       if (data?.files) {
         setDeliverables(data.files);
       }
-    } catch {
-      // Leave empty if unavailable
     } finally {
       setDeliverablesLoading(false);
     }
-  }, []);
+  }, [fetchJsonSafe]);
 
   useEffect(() => {
     void loadSystemData();
@@ -760,16 +768,16 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
           <ArchitectureBlueprint
             deliverables={deliverables}
             loading={deliverablesLoading}
+            onRetry={() => void loadDeliverables()}
           />
         )}
 
         {/* TAB 4: OPERATIONS RUNBOOK & QA MATRIX */}
         {activeTab === 'runbook' && (
           <RunbookView
-            runbookMarkdown={
-              deliverables['docs/RUNBOOK.md'] ||
-              (deliverablesLoading ? 'Loading RUNBOOK.md...' : 'Runbook unavailable.')
-            }
+            runbookMarkdown={deliverables['docs/RUNBOOK.md'] || ''}
+            loading={deliverablesLoading}
+            onRetry={() => void loadDeliverables()}
             onLaunchQaTest={handleLaunchQaTest}
           />
         )}

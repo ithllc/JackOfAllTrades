@@ -10,23 +10,25 @@
 
 Required environment variables (inject credentials via Google Secret Manager on Cloud Run or AI Studio Secrets; never commit secrets to source control):
 
-| Variable (Primary / Alias) | Description | Configured Value / Example |
+| Variable (Primary / Alias) | Description | Cloud Run Production Value / Example |
 | :--- | :--- | :--- |
-| `PORT` | HTTP listen port (`3000` local dev, `8080` Cloud Run) | `8080` |
-| `GEMINI_API_KEY` | Server-side Gemini 4 API key (never exposed to browser) | Secret Manager ref |
+| `NODE_ENV` | Runtime mode (`production` on Cloud Run, `development` locally) | `production` |
+| `PORT` | HTTP listen port (`3000` local dev, `8080` injected by Cloud Run) | `8080` |
+| `GEMINI_API_KEY` | Server-side Gemini 4 API key (never exposed to browser) | Runtime Secret / Env Var |
+| `DB_HOST` / `SQL_HOST` | Cloud SQL Unix socket path on Cloud Run (or `127.0.0.1` for local Auth Proxy) | `/cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project` |
+| `DB_PORT` / `SQL_PORT` | PostgreSQL TCP port (ignored when connecting over `/cloudsql/` Unix socket) | `5432` |
+| `DB_NAME` / `SQL_DB_NAME` | Target PostgreSQL database name | `postgres` |
+| `DB_USER` / `SQL_USER` | PostgreSQL application role | `postgres` (or least-privilege `joat_app`) |
+| `DB_PASS` / `SQL_PASSWORD` | PostgreSQL role password (never committed to Git) | Runtime Secret / Env Var |
 | `SQL_CONNECTION_NAME` | Cloud SQL instance connection name (`project:region:instance`) | `gemini4nyc26nyc-2273:us-east1:free-trial-first-project` |
-| `SQL_PUBLIC_IP` | Cloud SQL Public IPv4 address for direct TLS TCP | `34.74.102.222` |
+| `SQL_PUBLIC_IP` | Cloud SQL Public IPv4 address for direct TLS TCP fallback | `34.74.102.222` |
 | `SQL_OUTGOING_IP` | Cloud SQL instance Outgoing IPv4 address (for firewall allowlists) | `34.73.184.213` |
-| `SQL_PORT` | PostgreSQL TCP port (ignored when using `/cloudsql/` Unix socket) | `5432` |
-| `SQL_HOST` / `DB_HOST` | Optional explicit host override (`/cloudsql/...` on Cloud Run, `127.0.0.1` for local Auth Proxy, or blank for auto-detection) | `/cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project` |
 | `SQL_SSL` | Enable TLS for Public IP TCP (`true`); automatically disabled on `/cloudsql/` Unix sockets | `true` |
-| `SQL_DB_NAME` / `DB_NAME` | Target PostgreSQL database name | `postgres` or `jackofalltrades` |
-| `SQL_USER` / `DB_USER` | PostgreSQL application role (prefer least-privilege DML role in production) | `joat_app` or `postgres` |
-| `SQL_PASSWORD` / `DB_PASS` | PostgreSQL role password | Secret Manager ref |
 
-**Transport Auto-Detection (`src/lib/dbConfig.ts` & `server.js`):**
+**Unified Backend & Transport Auto-Detection (`server.ts` → `server.js` & `src/lib/dbConfig.ts`):**
+- **Single Source of Truth:** `Dockerfile` compiles `server.ts` directly into `server.js` (ESM) via `esbuild` and launches `CMD ["node", "server.js"]`. Keep `/server.js` synced whenever updating `/server.ts` (`npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js`).
 - On **Google Cloud Run** (`K_SERVICE` is set automatically **and** the `/cloudsql/<SQL_CONNECTION_NAME>` Unix socket exists on disk): connects over the encrypted Cloud SQL Auth Proxy Unix domain socket with `ssl: false`.
-- Outside Cloud Run (or in sandboxes where `K_SERVICE` is set without a mounted `/cloudsql/` socket): falls back cleanly to Public IP TCP (`34.74.102.222:5432`) with TLS enabled by default (or strict CA verification when `SQL_SSL_CA` is set).
+- Outside Cloud Run (or when `/cloudsql/` is not mounted): falls back cleanly to Public IP TCP (`34.74.102.222:5432`) with TLS enabled by default (or strict CA verification when `SQL_SSL_CA` is set).
 
 ---
 
@@ -90,16 +92,18 @@ Required environment variables (inject credentials via Google Secret Manager on 
      --concurrency 80 \
      --timeout 300 \
      --add-cloudsql-instances gemini4nyc26nyc-2273:us-east1:free-trial-first-project \
-     --set-env-vars "NODE_ENV=production,SQL_CONNECTION_NAME=gemini4nyc26nyc-2273:us-east1:free-trial-first-project,SQL_HOST=/cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project,SQL_PORT=5432,SQL_PUBLIC_IP=34.74.102.222,SQL_OUTGOING_IP=34.73.184.213,SQL_DB_NAME=jackofalltrades,SQL_USER=joat_app" \
-     --set-secrets "GEMINI_API_KEY=joat-gemini-key:latest,SQL_PASSWORD=joat-sql-password:latest" \
+     --set-env-vars "NODE_ENV=production,DB_HOST=/cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project,DB_PORT=5432,DB_NAME=postgres,DB_USER=postgres,SQL_CONNECTION_NAME=gemini4nyc26nyc-2273:us-east1:free-trial-first-project,SQL_PUBLIC_IP=34.74.102.222,SQL_OUTGOING_IP=34.73.184.213,SQL_PORT=5432,SQL_SSL=true" \
+     --set-secrets "GEMINI_API_KEY=joat-gemini-key:latest,DB_PASS=joat-sql-password:latest" \
      --allow-unauthenticated
    ```
 
-3. **Smoke-test the deployed revision, PostgreSQL connectivity, and voice endpoints:**
+3. **Smoke-test the deployed revision, PostgreSQL connectivity, live Ontology, and AGPL deliverables:**
+   *(Note: Google Cloud Run reserves `/healthz`, so always use `/api/health` in production.)*
    ```bash
-   curl -fsS https://<CLOUD_RUN_URL>/healthz
+   curl -fsS https://<CLOUD_RUN_URL>/api/health
    curl -fsS https://<CLOUD_RUN_URL>/api/db/status
    curl -fsS https://<CLOUD_RUN_URL>/api/ontology/tree
+   curl -fsS https://<CLOUD_RUN_URL>/api/deliverables | head -c 400
    ```
 
 ---
@@ -134,13 +138,9 @@ Required environment variables (inject credentials via Google Secret Manager on 
   5. Hidden `<audio>` element auto-plays the WAV response and the caption card displays `Speaking · Spanish` (or `Mechanic Guidance · Spanish`).
 
 ### Automated Unit Test Suite
-Run all pure-logic tests before every release:
+Run all pure-logic tests and verify the compiled Cloud Run bundle before every release:
 ```bash
-npx --yes tsx --test \
-  src/lib/audioUtils.test.ts \
-  src/lib/dbConfig.test.ts \
-  src/lib/makerLensState.test.ts \
-  src/lib/routingLogic.test.ts
+npx --yes tsx --test src/lib/*.test.ts
 node --check server.js
 ```
 

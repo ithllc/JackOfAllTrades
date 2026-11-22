@@ -24,6 +24,14 @@ export interface ScaleCalibrationResult {
   status: ScaleCalibrationStatus;
   detectedObject: DetectedScaleObject;
   detectedObjectLabel: string;
+  /** Physical reference dimension in millimeters (e.g., 24.26mm for US quarter, 85.6mm for credit card) */
+  referenceDimensionMm: number | null;
+  /** Estimated size of the target part in millimeters derived from anchor ratio comparison */
+  estimatedPartSizeMm: number | null;
+  /** Plain-English note explaining how the part was measured against the anchor */
+  scaleMeasurementNote: string | null;
+  /** Optional normalized viewport percentage box around the detected scale anchor */
+  anchorBox?: { xPct: number; yPct: number; wPct: number; hPct: number } | null;
   confidence: number;
   confirmed: boolean;
   optedOut: boolean;
@@ -35,6 +43,25 @@ export interface ScaleCalibrationResult {
   /** Concise voice line confirming calibration, requesting an object, or explaining opt-out */
   spokenScaleNotice: string;
 }
+
+export const REFERENCE_OBJECT_DIMENSIONS_MM: Record<DetectedScaleObject, number | null> = {
+  us_quarter: 24.26,
+  coin: 24.0,
+  credit_card: 85.6,
+  human_thumb: 20.0,
+  ruler: null,
+  webxr_depth: null,
+  none: null,
+};
+
+export const SCALE_CALIBRATION_PROMPT_GUIDE =
+  'KNOWN REFERENCE DIMENSIONS FOR PIXEL-RATIO MEASUREMENT:\n' +
+  '- US Quarter ("us_quarter"): 24.26 mm diameter\n' +
+  '- Standard Coin ("coin"): ~24.0 mm diameter\n' +
+  '- Credit / Debit / ID Card ("credit_card"): 85.60 mm wide x 53.98 mm tall\n' +
+  '- Adult Human Thumb ("human_thumb"): ~20.0 mm nail/pad width\n' +
+  '- Ruler / Tape Measure ("ruler"): read markings directly\n' +
+  'When any reference object is clearly visible on the same depth plane next to the target part, measure the target part width/head diameter as a ratio of the reference object, compute estimatedPartSizeMm, write a 1-sentence scaleMeasurementNote proving the measurement (e.g., "Compared to the 24.26 mm quarter, the bolt head is ~40% as wide (~10 mm), matching a 10mm socket"), and return anchorBox as [ymin, xmin, ymax, xmax] in 0..1000 coordinates.';
 
 export const WHY_SCALE_MATTERS_SUMMARY =
   'Camera lenses distort close-up distance and magnification, so a tiny screw can look identical to a much larger bolt. Placing a known-size object like a quarter, credit card, or your thumb beside the part lets us measure real dimensions and avoid recommending the wrong tool size.';
@@ -99,13 +126,13 @@ export function normalizeDetectedScaleObject(raw?: string | null): DetectedScale
 export function formatScaleObjectLabel(obj: DetectedScaleObject): string {
   switch (obj) {
     case 'us_quarter':
-      return 'quarter coin';
+      return 'quarter coin (24.26 mm)';
     case 'coin':
-      return 'coin';
+      return 'coin (~24 mm)';
     case 'credit_card':
-      return 'credit card';
+      return 'credit card (85.6 mm)';
     case 'human_thumb':
-      return 'your thumb';
+      return 'your thumb (~20 mm)';
     case 'ruler':
       return 'ruler';
     case 'webxr_depth':
@@ -160,6 +187,9 @@ export interface ResolveScaleCalibrationInput {
   detectedObject?: string | null;
   scaleCalibrated?: boolean;
   scaleConfidence?: number;
+  estimatedPartSizeMm?: number | null;
+  scaleMeasurementNote?: string | null;
+  anchorBox?: { xPct: number; yPct: number; wPct: number; hPct: number } | null;
   explicitOptOut?: boolean;
   userDeclinedInSpeech?: boolean;
   userTranscript?: string | null;
@@ -207,20 +237,42 @@ export function resolveScaleCalibration(
   const whyScaleMatters =
     input.localizedWhyScaleMatters?.trim() || WHY_SCALE_MATTERS_SUMMARY;
 
+  const estimatedPartSizeMm =
+    typeof input.estimatedPartSizeMm === 'number' &&
+    Number.isFinite(input.estimatedPartSizeMm) &&
+    input.estimatedPartSizeMm > 0
+      ? Math.round(input.estimatedPartSizeMm * 10) / 10
+      : null;
+
+  const scaleMeasurementNote =
+    typeof input.scaleMeasurementNote === 'string' && input.scaleMeasurementNote.trim()
+      ? input.scaleMeasurementNote.trim()
+      : null;
+
   if (isVisuallyCalibrated && resolvedObject !== 'none') {
     const label = formatScaleObjectLabel(resolvedObject);
+    const refMm = REFERENCE_OBJECT_DIMENSIONS_MM[resolvedObject];
+    const sizePhrase = estimatedPartSizeMm ? ` (~${estimatedPartSizeMm} mm part measured)` : '';
+    const bannerText =
+      scaleMeasurementNote ||
+      `We calibrated scale using the ${label} next to the part${sizePhrase}. Exact tool sizes are unlocked for this repair.`;
+
     return {
       status: 'calibrated',
       detectedObject: resolvedObject,
       detectedObjectLabel: label,
+      referenceDimensionMm: refMm,
+      estimatedPartSizeMm,
+      scaleMeasurementNote,
+      anchorBox: input.anchorBox ?? null,
       confidence,
       confirmed: true,
       optedOut: false,
       userDeclinedInSpeech: false,
       bannerTitle: `Scale Confirmed (${label})`,
-      bannerText: `We calibrated scale using the ${label} next to the part. Exact tool sizes are unlocked for this repair.`,
+      bannerText,
       whyScaleMatters,
-      spokenScaleNotice: `Scale confirmed using the ${label} next to the part.`,
+      spokenScaleNotice: `Scale confirmed using the ${label}${sizePhrase}.`,
     };
   }
 
@@ -233,6 +285,10 @@ export function resolveScaleCalibration(
       status: 'opted_out',
       detectedObject: 'none',
       detectedObjectLabel: 'none',
+      referenceDimensionMm: null,
+      estimatedPartSizeMm: null,
+      scaleMeasurementNote: null,
+      anchorBox: null,
       confidence: 0,
       confirmed: false,
       optedOut: true,
@@ -248,6 +304,10 @@ export function resolveScaleCalibration(
     status: 'needs_anchor',
     detectedObject: 'none',
     detectedObjectLabel: 'none',
+    referenceDimensionMm: null,
+    estimatedPartSizeMm: null,
+    scaleMeasurementNote: null,
+    anchorBox: null,
     confidence: 0,
     confirmed: false,
     optedOut: false,

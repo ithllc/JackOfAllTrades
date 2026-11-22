@@ -7,7 +7,7 @@
 
 ---
 
-## 1. End-to-End System Topology (ADR 001 – ADR 004)
+## 1. End-to-End System Topology (ADR 001 – ADR 007)
 
 ```mermaid
 flowchart TB
@@ -232,15 +232,64 @@ flowchart LR
 
 ---
 
-## 6. Architecture Decision Records & Engineering Mitigations
+## 6. Multi-Step Repair State Machine, Scale Ratio AR Overlay & Per-Step PiP (ADR 005 & ADR 006)
+
+Real-world hardware fixes frequently require 2–6 sequential physical operations (for example: releasing a locking clip, removing two mounting bolts, sliding a cover, and reseating a seal). Pre-generating `N` video clips upfront would add unacceptable latency and compute cost, while showing only a static bottom sheet obscures the live camera.
+
+### Adopted Design
+1. **Unified Structured Multi-Step Diagnosis (Scan Problem + Hold to Explain):** Both `POST /api/analyze-buffer` and `POST /api/voice-assist` instruct `gemini-4-neon` with `SCALE_CALIBRATION_PROMPT_GUIDE` (US Quarter `24.26 mm`, Credit Card `85.60 mm × 53.98 mm`, Adult Thumb `20.0 mm`, or ruler) to return:
+   - `estimatedPartSizeMm` & `scaleMeasurementNote` proving pixel-ratio comparison against the visible anchor.
+   - `targetBox` & `anchorBox` in normalized `0..1000` `[ymin, xmin, ymax, xmax]` coordinates (mapped via `normalizeBoxToPct()`).
+   - Ordered `steps[]` (up to 6 steps), each carrying its own `title`, `detail`, `motionCue` (`rotate_cw`, `rotate_ccw`, `slide`, `lift`, `press`, `align`, `inspect`), optional step-specific `targetBox`, `toolNeeded`, and dedicated `pipMotionPrompt`.
+2. **Strict No-Coin-Placement PiP Invariant:** `pipMotionPrompt` is validated both in the prompt and inside `buildHotspotFromDiagnosis()` so PiP videos **always** demonstrate the physical repair hand motion for the active step—never generic coin placement.
+3. **On-Demand Per-Step PiP Video Caching:** When the user taps **Show Step N Motion**, the client calls `POST /api/generate-pip` using only that step's `pipMotionPrompt` + reference camera frame and caches the resulting video URL in `stepVideos[stepNumber]` (`Record<number, string>`). Switching back to an earlier step replays instantaneously with zero extra API calls.
+4. **Live Spatial AR Overlay + Floating Mini-PiP (`SpatialRepairOverlay.tsx`):**
+   - Renders the active step's corner-bracketed AR reticle + animated SVG directional motion cue directly on top of the live camera feed (`z-20`), plus a dashed emerald **Scale Anchor Verified Box** when calibrated.
+   - `InstructionSheet` stays compact (`max-h-[56dvh]`) and provides a **View AR** toggle so the user can collapse the sheet into a slim step switcher bar while keeping the live AR reticle and a floating corner **Mini-PiP** video window pinned over the camera.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as User (Mobile / Desktop PWA)
+    participant AR as SpatialRepairOverlay + InstructionSheet
+    participant API as Unified Cloud Run server.js
+    participant Neon as gemini-4-neon
+    participant Omni as gemini-omni-1.2-flash
+    participant SQL as Cloud SQL (PostgreSQL 16 + pgvector)
+
+    User->>API: Scan Problem OR Hold to Explain (frames + optional audio)
+    API->>Neon: Prompt with SCALE_CALIBRATION_PROMPT_GUIDE (24.26mm quarter / 85.6mm card / 20mm thumb)
+    Neon-->>API: { estimatedPartSizeMm, targetBox, anchorBox, steps[1..N] with per-step motionCue & pipMotionPrompt }
+    API->>SQL: Auto-log diagnostic_sessions + embed (gemini-embedding-2) + match/insert components & repair_actions
+    API-->>AR: Return diagnosis + scaleCalibration + sessionId + componentId + WAV speech
+    AR->>User: Render Live AR Reticle + SVG Motion Arrow + Compact Multi-Step Sheet
+
+    opt User taps "Show Step N Motion"
+        User->>API: POST /api/generate-pip (Step N pipMotionPrompt + frame)
+        API->>Omni: Generate 6s close-up repair hand-motion loop
+        Omni-->>AR: Cache in stepVideos[N] + play inline or in Floating Mini-PiP
+    end
+
+    opt User taps "Done — This Fixed It!" or "Wrong Part or Size?"
+        User->>API: POST /api/ontology/confirm-fix OR POST /api/ontology/feedback
+        API->>SQL: Update diagnostic_sessions, repair_actions.success_rate, components.visual_signature_embedding & $30 bounty
+    end
+```
+
+---
+
+## 7. Architecture Decision Records & Engineering Mitigations
 
 | ID | Architectural Problem | Adopted Design | Verification Standard |
 | :--- | :--- | :--- | :--- |
-| **ADR 001** | Graph traversal + multimodal RAG without Neo4j or stateful SQLite volumes | PostgreSQL 16 with Recursive CTEs (`WITH RECURSIVE`) and `pgvector` HNSW cosine indexes; dual-transport Cloud SQL resolver (`SQL_*` and `DB_*` aliases, `/cloudsql/` socket presence check + Public IP TLS fallback) | `schema.sql` functions `get_component_hierarchy` & `rag_search_ontology_subgraph`; unit tests (`dbConfig.test.ts`) |
-| **ADR 002** | Scale-to-zero serverless hosting for WebRTC signaling + API proxy | Stateless Node.js/Express + Vite PWA container on Google Cloud Run (`PORT=8080`, `PORT=3000` dev) | `Dockerfile` multi-stage build + `/healthz` & `/api/db/status` probes |
+| **ADR 001** | Graph traversal + multimodal RAG without Neo4j or stateful SQLite volumes | PostgreSQL 16 with Recursive CTEs (`WITH RECURSIVE`) and `pgvector` HNSW cosine indexes; dual-transport Cloud SQL resolver (`SQL_*` and `DB_*` aliases, `/cloudsql/` socket presence check + Public IP TLS fallback) | `schema.sql` functions `get_component_hierarchy` & `rag_search_ontology_subgraph`; unit tests (`dbConfig.test.ts`, `ontologyMapper.test.ts`) |
+| **ADR 002** | Scale-to-zero serverless hosting & drift between dev `server.ts` and Cloud Run `server.js` | Single source of truth in `server.ts`, compiled by `esbuild` directly into `server.js` (ESM) in `Dockerfile` and repo so dev, Cloud Run, and `node server.js` expose identical routes (`/api/health`, `/api/ontology/*`, `/api/deliverables`) | `Dockerfile` multi-stage build + production `node server.js` smoke test |
 | **ADR 003 / Break 1** | Continuous 1080p streaming caused iPhone Safari thermal dimming & API bloat | Client-side Wasm motion gate (3s stillness) → zero-token `gemini-decision-1` → conditional `gemini-4-neon` | QA Test Case 3 + unit tests (`routingLogic.test.ts`) |
-| **ADR 004** | Hands-free voice queries from global users require same-language spoken mechanic guidance without forcing English | Two-stage pipeline at `POST /api/voice-assist`: `gemini-4-neon` structured JSON language detection + <3-sentence same-language reply → `normalizeBcp47Language` → `gemini-3.8-flash-lite-tts` (`response_format: { type: 'audio' }`, dynamic `speech_config.language`) returning binary 24 kHz RIFF WAV | QA Test Case 4 (live non-English audio round-trip) + unit tests (`audioUtils.test.ts`) |
-| **Break 2** | "Scale" hallucination recommending a pipe wrench for a 2mm screw | Mandatory WebXR depth or physical scale anchor (coin, credit card, thumb) enforced in both SQL and server response guard | `enforceScaleAnchorInvariant()` + `requires_scale_anchor` SQL check |
+| **ADR 004** | Hands-free voice queries from global users require same-language spoken mechanic guidance without forcing English | Two-stage pipeline at `POST /api/voice-assist`: `gemini-4-neon` structured JSON language detection + Scale Calibration + multi-step diagnosis → `normalizeBcp47Language` → `gemini-3.8-flash-lite-tts` returning binary 24 kHz RIFF WAV + structured repair guide | QA Test Case 4 + unit tests (`audioUtils.test.ts`, `scaleCalibration.test.ts`) |
+| **ADR 005** | Multi-step repairs need visual hand-motion guidance without pre-generating N expensive PiP videos upfront | Per-step `pipMotionPrompt` + `motionCue` + `targetBox` returned in `steps[]`; client generates 6s `gemini-omni-1.2-flash` clips strictly on demand per step and caches them in `stepVideos[stepNumber]` with a floating Mini-PiP window | Unit tests (`makerLensState.test.ts`) + live browser stepper verification |
+| **ADR 006 / Break 2** | "Scale" hallucination & hidden AR overlays covered by tall bottom sheets | Pixel-ratio measurement prompt (`24.26 mm` US quarter, `85.6 mm` card, `20 mm` thumb) returning `estimatedPartSizeMm`, `scaleMeasurementNote`, `targetBox`, and `anchorBox`, rendered via `<SpatialRepairOverlay/>` with animated directional SVG arrows and a compact sheet + **View AR** toggle | `resolveScaleCalibration()`, `normalizeBoxToPct()`, `SpatialRepairOverlay.tsx` |
+| **ADR 007** | Admin Ontology stayed static unless operators manually inserted rows | Automatic Cloud SQL write-back (`recordLiveDiagnosisToCloudSql`) logging every live Scan & Voice session, embedding frames via `gemini-embedding-2`, auto-inserting newly discovered parts, plus in-camera **Done — This Fixed It!** (`POST /api/ontology/confirm-fix`) and **Wrong Part or Size?** (`POST /api/ontology/feedback`) | `ontologyMapper.test.ts` + live `/api/ontology/tree` PostgreSQL verification |
 | **Hardest Input** | Water-smeared lens + chrome glare + spraying water under a kitchen sink | Automatic downgrade from WebRTC video to 3-shot high-contrast burst photography + voice instruction | QA Test Case 1 (3G throttling / visual noise fallback) |
 | **UX Accessibility** | Technical camera telemetry overwhelms non-technical DIY users | Full-screen **Magic Window** UI (`LiveCameraView.tsx`) with only Scan, Push-to-Talk, and Flashlight controls + first-visit interactive `<DemoMode/>` | Unit tests (`makerLensState.test.ts`) + browser verification |
+
 

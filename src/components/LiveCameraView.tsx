@@ -1,5 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   Flashlight,
   FlashlightOff,
   Mic,
@@ -23,6 +26,7 @@ import {
 } from '../lib/scaleCalibration';
 import { ScanningOverlay } from './ScanningOverlay';
 import { InstructionSheet } from './InstructionSheet';
+import { SpatialRepairOverlay } from './SpatialRepairOverlay';
 import { BrandMark } from './BrandMark';
 
 interface LiveCameraViewProps {
@@ -117,8 +121,15 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
   const [cameraReady, setCameraReady] = useState(false);
   const [torchSupported, setTorchSupported] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
-  const [motionVideoUrl, setMotionVideoUrl] = useState<string | null>(null);
-  const [loadingMotionVideo, setLoadingMotionVideo] = useState(false);
+  const [currentStepNumber, setCurrentStepNumber] = useState<number>(1);
+  const [completedSteps, setCompletedSteps] = useState<number[]>([]);
+  const [stepVideos, setStepVideos] = useState<Record<number, string>>({});
+  const [loadingStepVideo, setLoadingStepVideo] = useState<number | null>(null);
+  const [hideMiniPip, setHideMiniPip] = useState<boolean>(false);
+  const [fixConfirmed, setFixConfirmed] = useState<boolean>(false);
+  const [confirmingFix, setConfirmingFix] = useState<boolean>(false);
+  const [correctionSaved, setCorrectionSaved] = useState<boolean>(false);
+  const [submittingCorrection, setSubmittingCorrection] = useState<boolean>(false);
 
   // Scale Anchor opt-out preference (user can tap Continue Without Scaling or say it aloud)
   const [scaleOptOut, setScaleOptOut] = useState(false);
@@ -462,7 +473,13 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     async (audioBlob: Blob) => {
       setVoicePhase('thinking');
       setVoiceNotice(null);
-      setMotionVideoUrl(null);
+      setStepVideos({});
+      setLoadingStepVideo(null);
+      setHideMiniPip(false);
+      setCurrentStepNumber(1);
+      setCompletedSteps([]);
+      setFixConfirmed(false);
+      setCorrectionSaved(false);
 
       try {
         // 1. Encode recorded MediaRecorder Blob into a Base64 data URL
@@ -527,6 +544,8 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
             sourceMode: 'voice',
             spokenLanguage: detectedLangName,
             userTranscript: typeof data.userTranscript === 'string' ? data.userTranscript : null,
+            sessionId: typeof data.sessionId === 'string' ? data.sessionId : null,
+            componentId: typeof data.componentId === 'number' ? data.componentId : null,
           });
           onScanSucceeded(hotspot);
           setSheetOpen(true);
@@ -660,7 +679,13 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
       const effectiveOptOut = overrideOptOut ?? scaleOptOut;
       stopAudioPlayback();
       setVoiceNotice(null);
-      setMotionVideoUrl(null);
+      setStepVideos({});
+      setLoadingStepVideo(null);
+      setHideMiniPip(false);
+      setCurrentStepNumber(1);
+      setCompletedSteps([]);
+      setFixConfirmed(false);
+      setCorrectionSaved(false);
       setSheetOpen(false);
       onStartScan();
 
@@ -704,6 +729,8 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
           spokenText: spoken,
           voiceInstruction: data.voiceInstruction,
           sourceMode: 'scan',
+          sessionId: typeof data.sessionId === 'string' ? data.sessionId : null,
+          componentId: typeof data.componentId === 'number' ? data.componentId : null,
         });
         onScanSucceeded(hotspot);
         setSheetOpen(true);
@@ -774,29 +801,110 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     }
   }, [activeHotspot, onScanSucceeded]);
 
-  // Optional "Show Me How" motion clip from backend
-  const handleRequestMotionVideo = async () => {
-    if (!activeHotspot?.motionPrompt) return;
-    setLoadingMotionVideo(true);
+  // Select a repair step, marking prior steps completed and syncing the AR reticle
+  const handleSelectStep = useCallback((stepNumber: number) => {
+    setCurrentStepNumber((prev) => {
+      if (stepNumber > prev) {
+        setCompletedSteps((done) => Array.from(new Set([...done, prev])));
+      }
+      return stepNumber;
+    });
+    setHideMiniPip(false);
+  }, []);
+
+  // Read a single repair step aloud using neural TTS with browser fallback
+  const handleReadStepAloud = useCallback(
+    (stepNumber: number) => {
+      const step = activeHotspot?.steps.find((s) => s.number === stepNumber);
+      if (!step) return;
+      void speakNoticeText(`Step ${step.number}: ${step.title}. ${step.detail}`);
+    },
+    [activeHotspot, speakNoticeText]
+  );
+
+  // On-demand per-step PiP motion clip generator (cached in stepVideos[stepNumber])
+  const handleRequestStepMotionVideo = useCallback(
+    async (stepNumber: number, prompt: string) => {
+      if (!prompt.trim() || stepVideos[stepNumber]) return;
+      setLoadingStepVideo(stepNumber);
+      try {
+        const frame = captureFrameDataUrl();
+        const resp = await fetch('/api/generate-pip', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            referenceFrameDataUrl: frame,
+            duration: '6s',
+          }),
+        });
+        const data = await resp.json();
+        const videoUrl = data.videoDataUrl || data.videoUri;
+        if (resp.ok && typeof videoUrl === 'string' && videoUrl.length > 0) {
+          setStepVideos((prev) => ({ ...prev, [stepNumber]: videoUrl }));
+          setHideMiniPip(false);
+        }
+      } finally {
+        setLoadingStepVideo((curr) => (curr === stepNumber ? null : curr));
+      }
+    },
+    [captureFrameDataUrl, stepVideos]
+  );
+
+  // Live Self-Learning Flywheel: Confirm that the guided repair fixed the issue
+  const handleConfirmFix = useCallback(async () => {
+    if (!activeHotspot || fixConfirmed || confirmingFix) return;
+    setConfirmingFix(true);
     try {
-      const frame = captureFrameDataUrl();
-      const resp = await fetch('/api/generate-pip', {
+      const resp = await fetch('/api/ontology/confirm-fix', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          prompt: activeHotspot.motionPrompt,
-          referenceFrameDataUrl: frame,
-          duration: '6s',
+          sessionId: activeHotspot.sessionId ?? undefined,
+          componentId: activeHotspot.componentId ?? undefined,
+          componentName: activeHotspot.label,
         }),
       });
-      const data = await resp.json();
-      if (resp.ok && (data.videoDataUrl || data.videoUri)) {
-        setMotionVideoUrl(data.videoDataUrl || data.videoUri);
+      if (resp.ok) {
+        setFixConfirmed(true);
+        setCompletedSteps(activeHotspot.steps.map((s) => s.number));
       }
     } finally {
-      setLoadingMotionVideo(false);
+      setConfirmingFix(false);
     }
-  };
+  }, [activeHotspot, confirmingFix, fixConfirmed]);
+
+  // Live Self-Learning Flywheel: Submit an end-user part/size correction to Cloud SQL
+  const handleSubmitLiveCorrection = useCallback(
+    async (correctedName: string, tag: string) => {
+      if (!activeHotspot || submittingCorrection) return;
+      setSubmittingCorrection(true);
+      try {
+        const frame = captureFrameDataUrl();
+        const resp = await fetch('/api/ontology/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: activeHotspot.sessionId ?? undefined,
+            predictedComponentId: activeHotspot.componentId ?? undefined,
+            correctedName,
+            tag,
+            frameDataUrl: frame ?? undefined,
+          }),
+        });
+        if (resp.ok) {
+          setCorrectionSaved(true);
+          onScanSucceeded({
+            ...activeHotspot,
+            label: correctedName,
+          });
+        }
+      } finally {
+        setSubmittingCorrection(false);
+      }
+    },
+    [activeHotspot, captureFrameDataUrl, onScanSucceeded, submittingCorrection]
+  );
 
   const isScanning = scanPhase === 'scanning';
   const isThinkingVoice = voicePhase === 'thinking';
@@ -893,28 +1001,16 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         </button>
       </header>
 
-      {/* Highlighted Part Overlay after EITHER Scan Problem or Hold to Explain */}
-      {scanPhase === 'result' && activeHotspot && (
-        <div
-          className="absolute z-20"
-          style={{
-            left: `${activeHotspot.xPct}%`,
-            top: `${activeHotspot.yPct}%`,
-            width: `${activeHotspot.wPct}%`,
-            height: `${activeHotspot.hPct}%`,
-          }}
-        >
-          <button
-            type="button"
-            onClick={() => setSheetOpen(true)}
-            aria-label={`View repair instructions for ${activeHotspot.label}`}
-            className="relative h-full w-full min-h-[56px] rounded-2xl border-2 border-amber-400 bg-amber-400/15 hover:bg-amber-400/25 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"
-          >
-            <span className="absolute -top-8 left-1/2 -translate-x-1/2 rounded-lg bg-black/80 px-3 py-1 text-xs font-semibold text-amber-300 whitespace-nowrap shadow-md">
-              {activeHotspot.label}
-            </span>
-          </button>
-        </div>
+      {/* Live AR Spatial Repair Overlay (Bounding Box + Motion Cue + Scale Anchor + Mini-PiP) */}
+      {scanPhase === 'result' && activeHotspot && !isBusy && (
+        <SpatialRepairOverlay
+          hotspot={activeHotspot}
+          currentStepNumber={currentStepNumber}
+          sheetOpen={sheetOpen}
+          activeStepVideoUrl={hideMiniPip ? null : stepVideos[currentStepNumber] ?? null}
+          onOpenSheet={() => setSheetOpen(true)}
+          onCloseMiniPip={() => setHideMiniPip(true)}
+        />
       )}
 
       {/* Human-Readable Blurred Scanning / Listening Overlay */}
@@ -934,8 +1030,8 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         </div>
       )}
 
-      {/* Spoken AI Mechanic Caption Card (shown when sheet is closed) */}
-      {!sheetOpen && !isRecording && !isBusy && spokenReply && (
+      {/* Spoken AI Mechanic Caption Card (shown when no step guide is active) */}
+      {!sheetOpen && !activeHotspot && !isRecording && !isBusy && spokenReply && (
         <div
           role="status"
           aria-live="polite"
@@ -1067,6 +1163,76 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         </div>
       )}
 
+      {/* Collapsed AR Step Switcher Bar (when viewing live AR overlay over camera) */}
+      {scanPhase === 'result' && activeHotspot && !sheetOpen && !isBusy && !isRecording && (
+        <div className="absolute inset-x-4 bottom-24 z-25 mx-auto flex max-w-md items-center justify-between gap-2 rounded-2xl border border-amber-400/40 bg-neutral-950/90 px-3 py-2 shadow-2xl backdrop-blur-xl">
+          <div className="flex items-center gap-1.5 min-w-0">
+            {activeHotspot.steps.length > 1 && (
+              <button
+                type="button"
+                onClick={() => handleSelectStep(Math.max(1, currentStepNumber - 1))}
+                disabled={currentStepNumber <= 1}
+                aria-label="Previous repair step"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20 disabled:opacity-35 cursor-pointer"
+              >
+                <ChevronLeft className="h-4 w-4" aria-hidden="true" />
+              </button>
+            )}
+            <div className="min-w-0 px-1">
+              <p className="text-[11px] font-semibold text-amber-300 tabular-nums">
+                Step {currentStepNumber} of {activeHotspot.steps.length}
+              </p>
+              <p className="text-xs font-medium text-white truncate">
+                {activeHotspot.steps.find((s) => s.number === currentStepNumber)?.title ||
+                  activeHotspot.label}
+              </p>
+            </div>
+            {activeHotspot.steps.length > 1 && (
+              <button
+                type="button"
+                onClick={() =>
+                  handleSelectStep(Math.min(activeHotspot.steps.length, currentStepNumber + 1))
+                }
+                disabled={currentStepNumber >= activeHotspot.steps.length}
+                aria-label="Next repair step"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white/10 text-white hover:bg-white/20 disabled:opacity-35 cursor-pointer"
+              >
+                <ChevronRight className="h-4 w-4" aria-hidden="true" />
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            {(hasReplyAudio || spokenReply) && (
+              <button
+                type="button"
+                onClick={() => (isSpeaking ? stopAudioPlayback() : void handleReplayAudio())}
+                aria-label={isSpeaking ? 'Stop spoken guidance' : 'Replay spoken guidance'}
+                className={`flex h-9 w-9 items-center justify-center rounded-full transition-colors cursor-pointer ${
+                  isSpeaking
+                    ? 'bg-amber-400 text-neutral-950 animate-pulse'
+                    : 'bg-white/10 text-amber-300 hover:bg-white/20'
+                }`}
+              >
+                {isSpeaking ? (
+                  <Square className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
+                ) : (
+                  <Volume2 className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setSheetOpen(true)}
+              className="inline-flex min-h-[36px] shrink-0 items-center gap-1 rounded-full bg-amber-400 px-3.5 py-1 text-xs font-bold text-neutral-950 hover:bg-amber-300 transition-colors whitespace-nowrap cursor-pointer"
+            >
+              <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+              Open Guide
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Step-by-Step Repair Instruction Sheet (Unified for Scan Problem & Hold to Explain) */}
       {scanPhase === 'result' && activeHotspot && sheetOpen && (
         <InstructionSheet
@@ -1074,15 +1240,25 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
           primaryActionLabel="Scan Again"
           onPrimaryAction={() => {
             setSheetOpen(false);
-            setMotionVideoUrl(null);
+            setStepVideos({});
+            setLoadingStepVideo(null);
+            setCurrentStepNumber(1);
+            setCompletedSteps([]);
+            setFixConfirmed(false);
+            setCorrectionSaved(false);
             onResetScan();
           }}
           onClose={() => setSheetOpen(false)}
-          motionVideoUrl={motionVideoUrl}
-          loadingMotionVideo={loadingMotionVideo}
-          onRequestMotionVideo={
-            activeHotspot.motionPrompt ? () => void handleRequestMotionVideo() : undefined
+          onViewOverlay={() => setSheetOpen(false)}
+          activeStepNumber={currentStepNumber}
+          completedSteps={completedSteps}
+          onSelectStep={handleSelectStep}
+          stepVideos={stepVideos}
+          loadingStepVideo={loadingStepVideo}
+          onRequestStepMotionVideo={(stepNum, prompt) =>
+            void handleRequestStepMotionVideo(stepNum, prompt)
           }
+          onReadStepAloud={handleReadStepAloud}
           isSpeaking={isSpeaking}
           hasAudio={hasReplyAudio || Boolean(spokenReply)}
           onReplayAudio={() => void handleReplayAudio()}
@@ -1090,6 +1266,12 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
           onRescanWithAnchor={handleRescanWithAnchor}
           onOptOutScale={handleOptOutScale}
           onReenableScale={handleReenableScale}
+          fixConfirmed={fixConfirmed}
+          confirmingFix={confirmingFix}
+          onConfirmFix={() => void handleConfirmFix()}
+          correctionSaved={correctionSaved}
+          submittingCorrection={submittingCorrection}
+          onSubmitCorrection={(name, tag) => void handleSubmitLiveCorrection(name, tag)}
         />
       )}
     </div>

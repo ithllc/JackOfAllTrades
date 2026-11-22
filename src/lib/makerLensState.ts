@@ -4,6 +4,12 @@
  */
 
 import type { ScaleCalibrationResult } from './scaleCalibration';
+import {
+  normalizeBoxToPct,
+  normalizeMotionCue,
+  type BoundingBoxPct,
+  type RepairMotionCue,
+} from './ontologyMapper';
 
 export type AppMode = 'demo' | 'live';
 export type ScanPhase = 'idle' | 'scanning' | 'result' | 'error';
@@ -22,6 +28,14 @@ export interface RepairStep {
   number: number;
   title: string;
   detail: string;
+  /** Directional AR overlay cue rendered on the live camera feed for this step */
+  motionCue?: RepairMotionCue;
+  /** Optional step-specific target bounding box in percentage viewport coordinates */
+  targetBox?: BoundingBoxPct | null;
+  /** Dedicated 6-second close-up hand-motion prompt for on-demand per-step PiP loop */
+  pipMotionPrompt?: string;
+  /** Optional tool specifically required for this step */
+  toolNeeded?: string;
 }
 
 export interface HighlightHotspot {
@@ -32,6 +46,10 @@ export interface HighlightHotspot {
   yPct: number;
   wPct: number;
   hPct: number;
+  /** Primary directional motion cue for the overall repair */
+  motionCue?: RepairMotionCue;
+  /** Optional viewport box highlighting the detected scale anchor object */
+  anchorBox?: BoundingBoxPct | null;
   summary: string;
   toolNeeded: string;
   steps: RepairStep[];
@@ -44,6 +62,10 @@ export interface HighlightHotspot {
   userTranscript?: string | null;
   /** Authoritative Scale Calibration result (calibrated | needs_anchor | opted_out) */
   scaleCalibration?: ScaleCalibrationResult | null;
+  /** Cloud SQL diagnostic_sessions.id created for live self-learning feedback */
+  sessionId?: string | null;
+  /** Cloud SQL components.id matched or newly learned for this scan */
+  componentId?: number | null;
 }
 
 export const DEMO_BATTERY_HOTSPOT: HighlightHotspot = {
@@ -53,6 +75,7 @@ export const DEMO_BATTERY_HOTSPOT: HighlightHotspot = {
   yPct: 44,
   wPct: 26,
   hPct: 20,
+  motionCue: 'press',
   summary: 'Press the ridged latch inward and slide the cover down to open the battery compartment.',
   toolNeeded: 'No tools needed (thumb press)',
   steps: [
@@ -60,16 +83,19 @@ export const DEMO_BATTERY_HOTSPOT: HighlightHotspot = {
       number: 1,
       title: 'Press the ridged release tab',
       detail: 'Place your thumb on the textured groove inside the highlighted box and press gently inward.',
+      motionCue: 'press',
     },
     {
       number: 2,
       title: 'Slide the cover downward',
       detail: 'While holding light inward pressure, glide the plastic door toward the bottom edge until it clicks free.',
+      motionCue: 'slide',
     },
     {
       number: 3,
       title: 'Lift and check polarity',
       detail: 'Lift the cover away and match the + and − symbols printed inside the tray when replacing batteries.',
+      motionCue: 'lift',
     },
   ],
 };
@@ -233,7 +259,18 @@ export function buildHotspotFromDiagnosis(payload: {
     toolSizeSpec?: string | null;
     scaleGuardBlocked?: boolean;
     pipMotionPrompt?: string;
-    steps?: Array<{ number?: number; title?: string; detail?: string }>;
+    motionCue?: string;
+    targetBox?: unknown;
+    anchorBox?: unknown;
+    steps?: Array<{
+      number?: number;
+      title?: string;
+      detail?: string;
+      motionCue?: string;
+      targetBox?: unknown;
+      pipMotionPrompt?: string;
+      toolNeeded?: string;
+    }>;
   };
   scaleCalibration?: ScaleCalibrationResult | null;
   voiceInstruction?: string;
@@ -241,6 +278,8 @@ export function buildHotspotFromDiagnosis(payload: {
   sourceMode?: 'scan' | 'voice';
   spokenLanguage?: string | null;
   userTranscript?: string | null;
+  sessionId?: string | null;
+  componentId?: number | null;
 }): HighlightHotspot {
   const diag = payload.diagnosis;
   const label = diag?.componentName?.trim() || 'Highlighted Area';
@@ -254,7 +293,8 @@ export function buildHotspotFromDiagnosis(payload: {
     'Check the alignment gently before applying any force.';
 
   const isCalibrated = payload.scaleCalibration?.status === 'calibrated';
-  const isSizeBlocked = Boolean(diag?.scaleGuardBlocked) || (payload.scaleCalibration != null && !isCalibrated);
+  const isSizeBlocked =
+    Boolean(diag?.scaleGuardBlocked) || (payload.scaleCalibration != null && !isCalibrated);
 
   const toolLine =
     diag?.toolRequired && diag?.toolSizeSpec && !isSizeBlocked
@@ -265,59 +305,82 @@ export function buildHotspotFromDiagnosis(payload: {
           : diag.toolRequired
         : 'No special tools needed';
 
+  const defaultBox: BoundingBoxPct = { xPct: 26, yPct: 16, wPct: 48, hPct: 30 };
+  const resolvedTargetBox = normalizeBoxToPct(diag?.targetBox, defaultBox) ?? defaultBox;
+  const resolvedAnchorBox =
+    payload.scaleCalibration?.anchorBox ?? normalizeBoxToPct(diag?.anchorBox) ?? null;
+  const primaryMotionCue = normalizeMotionCue(diag?.motionCue || primaryStep);
+
+  // Ensure every PiP prompt demonstrates the actual physical repair motion (never just placing a coin)
+  const fallbackRepairMotionPrompt =
+    diag?.pipMotionPrompt && !/place a (coin|quarter|credit card|thumb)/i.test(diag.pipMotionPrompt)
+      ? diag.pipMotionPrompt
+      : `Close-up steady hands demonstrating how to adjust or repair the ${label}: ${primaryStep}`;
+
   let steps: RepairStep[];
   if (Array.isArray(diag?.steps) && diag.steps.length > 0) {
     steps = diag.steps
       .filter((s) => s && (s.title?.trim() || s.detail?.trim()))
-      .slice(0, 4)
-      .map((s, idx) => ({
-        number: idx + 1,
-        title: s.title?.trim() || `Step ${idx + 1}`,
-        detail: s.detail?.trim() || primaryStep,
-      }));
+      .slice(0, 6)
+      .map((s, idx) => {
+        const title = s.title?.trim() || `Step ${idx + 1}`;
+        const detail = s.detail?.trim() || primaryStep;
+        const stepBox = normalizeBoxToPct(s.targetBox) ?? resolvedTargetBox;
+        const stepMotion = normalizeMotionCue(s.motionCue || `${title} ${detail}`);
+        const stepPip =
+          s.pipMotionPrompt?.trim() &&
+          !/place a (coin|quarter|credit card|thumb)/i.test(s.pipMotionPrompt)
+            ? s.pipMotionPrompt.trim()
+            : `Close-up steady hands performing Step ${idx + 1} on ${label}: ${title}. ${detail}`;
+        return {
+          number: idx + 1,
+          title,
+          detail,
+          motionCue: stepMotion,
+          targetBox: stepBox,
+          pipMotionPrompt: stepPip,
+          toolNeeded: s.toolNeeded?.trim() || undefined,
+        };
+      });
   } else {
     steps = [
       {
         number: 1,
-        title: 'Check the highlighted part',
+        title: `Inspect & align ${label}`,
         detail: summary,
+        motionCue: 'align',
+        targetBox: resolvedTargetBox,
+        pipMotionPrompt: `Close-up hands inspecting and aligning ${label} cleanly before applying force.`,
       },
       {
         number: 2,
-        title: 'Follow the next step',
+        title: 'Perform the repair step',
         detail: primaryStep,
+        motionCue: primaryMotionCue,
+        targetBox: resolvedTargetBox,
+        pipMotionPrompt: fallbackRepairMotionPrompt,
       },
     ];
-  }
-
-  if (
-    steps.length < 3 &&
-    diag?.scaleGuardBlocked &&
-    payload.scaleCalibration?.status !== 'opted_out' &&
-    payload.scaleCalibration?.status !== 'calibrated'
-  ) {
-    steps.push({
-      number: steps.length + 1,
-      title: 'Hold a coin beside the part for exact sizing',
-      detail:
-        'Place a quarter, credit card, or your thumb next to the part and scan again to confirm the exact tool size.',
-    });
   }
 
   return {
     id: `scan-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
     label,
-    xPct: 32,
-    yPct: 33,
-    wPct: 36,
-    hPct: 26,
+    xPct: resolvedTargetBox.xPct,
+    yPct: resolvedTargetBox.yPct,
+    wPct: resolvedTargetBox.wPct,
+    hPct: resolvedTargetBox.hPct,
+    motionCue: steps[0]?.motionCue ?? primaryMotionCue,
+    anchorBox: resolvedAnchorBox,
     summary,
     toolNeeded: toolLine,
     steps,
-    motionPrompt: diag?.pipMotionPrompt,
+    motionPrompt: steps[0]?.pipMotionPrompt ?? fallbackRepairMotionPrompt,
     sourceMode: payload.sourceMode ?? 'scan',
     spokenLanguage: payload.spokenLanguage ?? null,
     userTranscript: payload.userTranscript ?? null,
     scaleCalibration: payload.scaleCalibration ?? null,
+    sessionId: payload.sessionId ?? null,
+    componentId: payload.componentId ?? null,
   };
 }

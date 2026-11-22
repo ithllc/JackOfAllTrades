@@ -1,131 +1,528 @@
-/**
- * =============================================================================
- * JackOfAllTrades — Production Node.js / Express Backend (Google Cloud Run)
- * License: GNU Affero General Public License v3.0 (AGPL-3.0-only)
- *
- * Architecture Traceability:
- *  - ADR 001 (PostgreSQL + pgvector): Uses pg.Pool (Object Method) to query
- *    Recursive CTEs (`v_component_hierarchy`, `rag_search_ontology_subgraph`)
- *    and update embeddings transactionally via `apply_ontology_correction`.
- *  - ADR 002 (Google Cloud Run): Stateless HTTP/2 Express container listening
- *    on `process.env.PORT || 8080`, serving the compiled Vite PWA (`dist/`)
- *    and relaying WebRTC SDP/ICE signaling messages.
- *  - ADR 003 & Test Case 3 (Zero-Token Routing): Proxies the client's 15-second
- *    frame buffer to `gemini-decision-1` (v1beta Decisions API, 0 output tokens).
- *    ONLY calls `gemini-4-neon` if the Decisions model returns a high-confidence
- *    anomaly (>= 0.78) or the user explicitly asks a voice question.
- *  - Break 2 ("Scale" Hallucination Guard): Bars specific tool size advice when
- *    both WebXR depth and physical scale anchors (coin, credit card, thumb) are absent.
- * =============================================================================
- */
+// server.ts
+import "dotenv/config";
+import express from "express";
+import http from "node:http";
+import fs2 from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { Pool } from "pg";
+import { GoogleGenAI, Type } from "@google/genai";
 
-import 'dotenv/config';
-import express from 'express';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { Pool } from 'pg';
-import { GoogleGenAI, Type } from '@google/genai';
+// src/lib/routingLogic.ts
+var ANOMALY_CONFIDENCE_THRESHOLD = 0.78;
+function evaluateDecisionsRouting(scores, threshold = ANOMALY_CONFIDENCE_THRESHOLD) {
+  if (scores.visualNoiseExtreme >= threshold) {
+    return {
+      shouldEscalateToNeon: false,
+      shouldDowngradeToBurst: true,
+      dominantTrigger: "visual_noise_extreme",
+      maxAnomalyConfidence: scores.visualNoiseExtreme,
+      reason: "Decisions API detected extreme glare, water droplets, or motion blur. Downgrading to 3-shot burst photography."
+    };
+  }
+  const candidates = [
+    { key: "hazard_proximity", value: scores.hazardProximity },
+    { key: "alignment_anomaly", value: scores.alignmentAnomaly },
+    { key: "user_stalled", value: scores.userStalled }
+  ];
+  candidates.sort((a, b) => b.value - a.value);
+  const top = candidates[0];
+  if (top.value >= threshold) {
+    return {
+      shouldEscalateToNeon: true,
+      shouldDowngradeToBurst: false,
+      dominantTrigger: top.key,
+      maxAnomalyConfidence: top.value,
+      reason: `High-confidence anomaly (${top.key} = ${(top.value * 100).toFixed(1)}%). Waking gemini-4-neon with 15-second buffer + ontology RAG.`
+    };
+  }
+  return {
+    shouldEscalateToNeon: false,
+    shouldDowngradeToBurst: false,
+    dominantTrigger: "nominal",
+    maxAnomalyConfidence: top.value,
+    reason: "Nominal progress verified with zero output tokens. Holding gemini-4-neon asleep."
+  };
+}
+function enforceScaleAnchorInvariant(advice, scaleAnchor, hasWebXRDepth) {
+  const hasScaleReference = hasWebXRDepth || scaleAnchor !== "none";
+  if (advice.requiresScaleAnchor && !hasScaleReference) {
+    return {
+      toolRequired: advice.toolRequired,
+      toolSizeSpec: "Locked \u2014 Scale anchor required",
+      scaleGuardBlocked: true,
+      instructionText: "Place a standard reference object (US quarter coin, credit card, or your thumb) beside the part before selecting a specific tool size.",
+      anchorPrompt: "Place a coin, credit card, or your thumb next to the component so scale can be calibrated safely."
+    };
+  }
+  return {
+    toolRequired: advice.toolRequired,
+    toolSizeSpec: advice.toolSizeSpec ?? "Standard hand fit",
+    scaleGuardBlocked: false,
+    instructionText: advice.instructionText,
+    anchorPrompt: null
+  };
+}
+function cosineSimilarity(a, b) {
+  const len = Math.min(a.length, b.length);
+  if (len === 0) return 0;
+  let dot = 0;
+  let magA = 0;
+  let magB = 0;
+  for (let i = 0; i < len; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(magA) * Math.sqrt(magB);
+  if (denom === 0) return 0;
+  return dot / denom;
+}
+function buildFeatureVector(seedValues) {
+  const norm = Math.sqrt(seedValues.reduce((acc, v) => acc + v * v, 0)) || 1;
+  return seedValues.map((v) => Number((v / norm).toFixed(6)));
+}
+function createSeedOntologyNodes() {
+  return [
+    {
+      id: 1,
+      parentId: null,
+      manualSku: "NFP-HINGE-110",
+      brandName: "NordicFlatPack Furnishings",
+      name: "Cabinet Door Assembly",
+      partCode: "CAB-DOOR-01",
+      componentClass: "assembly",
+      measurementSystem: "metric",
+      threadPitchMm: null,
+      nominalDiameterMm: null,
+      visualCueNotes: "Vertical melamine door panel with 35mm concealed cup bore.",
+      failurePrecursorCue: "Door sagging > 3mm at top latch corner.",
+      actionType: "inspect",
+      toolRequired: "Spirit Level",
+      toolSizeSpec: "Standard 300mm level",
+      requiresScaleAnchor: false,
+      rotationDirection: "linear",
+      instructionText: "Confirm cabinet carcase is square before snapping hinge arms onto mounting plates.",
+      pipMotionPrompt: "Close-up hand checking alignment of cabinet door edge against frame.",
+      successRate: 0.96,
+      correctionCount: 4,
+      embedding: buildFeatureVector([0.92, 0.25, 0.1, 0.08, 0.12, 0.05, 0.14, 0.2])
+    },
+    {
+      id: 2,
+      parentId: 1,
+      manualSku: "NFP-HINGE-110",
+      brandName: "NordicFlatPack Furnishings",
+      name: "110-Deg Concealed Hinge Arm",
+      partCode: "HNG-ARM-110",
+      componentClass: "subassembly",
+      measurementSystem: "metric",
+      threadPitchMm: null,
+      nominalDiameterMm: 35,
+      visualCueNotes: "Brushed steel articulated hinge arm with dual depth/lateral cam screws.",
+      failurePrecursorCue: "Bracket angled > 12 degrees off mounting plate track (Tokyo->Chicago flywheel cue).",
+      actionType: "align",
+      toolRequired: "Phillips Screwdriver",
+      toolSizeSpec: "#2 Phillips driver",
+      requiresScaleAnchor: false,
+      rotationDirection: "angled",
+      instructionText: "Tilt the hinge bracket 15 degrees inward to hook the front pins, then press the rear heel until it snaps flush.",
+      pipMotionPrompt: "Hands tilting brushed steel concealed cabinet hinge at 15-degree angle onto mounting plate until snap click.",
+      successRate: 0.942,
+      correctionCount: 19,
+      embedding: buildFeatureVector([0.84, 0.52, 0.14, 0.05, 0.09, 0.11, 0.2, 0.18])
+    },
+    {
+      id: 3,
+      parentId: 2,
+      manualSku: "NFP-HINGE-110",
+      brandName: "NordicFlatPack Furnishings",
+      name: "M4 Machine Screw (Hinge Plate)",
+      partCode: "ISO-M4-12",
+      componentClass: "fastener",
+      measurementSystem: "metric",
+      threadPitchMm: 0.7,
+      nominalDiameterMm: 4,
+      visualCueNotes: "Fine 0.7mm thread pitch; 4mm shank diameter; compact pan/socket head.",
+      failurePrecursorCue: "Frequently misidentified as M6 screw at close macro range without scale anchor.",
+      actionType: "tighten",
+      toolRequired: "Hex / Phillips Driver",
+      toolSizeSpec: "M4 driver (2.5mm hex / PH2)",
+      requiresScaleAnchor: true,
+      rotationDirection: "clockwise",
+      instructionText: "Seat the M4 screw square to the mounting plate pilot hole and tighten clockwise to 1.8 Nm.",
+      pipMotionPrompt: "Fingers aligning M4 screw into steel hinge plate and turning driver smoothly clockwise.",
+      successRate: 0.915,
+      correctionCount: 12,
+      embedding: buildFeatureVector([0.16, 0.18, 0.82, 0.48, 0.12, 0.09, 0.08, 0.11])
+    },
+    {
+      id: 4,
+      parentId: null,
+      manualSku: "ISO-METRIC-FAST",
+      brandName: "Precision Fastener Standards",
+      name: "M6 Hex Socket Cap Screw",
+      partCode: "ISO-M6-20",
+      componentClass: "fastener",
+      measurementSystem: "metric",
+      threadPitchMm: 1,
+      nominalDiameterMm: 6,
+      visualCueNotes: "Coarse 1.0mm thread pitch; 10mm cylindrical socket head; 5mm hex key recess.",
+      failurePrecursorCue: "Stripped socket recess when driven with undersized 4mm hex key.",
+      actionType: "tighten",
+      toolRequired: "Metric Hex Key",
+      toolSizeSpec: "5mm hex key (for M6 cap screw)",
+      requiresScaleAnchor: true,
+      rotationDirection: "clockwise",
+      instructionText: "Verify 5mm hex key seats fully to the bottom of the M6 socket recess before applying clockwise torque.",
+      pipMotionPrompt: "Hand inserting 5mm hex key straight into M6 socket head cap screw and rotating clockwise.",
+      successRate: 0.892,
+      correctionCount: 9,
+      embedding: buildFeatureVector([0.14, 0.16, 0.86, 0.44, 0.1, 0.07, 0.06, 0.09])
+    },
+    {
+      id: 5,
+      parentId: null,
+      manualSku: "ISO-METRIC-FAST",
+      brandName: "Precision Fastener Standards",
+      name: "M10 Metric Hex Bolt",
+      partCode: "ISO-M10-150",
+      componentClass: "fastener",
+      measurementSystem: "metric",
+      threadPitchMm: 1.5,
+      nominalDiameterMm: 10,
+      visualCueNotes: "Thread pitch 1.5mm; 10mm shank; metric 8.8 head marking.",
+      failurePrecursorCue: "Confused with 3/8-inch imperial bolt; requires 10mm/17mm metric socket, not imperial.",
+      actionType: "tighten",
+      toolRequired: "Metric Socket Wrench",
+      toolSizeSpec: '10mm metric socket (NOT 3/8" imperial)',
+      requiresScaleAnchor: true,
+      rotationDirection: "clockwise",
+      instructionText: "Switch to a calibrated metric socket\u2014do not force an imperial 3/8-inch tool onto 1.5mm pitch metric hardware.",
+      pipMotionPrompt: "Mechanic fitting metric socket onto hex bolt head and tightening clockwise in steady quarter turns.",
+      successRate: 0.931,
+      correctionCount: 15,
+      embedding: buildFeatureVector([0.1, 0.14, 0.56, 0.78, 0.16, 0.08, 0.05, 0.07])
+    },
+    {
+      id: 7,
+      parentId: null,
+      manualSku: "AFP-PTRAP-150",
+      brandName: "AquaFlow Residential Plumbing",
+      name: "Kitchen Sink P-Trap Assembly",
+      partCode: "PTRAP-CH-150",
+      componentClass: "assembly",
+      measurementSystem: "imperial",
+      threadPitchMm: null,
+      nominalDiameterMm: 38.1,
+      visualCueNotes: "Reflective chrome-plated brass J-bend under kitchen basin.",
+      failurePrecursorCue: "Flashlight specular glare + water droplets degrade continuous video tracking.",
+      actionType: "inspect",
+      toolRequired: "Microfiber Cloth & Bucket",
+      toolSizeSpec: 'Standard 1-1/2" drain union',
+      requiresScaleAnchor: false,
+      rotationDirection: "linear",
+      instructionText: "Wipe lens and chrome nut dry, then verify the J-bend tailpiece sits vertically without shear stress.",
+      pipMotionPrompt: "Hand wiping wet chrome P-trap pipe under sink with cloth to reveal compression nut threading.",
+      successRate: 0.908,
+      correctionCount: 11,
+      embedding: buildFeatureVector([0.08, 0.11, 0.1, 0.12, 0.92, 0.34, 0.09, 0.05])
+    },
+    {
+      id: 8,
+      parentId: 7,
+      manualSku: "AFP-PTRAP-150",
+      brandName: "AquaFlow Residential Plumbing",
+      name: "Chrome Slip-Joint Compression Nut",
+      partCode: "NUT-SJ-150",
+      componentClass: "fastener",
+      measurementSystem: "imperial",
+      threadPitchMm: null,
+      nominalDiameterMm: 42,
+      visualCueNotes: "Hexagonal chrome nut sealing nylon slip-joint washer.",
+      failurePrecursorCue: "Cross-threading risk when forced under low visibility and active spray.",
+      actionType: "tighten",
+      toolRequired: "Slip-Joint Pliers",
+      toolSizeSpec: '1-1/2" slip-joint jaw',
+      requiresScaleAnchor: true,
+      rotationDirection: "clockwise",
+      instructionText: "Seat the beveled nylon washer bevel-down, hand-thread clockwise until seated, then finish with one quarter turn.",
+      pipMotionPrompt: "Close-up hand threading chrome slip-joint nut clockwise by hand, then applying quarter turn with pliers.",
+      successRate: 0.896,
+      correctionCount: 14,
+      embedding: buildFeatureVector([0.09, 0.1, 0.12, 0.15, 0.85, 0.5, 0.08, 0.06])
+    },
+    {
+      id: 9,
+      parentId: null,
+      manualSku: "SAM-DW-IMP400",
+      brandName: "Samsung Home Appliances",
+      name: "Dishwasher Drain Impeller Assembly",
+      partCode: "IMP-400-ASM",
+      componentClass: "assembly",
+      measurementSystem: "metric",
+      threadPitchMm: null,
+      nominalDiameterMm: null,
+      visualCueNotes: "Lower sump impeller housing beneath removable coarse filter screen.",
+      failurePrecursorCue: "Rhythmic acoustic cavitation grinding sound during drain pump cycle.",
+      actionType: "inspect",
+      toolRequired: "Inspection Flashlight",
+      toolSizeSpec: "No socket required",
+      requiresScaleAnchor: false,
+      rotationDirection: "linear",
+      instructionText: "Clear glass or seed debris around impeller vanes before re-seating the sump cover.",
+      pipMotionPrompt: "Hand lifting dishwasher sump cover to inspect drain impeller vanes for trapped debris.",
+      successRate: 0.948,
+      correctionCount: 7,
+      embedding: buildFeatureVector([0.07, 0.09, 0.08, 0.06, 0.14, 0.12, 0.91, 0.34])
+    },
+    {
+      id: 10,
+      parentId: 9,
+      manualSku: "SAM-DW-IMP400",
+      brandName: "Samsung Home Appliances",
+      name: "Clockwise Snap-Lock Retaining Clip",
+      partCode: "CLIP-CW-09",
+      componentClass: "fastener",
+      measurementSystem: "metric",
+      threadPitchMm: null,
+      nominalDiameterMm: 28,
+      visualCueNotes: "Molded wear-pattern ramp on dark polymer clip clearly slants clockwise.",
+      failurePrecursorCue: "Forcing retaining clip counter-clockwise snaps the plastic retention lug.",
+      actionType: "rotate_clockwise",
+      toolRequired: "Finger Grip",
+      toolSizeSpec: "No wrench \u2014 manual 30-deg clockwise twist",
+      requiresScaleAnchor: false,
+      rotationDirection: "clockwise",
+      instructionText: "Stop pushing counter-clockwise. Press gently and rotate the retaining clip 30 degrees CLOCKWISE to release.",
+      pipMotionPrompt: "Close-up fingers pressing and turning dishwasher polymer retaining clip 30 degrees clockwise to unlock.",
+      successRate: 0.964,
+      correctionCount: 21,
+      embedding: buildFeatureVector([0.06, 0.08, 0.09, 0.07, 0.12, 0.11, 0.84, 0.52])
+    }
+  ];
+}
+var InMemoryOntologyGraph = class {
+  constructor(seedNodes = createSeedOntologyNodes()) {
+    this.feedbackLog = [];
+    this.deflectedCount = 42;
+    this.totalComputeUsd = 58.4;
+    this.nodes = new Map(seedNodes.map((n) => [n.id, { ...n, embedding: [...n.embedding] }]));
+  }
+  getAllNodes() {
+    return Array.from(this.nodes.values()).sort((a, b) => a.id - b.id);
+  }
+  getNode(id) {
+    return this.nodes.get(id);
+  }
+  /**
+   * Mirrors `v_component_hierarchy` & `get_component_hierarchy(root_id)` Recursive CTE with cycle protection.
+   */
+  getHierarchyTree(rootId) {
+    const result = [];
+    const all = this.getAllNodes();
+    const roots = rootId !== void 0 ? all.filter((n) => n.id === rootId) : all.filter((n) => n.parentId === null);
+    const traverse = (node, depth, visited, path2) => {
+      if (visited.has(node.id) || depth > 10) return;
+      const nextVisited = new Set(visited);
+      nextVisited.add(node.id);
+      const breadcrumb = path2 ? `${path2} > ${node.name}` : node.name;
+      result.push({
+        id: node.id,
+        parentId: node.parentId,
+        name: node.name,
+        componentClass: node.componentClass,
+        depth,
+        breadcrumbPath: breadcrumb,
+        failurePrecursorCue: node.failurePrecursorCue,
+        toolRequired: node.toolRequired,
+        toolSizeSpec: node.toolSizeSpec,
+        requiresScaleAnchor: node.requiresScaleAnchor,
+        successRate: node.successRate,
+        correctionCount: node.correctionCount
+      });
+      const children = all.filter((c) => c.parentId === node.id);
+      for (const child of children) {
+        traverse(child, depth + 1, nextVisited, breadcrumb);
+      }
+    };
+    for (const r of roots) {
+      traverse(r, 0, /* @__PURE__ */ new Set(), "");
+    }
+    return result;
+  }
+  /**
+   * Mirrors `get_component_ancestry(target_id)` bottom-up Recursive CTE.
+   */
+  getAncestryBreadcrumb(targetId) {
+    const chain = [];
+    const visited = /* @__PURE__ */ new Set();
+    let current = this.nodes.get(targetId);
+    while (current && !visited.has(current.id)) {
+      visited.add(current.id);
+      chain.unshift(current.name);
+      current = current.parentId !== null ? this.nodes.get(current.parentId) : void 0;
+    }
+    return chain.join(" > ");
+  }
+  /**
+   * Mirrors `rag_search_ontology_subgraph(...)`: pgvector cosine similarity + Recursive CTE ancestry + Break 2 guard.
+   */
+  searchRagSubgraph(queryEmbedding, scaleAnchor, hasWebXRDepth, limit = 4) {
+    const scored = this.getAllNodes().map((node) => ({
+      component: node,
+      similarity: Number(cosineSimilarity(queryEmbedding, node.embedding).toFixed(4))
+    })).sort((a, b) => b.similarity - a.similarity).slice(0, limit);
+    return scored.map(({ component, similarity }) => ({
+      component,
+      ancestryPath: this.getAncestryBreadcrumb(component.id),
+      similarity,
+      scaleGatedAdvice: enforceScaleAnchorInvariant(
+        {
+          toolRequired: component.toolRequired,
+          toolSizeSpec: component.toolSizeSpec,
+          requiresScaleAnchor: component.requiresScaleAnchor,
+          instructionText: component.instructionText
+        },
+        scaleAnchor,
+        hasWebXRDepth
+      )
+    }));
+  }
+  /**
+   * Mirrors `apply_ontology_correction(...)` (Test Case 2: M4 vs M6 screw).
+   * Updates the corrected component's visual_signature_embedding so subsequent RAG scans
+   * immediately rank the corrected component #1 without retraining.
+   */
+  applyCorrection(params) {
+    const target = this.nodes.get(params.correctedComponentId);
+    if (!target) {
+      throw new Error(`Component ID ${params.correctedComponentId} not found in ontology graph.`);
+    }
+    const predicted = this.nodes.get(params.predictedComponentId);
+    target.embedding = buildFeatureVector(params.capturedEmbedding);
+    target.correctionCount += 1;
+    target.successRate = Math.min(0.995, Number((target.successRate + 4e-3).toFixed(4)));
+    if (predicted && predicted.id !== target.id) {
+      const nudged = predicted.embedding.map((v, idx) => {
+        const q = target.embedding[idx] ?? 0;
+        return Math.max(0.01, v - 0.15 * q);
+      });
+      predicted.embedding = buildFeatureVector(nudged);
+    }
+    const event = {
+      id: `fb_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+      predictedComponentId: params.predictedComponentId,
+      predictedName: predicted?.name ?? `Component #${params.predictedComponentId}`,
+      correctedComponentId: target.id,
+      correctedName: target.name,
+      tag: params.tag,
+      regionCode: params.regionCode ?? "US-CHI"
+    };
+    this.feedbackLog.unshift(event);
+    if (this.feedbackLog.length > 30) {
+      this.feedbackLog.pop();
+    }
+    return { updated: target, event };
+  }
+  recordDeflection(computeCostUsd = 1.45) {
+    this.deflectedCount += 1;
+    this.totalComputeUsd = Number((this.totalComputeUsd + computeCostUsd).toFixed(2));
+    return this.getFlywheelMetrics();
+  }
+  getFeedbackLog() {
+    return [...this.feedbackLog];
+  }
+  getFlywheelMetrics() {
+    const bountyUsd = 30;
+    const revenueUsd = this.deflectedCount * bountyUsd;
+    const avgComputePerSession = this.deflectedCount > 0 ? this.totalComputeUsd / this.deflectedCount : 1.5;
+    const marginMultiple = avgComputePerSession > 0 ? bountyUsd / avgComputePerSession : 20;
+    return {
+      deflectedReturns: this.deflectedCount,
+      bountyPerDeflectionUsd: bountyUsd,
+      grossBountyRevenueUsd: revenueUsd,
+      totalComputeUsd: this.totalComputeUsd,
+      marginMultiple: Number(marginMultiple.toFixed(1)),
+      totalCorrections: this.getAllNodes().reduce((sum, n) => sum + n.correctionCount, 0)
+    };
+  }
+};
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-const PORT = Number(process.env.PORT || 8080);
-const ANOMALY_CONFIDENCE_THRESHOLD = 0.78;
-
-// -----------------------------------------------------------------------------
-// 1. PostgreSQL Connection Pool (ADR 001 — Cloud SQL Auth Proxy + Public IP TLS)
-//    Instance: gemini4nyc26nyc-2273:us-east1:free-trial-first-project
-//    Public IP: 34.74.102.222 | Outgoing IP: 34.73.184.213 | Port: 5432
-// -----------------------------------------------------------------------------
-const DEFAULT_SQL_PORT = 5432;
-const DEFAULT_SQL_CONNECTION_NAME = 'gemini4nyc26nyc-2273:us-east1:free-trial-first-project';
-const DEFAULT_SQL_PUBLIC_IP = '34.74.102.222';
-const DEFAULT_SQL_OUTGOING_IP = '34.73.184.213';
-const LOCAL_SQL_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
-const PLACEHOLDER_SQL_SECRETS = new Set([
-  'CHANGE_ME_IN_SECRET_MANAGER',
-  'MY_SQL_PASSWORD',
-  'REPLACE_ME',
+// src/lib/dbConfig.ts
+import fs from "node:fs";
+var DEFAULT_SQL_PORT = 5432;
+var DEFAULT_SQL_CONNECTION_NAME = "gemini4nyc26nyc-2273:us-east1:free-trial-first-project";
+var DEFAULT_SQL_PUBLIC_IP = "34.74.102.222";
+var DEFAULT_SQL_OUTGOING_IP = "34.73.184.213";
+var LOCAL_HOSTS = /* @__PURE__ */ new Set(["127.0.0.1", "localhost", "::1"]);
+var PLACEHOLDER_SECRETS = /* @__PURE__ */ new Set([
+  "CHANGE_ME_IN_SECRET_MANAGER",
+  "MY_SQL_PASSWORD",
+  "REPLACE_ME"
 ]);
-
-function resolveCloudSqlPoolConfig(env) {
-  const connectionName = (
-    env.SQL_CONNECTION_NAME ||
-    env.SQL_Connection_Name ||
-    DEFAULT_SQL_CONNECTION_NAME
-  ).trim();
+function parsePort(rawPort, fallback) {
+  if (!rawPort) return fallback;
+  const parsed = Number.parseInt(rawPort.trim(), 10);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > 65535) {
+    return fallback;
+  }
+  return parsed;
+}
+function resolveCloudSqlPoolConfig(env, options = {}) {
+  const connectionName = (env.SQL_CONNECTION_NAME || env.SQL_Connection_Name || DEFAULT_SQL_CONNECTION_NAME).trim();
   const publicIp = (env.SQL_PUBLIC_IP || DEFAULT_SQL_PUBLIC_IP).trim();
-  const outgoingIp = (
-    env.SQL_OUTGOING_IP ||
-    env.SQL_Outgoing_IP ||
-    DEFAULT_SQL_OUTGOING_IP
-  ).trim();
-  const parsedPort = Number.parseInt(
-    String(env.SQL_PORT || env.DB_PORT || DEFAULT_SQL_PORT),
-    10
-  );
-  const port =
-    Number.isFinite(parsedPort) && parsedPort > 0 && parsedPort <= 65535
-      ? parsedPort
-      : DEFAULT_SQL_PORT;
-
-  const database = (env.SQL_DB_NAME || env.DB_NAME || '').trim();
-  const user = (env.SQL_USER || env.DB_USER || '').trim();
+  const outgoingIp = (env.SQL_OUTGOING_IP || env.SQL_Outgoing_IP || DEFAULT_SQL_OUTGOING_IP).trim();
+  const port = parsePort(env.SQL_PORT || env.DB_PORT, DEFAULT_SQL_PORT);
+  const database = (env.SQL_DB_NAME || env.DB_NAME || "").trim();
+  const user = (env.SQL_USER || env.DB_USER || "").trim();
   const password = env.SQL_PASSWORD ?? env.DB_PASS;
-  const explicitHost = (env.SQL_HOST || env.DB_HOST || '').trim();
+  const explicitHost = (env.SQL_HOST || env.DB_HOST || "").trim();
   const socketPath = `/cloudsql/${connectionName}`;
-  const useUnixSocket =
-    env.SQL_USE_UNIX_SOCKET?.trim().toLowerCase() === 'true' ||
-    (Boolean(env.K_SERVICE?.trim()) && fs.existsSync(socketPath));
-
-  if (!database || !user || (password && PLACEHOLDER_SQL_SECRETS.has(password.trim()))) {
+  const checkSocketExists = options.socketExists ?? ((p) => fs.existsSync(p));
+  const useUnixSocket = env.SQL_USE_UNIX_SOCKET?.trim().toLowerCase() === "true" || Boolean(env.K_SERVICE?.trim()) && checkSocketExists(socketPath);
+  if (!database || !user || password && PLACEHOLDER_SECRETS.has(password.trim())) {
     return {
       poolConfig: null,
-      transport: 'unconfigured',
+      transport: "unconfigured",
       connectionName,
       publicIp,
       outgoingIp,
       port,
       sslEnabled: false,
-      hostSummary: useUnixSocket ? socketPath : `${publicIp}:${port}`,
+      hostSummary: useUnixSocket ? socketPath : `${publicIp}:${port}`
     };
   }
-
   let host;
   let transport;
   if (explicitHost) {
-    if (explicitHost.startsWith('/cloudsql/')) {
-      if (Boolean(env.K_SERVICE?.trim()) && !fs.existsSync(explicitHost)) {
+    if (explicitHost.startsWith("/cloudsql/")) {
+      if (Boolean(env.K_SERVICE?.trim()) && !checkSocketExists(explicitHost)) {
         host = publicIp;
-        transport = 'public_ip_tcp';
+        transport = "public_ip_tcp";
       } else {
         host = explicitHost;
-        transport = 'cloud_sql_socket';
+        transport = "cloud_sql_socket";
       }
-    } else if (
-      explicitHost.toLowerCase() === 'postgres' &&
-      Boolean(env.K_SERVICE?.trim()) &&
-      publicIp
-    ) {
+    } else if (explicitHost.toLowerCase() === "postgres" && Boolean(env.K_SERVICE?.trim()) && publicIp) {
       host = publicIp;
-      transport = 'public_ip_tcp';
+      transport = "public_ip_tcp";
     } else if (explicitHost === publicIp) {
       host = explicitHost;
-      transport = 'public_ip_tcp';
+      transport = "public_ip_tcp";
     } else {
       host = explicitHost;
-      transport = 'custom_tcp';
+      transport = "custom_tcp";
     }
   } else if (useUnixSocket) {
     host = socketPath;
-    transport = 'cloud_sql_socket';
+    transport = "cloud_sql_socket";
   } else {
     host = publicIp;
-    transport = 'public_ip_tcp';
+    transport = "public_ip_tcp";
   }
-
-  if (transport === 'cloud_sql_socket') {
+  if (transport === "cloud_sql_socket") {
     return {
       poolConfig: {
         host,
@@ -133,9 +530,9 @@ function resolveCloudSqlPoolConfig(env) {
         user,
         password,
         max: 10,
-        connectionTimeoutMillis: 15000,
-        idleTimeoutMillis: 30000,
-        ssl: false,
+        connectionTimeoutMillis: 5e3,
+        idleTimeoutMillis: 3e4,
+        ssl: false
       },
       transport,
       connectionName,
@@ -143,18 +540,20 @@ function resolveCloudSqlPoolConfig(env) {
       outgoingIp,
       port,
       sslEnabled: false,
-      hostSummary: host,
+      hostSummary: host
     };
   }
-
-  const sslCa = (env.SQL_SSL_CA || env.DB_SSL_CA || '').trim();
-  const sslFlag = (env.SQL_SSL ?? env.DB_SSL ?? 'true')?.trim().toLowerCase();
-  const isLocalHost = LOCAL_SQL_HOSTS.has(host.toLowerCase());
+  const sslCa = (env.SQL_SSL_CA || env.DB_SSL_CA || "").trim();
+  const sslFlag = (env.SQL_SSL ?? env.DB_SSL)?.trim().toLowerCase();
+  const isLocalHost = LOCAL_HOSTS.has(host.toLowerCase());
   let ssl = false;
-  if (sslCa) ssl = { ca: sslCa, rejectUnauthorized: true };
-  else if (sslFlag === 'false') ssl = false;
-  else if (sslFlag === 'true' || !isLocalHost) ssl = { rejectUnauthorized: false };
-
+  if (sslCa) {
+    ssl = { ca: sslCa, rejectUnauthorized: true };
+  } else if (sslFlag === "false") {
+    ssl = false;
+  } else if (sslFlag === "true" || !isLocalHost) {
+    ssl = { rejectUnauthorized: false };
+  }
   return {
     poolConfig: {
       host,
@@ -163,9 +562,9 @@ function resolveCloudSqlPoolConfig(env) {
       user,
       password,
       max: 10,
-      connectionTimeoutMillis: 15000,
-      idleTimeoutMillis: 30000,
-      ssl,
+      connectionTimeoutMillis: 4e3,
+      idleTimeoutMillis: 3e4,
+      ssl
     },
     transport,
     connectionName,
@@ -173,789 +572,2101 @@ function resolveCloudSqlPoolConfig(env) {
     outgoingIp,
     port,
     sslEnabled: Boolean(ssl),
-    hostSummary: `${host}:${port}`,
+    hostSummary: `${host}:${port}`
   };
 }
 
-const cloudSqlConfig = resolveCloudSqlPoolConfig(process.env);
-const pool = cloudSqlConfig.poolConfig ? new Pool(cloudSqlConfig.poolConfig) : null;
-
-if (pool) {
-  pool.on('error', (err) => {
-    console.error('[Cloud SQL Pool Error]', err.message);
-  });
-}
-
-// -----------------------------------------------------------------------------
-// 2. Gemini 4 API Clients (Server-Side Key Isolation — Technical Doc §1)
-// -----------------------------------------------------------------------------
-function initGeminiClients() {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey) return null;
-
-  // Decisions API (`gemini-decision-1`) requires `apiVersion: 'v1beta'` on @google/genai >= 3.2.0
-  const decisionsAi = new GoogleGenAI({
-    apiKey,
-    apiVersion: 'v1beta',
-    httpOptions: {
-      headers: { 'User-Agent': 'aistudio-build' },
-    },
-  });
-
-  // Interactions API client for `gemini-4-neon`, `gemini-omni-1.2-flash`, and `gemini-embedding-2`
-  const interactionsAi = new GoogleGenAI({
-    apiKey,
-    apiVersion: 'v1beta',
-    httpOptions: {
-      headers: { 'User-Agent': 'aistudio-build' },
-    },
-  });
-
-  return { decisionsAi, interactionsAi };
-}
-
-function parseBase64Frame(dataUrl) {
-  const match = String(dataUrl || '').match(/^data:([^;]+);base64,(.+)$/);
-  if (match) return { mimeType: match[1], base64: match[2] };
-  return { mimeType: 'image/jpeg', base64: String(dataUrl || '') };
-}
-
-/**
- * Enforces Break 2 ("Scale" Hallucination Guard):
- * Without WebXR depth mapping or a physical scale anchor (coin, credit card, thumb),
- * strip exact numeric tool sizes before returning instructions to the PWA.
- */
-function enforceScaleAnchorGuard(diagnosis, scaleAnchor, hasWebXRDepth) {
-  const hasReference = Boolean(hasWebXRDepth) || (scaleAnchor && scaleAnchor !== 'none');
-  if (diagnosis.requiresScaleAnchor && !hasReference) {
-    return {
-      ...diagnosis,
-      toolSizeSpec: 'REDACTED — Place scale anchor (coin, credit card, or thumb) first',
-      scaleGuardBlocked: true,
-      nextStepInstruction:
-        'Place a standard scale anchor (a coin, credit card, or your thumb) next to the part so JackOfAllTrades can safely verify tool sizing.',
-    };
-  }
-  return { ...diagnosis, scaleGuardBlocked: false };
-}
-
-const app = express();
-app.use(express.json({ limit: '25mb' }));
-
-// Ephemeral WebRTC SDP/ICE signaling store (ADR 002)
-const rtcRooms = new Map();
-
-// -----------------------------------------------------------------------------
-// 3. Healthcheck & WebRTC Signaling Routes (ADR 002)
-// -----------------------------------------------------------------------------
-app.get(['/api/health', '/healthz'], (_req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'jackofalltrades',
-    license: 'AGPL-3.0-only',
-    port: PORT,
-    postgresConfigured: Boolean(pool),
-    databaseConnected: Boolean(pool),
-    databaseTransport: cloudSqlConfig.transport,
-    sqlConnectionName: cloudSqlConfig.connectionName,
-    sqlPublicIp: cloudSqlConfig.publicIp,
-    sqlOutgoingIp: cloudSqlConfig.outgoingIp,
-    sqlPort: cloudSqlConfig.port,
-    sqlSslEnabled: cloudSqlConfig.sslEnabled,
-    sqlTarget: cloudSqlConfig.hostSummary,
-    geminiConfigured: Boolean(initGeminiClients()),
-    timestamp: new Date().toISOString(),
-  });
-});
-
-app.get('/api/db/status', async (req, res) => {
-  if (!pool) {
-    return res.json({
-      connected: false,
-      configured: false,
-      transport: cloudSqlConfig.transport,
-      connectionName: cloudSqlConfig.connectionName,
-      publicIp: cloudSqlConfig.publicIp,
-      outgoingIp: cloudSqlConfig.outgoingIp,
-      port: cloudSqlConfig.port,
-    });
-  }
-  try {
-    const { rows } = await pool.query(
-      "SELECT current_database() AS database_name, current_user AS db_user, EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') AS pgvector_enabled"
-    );
-    return res.json({
-      connected: true,
-      configured: true,
-      transport: cloudSqlConfig.transport,
-      connectionName: cloudSqlConfig.connectionName,
-      target: cloudSqlConfig.hostSummary,
-      sslEnabled: cloudSqlConfig.sslEnabled,
-      details: rows[0] ?? null,
-    });
-  } catch (err) {
-    const statusCode = req.query.strict === '1' ? 503 : 200;
-    return res.status(statusCode).json({
-      connected: false,
-      configured: true,
-      fallbackActive: true,
-      transport: cloudSqlConfig.transport,
-      connectionName: cloudSqlConfig.connectionName,
-      target: cloudSqlConfig.hostSummary,
-      sslEnabled: cloudSqlConfig.sslEnabled,
-      error: err.message,
-    });
-  }
-});
-
-app.post('/api/webrtc/signal', (req, res) => {
-  const { roomId, type, payload } = req.body ?? {};
-  if (!roomId || !type) {
-    return res.status(400).json({ error: 'roomId and type are required.' });
-  }
-  const room = rtcRooms.get(roomId) ?? { candidates: [], updatedAt: Date.now() };
-  if (type === 'offer') room.offer = payload;
-  else if (type === 'answer') room.answer = payload;
-  else if (type === 'ice-candidate') room.candidates.push(payload);
-  room.updatedAt = Date.now();
-  rtcRooms.set(roomId, room);
-  return res.json({ roomId, status: 'relayed' });
-});
-
-// -----------------------------------------------------------------------------
-// 4. Core 15-Second Buffer Proxy: `gemini-decision-1` -> `gemini-4-neon`
-//    Fulfills ADR 003, Break 1 (Thermal/Cost Gate), and QA Test Case 3
-// -----------------------------------------------------------------------------
-app.post('/api/analyze-buffer', async (req, res) => {
-  const {
-    frames = [],
-    ingestMode = 'webrtc_15fps',
-    scaleAnchor = 'none',
-    hasWebXRDepth = false,
-    stillDurationMs = 0,
-    userQuestion = '',
-  } = req.body ?? {};
-
-  if (!Array.isArray(frames) || frames.length === 0) {
-    return res.status(400).json({ error: 'Expected 15-second frame buffer array.' });
-  }
-
-  const clients = initGeminiClients();
-  if (!clients) {
-    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
-  }
-
-  // Uniformly sample up to 6 frames spanning the 15-second rolling ring buffer
-  const stride = Math.max(1, Math.floor(frames.length / 6));
-  const sampled = frames.filter((_f, i) => i % stride === 0).slice(0, 6);
-
-  const multimodalInput = [
-    {
-      type: 'text',
-      text:
-        `JackOfAllTrades 15-second camera buffer (${sampled.length} frames, mode=${ingestMode}, ` +
-        `handStillMs=${stillDurationMs}, scaleAnchor=${scaleAnchor}, webXRDepth=${Boolean(hasWebXRDepth)}).` +
-        (userQuestion ? ` User question: ${userQuestion}\n` : '\n'),
-    },
-    ...sampled.map((frame) => {
-      const { mimeType, base64 } = parseBase64Frame(frame.dataUrl);
-      return {
-        type: 'image',
-        data: base64,
-        mime_type: mimeType,
-        resolution: ingestMode === 'burst_photo_3x' ? 'medium' : 'low',
-      };
-    }),
-  ];
-
-  // --- STAGE 1: Zero-Token Gate via `gemini-decision-1` (0 output tokens) ---
-  let scores;
-  let decisionUsage;
-  try {
-    const decision = await clients.decisionsAi.decisions.create({
-      model: 'gemini-decision-1',
-      input: multimodalInput,
-      questions: {
-        user_stalled: {
-          type: 'noul',
-          instructions: 'Has the user stalled or held hands motionless on an unresolved step?',
-          criteria: {
-            true_description: 'Hands stationary in hesitation or awaiting guidance.',
-            false_description: 'User is actively progressing without confusion.',
-          },
-        },
-        hazard_proximity: {
-          type: 'noul',
-          instructions: 'Are hands or tools near a hazard or forcing a fastener/clip incorrectly?',
-        },
-        alignment_anomaly: {
-          type: 'noul',
-          instructions: 'Is there a misaligned bracket, wrong tool size, or cross-threaded fastener?',
-        },
-        visual_noise_extreme: {
-          type: 'noul',
-          instructions: 'Are water droplets, harsh chrome glare, or blur obscuring the component?',
-        },
-      },
-    });
-
-    if (!decision.answers) {
-      return res.status(400).json({ error: 'Decisions API returned no answers.' });
-    }
-
-    const noul = (k) => (decision.answers[k]?.type === 'noul' ? decision.answers[k].noul : 0.01);
-    scores = {
-      userStalled: noul('user_stalled'),
-      hazardProximity: noul('hazard_proximity'),
-      alignmentAnomaly: noul('alignment_anomaly'),
-      visualNoiseExtreme: noul('visual_noise_extreme'),
-    };
-    decisionUsage = decision.usage ?? { total_output_tokens: 0 };
-  } catch (err) {
-    return res.status(502).json({
-      error: `gemini-decision-1 call failed: ${err.message}`,
-    });
-  }
-
-  // Hardest Input Mitigation: Downgrade to 3-shot burst mode on extreme visual noise
-  if (scores.visualNoiseExtreme >= ANOMALY_CONFIDENCE_THRESHOLD) {
-    return res.json({
-      escalatedToNeon: false,
-      downgradeToBurst: true,
-      decisionModel: 'gemini-decision-1',
-      decisionScores: scores,
-      decisionUsage,
-      voiceInstruction:
-        "I can't see the threading clearly. Wipe the lens and hold still for three high-contrast burst photos.",
-    });
-  }
-
-  // Strict High-Confidence Anomaly Gate (ADR 003): Stay zero-token if below 0.78
-  const maxAnomaly = Math.max(scores.userStalled, scores.hazardProximity, scores.alignmentAnomaly);
-  const highConfidenceAnomaly = maxAnomaly >= ANOMALY_CONFIDENCE_THRESHOLD;
-
-  if (!highConfidenceAnomaly && !String(userQuestion).trim()) {
-    return res.json({
-      escalatedToNeon: false,
-      downgradeToBurst: false,
-      decisionModel: 'gemini-decision-1',
-      decisionScores: scores,
-      decisionUsage,
-      message: 'Nominal stream verified with zero output tokens. gemini-4-neon kept asleep.',
-    });
-  }
-
-  // --- STAGE 2: Retrieve PostgreSQL pgvector + Recursive CTE RAG Subgraph (ADR 001) ---
-  let ragContext = [];
-  if (pool) {
-    try {
-      const { mimeType, base64 } = parseBase64Frame(sampled[sampled.length - 1].dataUrl);
-      const emb = await clients.interactionsAi.models.embedContent({
-        model: 'gemini-embedding-2',
-        contents: [{ inlineData: { data: base64, mimeType } }],
-      });
-      const vec = emb.embeddings?.[0]?.values?.slice(0, 768);
-      if (Array.isArray(vec) && vec.length === 768) {
-        const hasAnchor = Boolean(hasWebXRDepth) || scaleAnchor !== 'none';
-        const { rows } = await pool.query(
-          'SELECT * FROM rag_search_ontology_subgraph($1::vector, $2, 0.55, 5)',
-          [`[${vec.join(',')}]`, hasAnchor]
-        );
-        ragContext = rows;
-      }
-    } catch (dbErr) {
-      console.warn('[Ontology RAG warning]', dbErr.message);
-    }
-  }
-
-  // --- STAGE 3: Wake `gemini-4-neon` (The Brain) with 15s Buffer + RAG Subgraph ---
-  try {
-    const hasScaleRef = Boolean(hasWebXRDepth) || scaleAnchor !== 'none';
-    const neonInteraction = await clients.interactionsAi.interactions.create({
-      model: 'gemini-4-neon',
-      system_instruction:
-        'You are JackOfAllTrades. Diagnose the physical component and provide the next corrective action. ' +
-        (hasScaleRef
-          ? 'Scale anchor verified; exact tool sizes are permitted.'
-          : 'BREAK 2 GUARD: No scale anchor or WebXR depth detected. Do NOT suggest a numeric tool size; instruct the user to place a coin, credit card, or thumb beside the part.'),
-      input: [
-        ...multimodalInput,
-        {
-          type: 'text',
-          text: `PostgreSQL Ontology RAG context:\n${JSON.stringify(ragContext, null, 2)}`,
-        },
-      ],
-      response_format: {
-        type: Type.OBJECT,
-        properties: {
-          componentName: { type: Type.STRING },
-          diagnosisSummary: { type: Type.STRING },
-          nextStepInstruction: { type: Type.STRING },
-          toolRequired: { type: Type.STRING },
-          toolSizeSpec: { type: Type.STRING },
-          requiresScaleAnchor: { type: Type.BOOLEAN },
-          pipMotionPrompt: { type: Type.STRING },
-          voiceCoachingLine: { type: Type.STRING },
-        },
-        required: ['componentName', 'diagnosisSummary', 'nextStepInstruction', 'toolRequired', 'requiresScaleAnchor', 'pipMotionPrompt'],
-      },
-      generation_config: { thinking_level: 'medium' },
-    });
-
-    const parsed = JSON.parse(neonInteraction.output_text || '{}');
-    const safeDiagnosis = enforceScaleAnchorGuard(parsed, scaleAnchor, hasWebXRDepth);
-
-    return res.json({
-      escalatedToNeon: true,
-      downgradeToBurst: false,
-      decisionModel: 'gemini-decision-1',
-      reasoningModel: 'gemini-4-neon',
-      decisionScores: scores,
-      decisionUsage,
-      ragMatches: ragContext,
-      diagnosis: safeDiagnosis,
-    });
-  } catch (err) {
-    return res.status(502).json({
-      error: `gemini-4-neon call failed: ${err.message}`,
-      decisionScores: scores,
-    });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// 5. Ontology Graph Feedback Loop (PRD §2 / QA Test Case 2: M4 vs M6 Screw)
-// -----------------------------------------------------------------------------
-app.post('/api/ontology/feedback', async (req, res) => {
-  const { predictedComponentId, correctedComponentId, tag, frameDataUrl, regionCode = 'GLOBAL' } =
-    req.body ?? {};
-
-  if (!correctedComponentId || !tag) {
-    return res.status(400).json({ error: 'correctedComponentId and tag are required.' });
-  }
-
-  const clients = initGeminiClients();
-  if (!clients || !pool) {
-    return res.status(503).json({
-      error: 'Both PostgreSQL (SQL_HOST) and GEMINI_API_KEY must be configured for production ontology updates.',
-    });
-  }
-
-  try {
-    const { mimeType, base64 } = parseBase64Frame(frameDataUrl);
-    const emb = await clients.interactionsAi.models.embedContent({
-      model: 'gemini-embedding-2',
-      contents: [
-        `Corrected physical component: ${tag}`,
-        ...(base64 ? [{ inlineData: { data: base64, mimeType } }] : []),
-      ],
-    });
-    const vector768 = emb.embeddings?.[0]?.values?.slice(0, 768);
-    const { rows } = await pool.query(
-      'SELECT * FROM apply_ontology_correction($1, $2, $3, $4, $5::vector, $6)',
-      [
-        null,
-        predictedComponentId || null,
-        Number(correctedComponentId),
-        String(tag).slice(0, 80),
-        `[${vector768.join(',')}]`,
-        String(regionCode).slice(0, 32),
-      ]
-    );
-    return res.json({ status: 'updated', result: rows[0] });
-  } catch (err) {
-    return res.status(500).json({ error: `Ontology feedback update failed: ${err.message}` });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// 6. Live Spatial Output: PiP Hand-Motion Loop via `gemini-omni-1.2-flash`
-// -----------------------------------------------------------------------------
-app.post('/api/generate-pip', async (req, res) => {
-  const { prompt, referenceFrameDataUrl } = req.body ?? {};
-  const clients = initGeminiClients();
-  if (!clients) {
-    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured.' });
-  }
-
-  try {
-    const input = [];
-    if (referenceFrameDataUrl) {
-      const { mimeType, base64 } = parseBase64Frame(referenceFrameDataUrl);
-      input.push({ type: 'image', mime_type: mimeType, data: base64 });
-    }
-    input.push({ type: 'text', text: String(prompt) });
-
-    const interaction = await clients.interactionsAi.interactions.create(
-      {
-        model: 'gemini-omni-1.2-flash',
-        input,
-        background: false,
-        store: false,
-        stream: false,
-        response_format: {
-          type: 'video',
-          aspect_ratio: '16:9',
-          duration: '6s',
-          resolution: '720p',
-        },
-      },
-      { timeout: 300000 }
-    );
-
-    const video = interaction.output_video;
-    return res.json({
-      model: 'gemini-omni-1.2-flash',
-      mimeType: video?.mime_type || 'video/mp4',
-      videoDataUrl: video?.data ? `data:${video.mime_type || 'video/mp4'};base64,${video.data}` : null,
-      videoUri: video?.uri || null,
-    });
-  } catch (err) {
-    return res.status(502).json({ error: `PiP video generation failed: ${err.message}` });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// 6b. Native Two-Way Audio: Push-to-Talk Visual + Audio -> Generated Speech (WAV)
-//     Audio Encoding/Decoding Flow:
-//       - Client MediaRecorder records microphone audio as a Blob (audio/webm or audio/mp4)
-//         and Base64-encodes it alongside sampled JPEG camera frames.
-//       - Server strips data-URL headers, normalizes MIME (removing `;codecs=opus`),
-//         and sends BOTH inline `image` parts AND the raw inline `audio` part to
-//         `gemini-4-neon` with the strict expert mechanic system prompt.
-//       - Server synthesizes spoken WAV audio via `gemini-3.8-flash-lite-tts` with
-//         `response_format: { type: 'audio' }` (complete 24kHz mono 16-bit RIFF WAV).
-//       - Server decodes the Base64 WAV via `Buffer.from(data, 'base64')` and pipes
-//         raw binary `audio/wav` bytes back when `Accept: audio/*` is sent (or JSON Base64).
-// -----------------------------------------------------------------------------
-const EXPERT_MECHANIC_SYSTEM_PROMPT =
-  "You are an expert mechanic. Detect the exact spoken language of the user's audio query and respond in that exact same language using the visual context provided. Keep your spoken response under 3 sentences. Be direct and actionable.";
-
-const SHORT_LANGUAGE_DEFAULTS = {
-  en: 'en-US',
-  es: 'es-ES',
-  fr: 'fr-FR',
-  de: 'de-DE',
-  it: 'it-IT',
-  pt: 'pt-BR',
-  ja: 'ja-JP',
-  ko: 'ko-KR',
-  zh: 'zh-CN',
-  ar: 'ar-EG',
-  hi: 'hi-IN',
-  ru: 'ru-RU',
-  nl: 'nl-NL',
-  pl: 'pl-PL',
-  tr: 'tr-TR',
-  vi: 'vi-VN',
-  th: 'th-TH',
-  id: 'id-ID',
-  uk: 'uk-UA',
-  sv: 'sv-SE',
+// src/lib/audioUtils.ts
+var EXPERT_MECHANIC_SYSTEM_PROMPT = "You are an expert mechanic. Detect the exact spoken language of the user's audio query and respond in that exact same language using the visual context provided. Keep your spoken response under 3 sentences. Be direct and actionable.";
+var MAX_AUDIO_UPLOAD_BYTES = 10 * 1024 * 1024;
+var SUPPORTED_AUDIO_MIME_TYPES = /* @__PURE__ */ new Set([
+  "audio/webm",
+  "audio/mp4",
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/ogg",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/aac",
+  "audio/flac"
+]);
+var SHORT_LANGUAGE_DEFAULTS = {
+  en: "en-US",
+  es: "es-ES",
+  fr: "fr-FR",
+  de: "de-DE",
+  it: "it-IT",
+  pt: "pt-BR",
+  ja: "ja-JP",
+  ko: "ko-KR",
+  zh: "zh-CN",
+  ar: "ar-EG",
+  hi: "hi-IN",
+  ru: "ru-RU",
+  nl: "nl-NL",
+  pl: "pl-PL",
+  tr: "tr-TR",
+  vi: "vi-VN",
+  th: "th-TH",
+  id: "id-ID",
+  uk: "uk-UA",
+  sv: "sv-SE"
 };
-
-function normalizeBcp47Language(rawCode, fallback = 'en-US') {
-  const safeFallback = /^[a-z]{2,3}-[A-Z]{2}$/.test(fallback) ? fallback : 'en-US';
-  if (!rawCode || typeof rawCode !== 'string') return safeFallback;
-  const cleaned = rawCode.trim().replace(/_/g, '-');
+function normalizeBcp47Language(rawCode, fallback = "en-US") {
+  const safeFallback = /^[a-z]{2,3}-[A-Z]{2}$/.test(fallback) ? fallback : "en-US";
+  if (!rawCode || typeof rawCode !== "string") return safeFallback;
+  const cleaned = rawCode.trim().replace(/_/g, "-");
   if (!cleaned) return safeFallback;
   const lower = cleaned.toLowerCase();
   if (/^[a-z]{2}$/.test(lower)) {
     return SHORT_LANGUAGE_DEFAULTS[lower] ?? `${lower}-${lower.toUpperCase()}`;
   }
-  const parts = cleaned.split('-').filter(Boolean);
+  const parts = cleaned.split("-").filter(Boolean);
   if (parts.length === 2 && /^[a-z]{2,3}$/i.test(parts[0]) && /^[a-z0-9]{2,4}$/i.test(parts[1])) {
     return `${parts[0].toLowerCase()}-${parts[1].toUpperCase()}`;
   }
-  if (parts.length === 3 && /^[a-z]{2,3}$/i.test(parts[0]) && /^[a-z]{2}$/i.test(parts[2])) {
+  if (parts.length === 3 && /^[a-z]{2,3}$/i.test(parts[0]) && /^[a-z]{4}$/i.test(parts[1]) && /^[a-z]{2}$/i.test(parts[2])) {
     return `${parts[0].toLowerCase()}-${parts[2].toUpperCase()}`;
   }
   return safeFallback;
 }
-
-function parseBase64Audio(rawInput, fallbackMime = 'audio/webm') {
-  const trimmed = String(rawInput || '').trim();
+function normalizeAudioMimeType(rawMime) {
+  if (!rawMime || typeof rawMime !== "string") return "audio/webm";
+  const base = rawMime.split(";")[0].trim().toLowerCase();
+  if (base === "audio/x-wav") return "audio/wav";
+  if (SUPPORTED_AUDIO_MIME_TYPES.has(base)) return base;
+  return "audio/webm";
+}
+function stripAudioDataUrl(input, fallbackMime = "audio/webm") {
+  const trimmed = String(input || "").trim();
   const match = trimmed.match(/^data:([^,]+);base64,(.+)$/i);
-  const rawMime = match ? match[1] : fallbackMime;
-  const base64 = (match ? match[2] : trimmed).replace(/\s+/g, '');
-  const baseMime = String(rawMime || 'audio/webm').split(';')[0].trim().toLowerCase();
-  const mimeType = baseMime === 'audio/x-wav' ? 'audio/wav' : baseMime || 'audio/webm';
-  return { mimeType, base64 };
+  if (match) {
+    return {
+      mimeType: normalizeAudioMimeType(match[1]),
+      base64: match[2].replace(/\s+/g, "")
+    };
+  }
+  return {
+    mimeType: normalizeAudioMimeType(fallbackMime),
+    base64: trimmed.replace(/\s+/g, "")
+  };
+}
+function validateAudioPayload(base64, maxBytes = MAX_AUDIO_UPLOAD_BYTES) {
+  const clean = String(base64 || "").replace(/\s+/g, "");
+  if (clean.length < 16) {
+    return {
+      ok: false,
+      byteLength: 0,
+      error: "Recording was too short. Hold the button while speaking your question."
+    };
+  }
+  const padding = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
+  const byteLength = Math.max(0, Math.floor(clean.length * 3 / 4) - padding);
+  if (byteLength > maxBytes) {
+    return {
+      ok: false,
+      byteLength,
+      error: "Audio clip is too long. Keep your explanation brief and try again."
+    };
+  }
+  return { ok: true, byteLength };
+}
+function enforceThreeSentenceCap(rawText) {
+  const cleaned = String(rawText || "").replace(/```[\s\S]*?```/g, " ").replace(/[*_#`>]+/g, "").replace(/\s+/g, " ").trim();
+  if (!cleaned) {
+    return "Hold the camera steady with a bit more light and describe what feels stuck.";
+  }
+  const sentences = cleaned.match(/[^.!?。！？؟।]+[.!?。！？؟।]+|[^.!?。！？؟।]+$/g) ?? [cleaned];
+  const capped = sentences.map((s) => s.trim()).filter(Boolean).slice(0, 3).join(" ");
+  return capped || cleaned;
 }
 
-function capToThreeSentences(rawText) {
-  const clean = String(rawText || '')
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/[*_#`>]+/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!clean) return 'Hold steady with a little more light and tell me what feels stuck.';
-  const sentences = clean.match(/[^.!?。！？؟।]+[.!?。！？؟।]+|[^.!?。！？؟।]+$/g) ?? [clean];
-  return sentences.map((s) => s.trim()).filter(Boolean).slice(0, 3).join(' ');
+// src/lib/demoNarration.ts
+var DEMO_NARRATION_CUES = {
+  intro: {
+    id: "intro",
+    spokenText: "Welcome to Jack of All Trades. This is a quick interactive demo showing how visual repair guidance works. Tap the highlighted battery latch on screen to see step-by-step instructions.",
+    caption: "Interactive demo \xB7 Tap the highlighted battery latch to begin.",
+    activeStepNumber: null,
+    visualPhase: "loop"
+  },
+  "step-1": {
+    id: "step-1",
+    spokenText: "Step one: Press down gently with your thumb on the ridged release latch near the top of the cover.",
+    caption: "Step 1 of 3 \xB7 Press down on the ridged latch",
+    activeStepNumber: 1,
+    visualPhase: "press"
+  },
+  "step-2": {
+    id: "step-2",
+    spokenText: "Step two: Keep light pressure and slide the cover straight down toward the molded arrow until it clicks loose.",
+    caption: "Step 2 of 3 \xB7 Slide the cover toward the arrow",
+    activeStepNumber: 2,
+    visualPhase: "slide"
+  },
+  "step-3": {
+    id: "step-3",
+    spokenText: "Step three: Lift the cover up to reveal the batteries. You are all set\u2014tap Got It, Open Camera whenever you are ready for a live repair.",
+    caption: "Step 3 of 3 \xB7 Lift cover to reveal batteries \xB7 Ready for camera",
+    activeStepNumber: 3,
+    visualPhase: "open"
+  }
+};
+function isValidDemoCueId(value) {
+  return value === "intro" || value === "step-1" || value === "step-2" || value === "step-3";
 }
 
-app.post('/api/voice-assist', async (req, res) => {
-  const {
-    frames = [],
-    audio,
-    audioDataUrl,
-    audioBase64,
-    audioMimeType = 'audio/webm',
-    preferredLanguage,
-    format,
-  } = req.body ?? {};
-
-  const rawAudio =
-    typeof audio === 'string'
-      ? audio
-      : typeof audio?.data === 'string'
-        ? audio.data
-        : typeof audioDataUrl === 'string'
-          ? audioDataUrl
-          : typeof audioBase64 === 'string'
-            ? audioBase64
-            : '';
-
-  const fallbackLanguage = normalizeBcp47Language(
-    typeof preferredLanguage === 'string' ? preferredLanguage : undefined,
-    'en-US'
-  );
-
-  const { mimeType: cleanAudioMime, base64: cleanAudioBase64 } = parseBase64Audio(
-    rawAudio,
-    (typeof audio === 'object' && audio?.mimeType) || audioMimeType
-  );
-
-  if (cleanAudioBase64.length < 16) {
-    return res.status(400).json({ error: 'Recording was too short. Hold the button while speaking.' });
+// src/lib/scaleCalibration.ts
+var REFERENCE_OBJECT_DIMENSIONS_MM = {
+  us_quarter: 24.26,
+  coin: 24,
+  credit_card: 85.6,
+  human_thumb: 20,
+  ruler: null,
+  webxr_depth: null,
+  none: null
+};
+var SCALE_CALIBRATION_PROMPT_GUIDE = 'KNOWN REFERENCE DIMENSIONS FOR PIXEL-RATIO MEASUREMENT:\n- US Quarter ("us_quarter"): 24.26 mm diameter\n- Standard Coin ("coin"): ~24.0 mm diameter\n- Credit / Debit / ID Card ("credit_card"): 85.60 mm wide x 53.98 mm tall\n- Adult Human Thumb ("human_thumb"): ~20.0 mm nail/pad width\n- Ruler / Tape Measure ("ruler"): read markings directly\nWhen any reference object is clearly visible on the same depth plane next to the target part, measure the target part width/head diameter as a ratio of the reference object, compute estimatedPartSizeMm, write a 1-sentence scaleMeasurementNote proving the measurement (e.g., "Compared to the 24.26 mm quarter, the bolt head is ~40% as wide (~10 mm), matching a 10mm socket"), and return anchorBox as [ymin, xmin, ymax, xmax] in 0..1000 coordinates.';
+var WHY_SCALE_MATTERS_SUMMARY = "Camera lenses distort close-up distance and magnification, so a tiny screw can look identical to a much larger bolt. Placing a known-size object like a quarter, credit card, or your thumb beside the part lets us measure real dimensions and avoid recommending the wrong tool size.";
+var WHY_SCALE_MATTERS_SPOKEN = "No problem, you can continue without scaling. Just keep in mind that camera lenses distort close-up size, so without a quarter, credit card, or your thumb beside the part, tool sizes are approximate\u2014test the fit gently before turning.";
+var SCALE_REQUEST_BANNER = "Hold a quarter, credit card, or your thumb right beside the part and try again so we can confirm exact size\u2014or choose Continue Without Scaling.";
+var SCALE_REQUEST_SPOKEN = "Please place a quarter, credit card, or your thumb next to the part so I can calibrate scale and confirm the exact tool size\u2014or let me know if you prefer to continue without scaling.";
+function normalizeDetectedScaleObject(raw) {
+  if (!raw || typeof raw !== "string") return "none";
+  const cleaned = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (cleaned === "none" || cleaned === "null" || cleaned === "unknown" || cleaned === "no_object" || cleaned === "not_found") {
+    return "none";
   }
-
-  const clients = initGeminiClients();
-  if (!clients) {
-    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
+  if (cleaned.includes("webxr") || cleaned.includes("depth")) return "webxr_depth";
+  if (cleaned.includes("quarter")) return "us_quarter";
+  if (cleaned.includes("coin") || cleaned.includes("penny") || cleaned.includes("dime") || cleaned.includes("nickel") || cleaned.includes("euro")) {
+    return "coin";
   }
+  if (cleaned.includes("credit_card") || cleaned.includes("bank_card") || cleaned.includes("debit_card") || cleaned.includes("id_card") || cleaned === "card") {
+    return "credit_card";
+  }
+  if (cleaned.includes("thumb") || cleaned.includes("finger") || cleaned.includes("hand")) {
+    return "human_thumb";
+  }
+  if (cleaned.includes("ruler") || cleaned.includes("tape_measure") || cleaned.includes("caliper") || cleaned.includes("measuring")) {
+    return "ruler";
+  }
+  return "none";
+}
+function formatScaleObjectLabel(obj) {
+  switch (obj) {
+    case "us_quarter":
+      return "quarter coin (24.26 mm)";
+    case "coin":
+      return "coin (~24 mm)";
+    case "credit_card":
+      return "credit card (85.6 mm)";
+    case "human_thumb":
+      return "your thumb (~20 mm)";
+    case "ruler":
+      return "ruler";
+    case "webxr_depth":
+      return "depth sensor";
+    default:
+      return "reference object";
+  }
+}
+function mapDetectedObjectToScaleAnchor(obj) {
+  switch (obj) {
+    case "us_quarter":
+    case "coin":
+      return "us_quarter";
+    case "credit_card":
+      return "credit_card";
+    case "human_thumb":
+    case "ruler":
+      return "human_thumb";
+    case "webxr_depth":
+      return "webxr_depth";
+    default:
+      return "none";
+  }
+}
+var DECLINE_SCALE_PATTERNS = [
+  /\b(don'?t|do not|dont)\s+(want|need|have)\s+(to\s+)?(scale|calibrate|an?\s+object|a\s+quarter|a\s+card|a\s+coin)\b/i,
+  /\b(skip|ignore|bypass|disable|no)\s+(the\s+)?(scal(e|ing)|calibrat(e|ion)|reference\s+object|scale\s+object)\b/i,
+  /\b(continue|proceed|go\s+ahead|just\s+help|keep\s+going)\s+without\s+(scal(e|ing)|an?\s+object|a\s+quarter|a\s+card|calibrat(e|ion))\b/i,
+  /\bwithout\s+(scal(e|ing)|using\s+an?\s+object|a\s+reference\s+object)\b/i,
+  /\bno\s+quiero\s+(usar\s+)?(escala|escalar|un\s+objeto|moneda|tarjeta)\b/i,
+  /\bsin\s+(escala|escalar|objeto\s+de\s+referencia)\b/i,
+  /\b(sans|pas\s+d['’])\s*(échelle|objet\s+de\s+référence|calibrage)\b/i,
+  /\b(ohne|nicht)\s+(skalier(en|ung)|maßstab|referenzobjekt)\b/i,
+  /\b(sem|não\s+quero)\s+(escala|escalar|objeto\s+de\s+referência)\b/i
+];
+function detectScaleDeclineIntent(transcript) {
+  if (!transcript || typeof transcript !== "string") return false;
+  const text = transcript.trim();
+  if (text.length < 4) return false;
+  return DECLINE_SCALE_PATTERNS.some((pattern) => pattern.test(text));
+}
+function resolveScaleCalibration(input) {
+  const normalizedDetected = normalizeDetectedScaleObject(input.detectedObject);
+  const clientAnchor = input.clientScaleAnchor && input.clientScaleAnchor !== "none" ? normalizeDetectedScaleObject(input.clientScaleAnchor) : "none";
+  const resolvedObject = input.hasWebXRDepth ? "webxr_depth" : normalizedDetected !== "none" ? normalizedDetected : clientAnchor;
+  const confidence = typeof input.scaleConfidence === "number" && Number.isFinite(input.scaleConfidence) ? Math.max(0, Math.min(1, Number(input.scaleConfidence.toFixed(2)))) : resolvedObject !== "none" ? 0.9 : 0;
+  const isVisuallyCalibrated = Boolean(input.hasWebXRDepth) || clientAnchor !== "none" || Boolean(input.scaleCalibrated) && normalizedDetected !== "none" && confidence >= 0.55;
+  const whyScaleMatters = input.localizedWhyScaleMatters?.trim() || WHY_SCALE_MATTERS_SUMMARY;
+  const estimatedPartSizeMm = typeof input.estimatedPartSizeMm === "number" && Number.isFinite(input.estimatedPartSizeMm) && input.estimatedPartSizeMm > 0 ? Math.round(input.estimatedPartSizeMm * 10) / 10 : null;
+  const scaleMeasurementNote = typeof input.scaleMeasurementNote === "string" && input.scaleMeasurementNote.trim() ? input.scaleMeasurementNote.trim() : null;
+  if (isVisuallyCalibrated && resolvedObject !== "none") {
+    const label = formatScaleObjectLabel(resolvedObject);
+    const refMm = REFERENCE_OBJECT_DIMENSIONS_MM[resolvedObject];
+    const sizePhrase = estimatedPartSizeMm ? ` (~${estimatedPartSizeMm} mm part measured)` : "";
+    const bannerText = scaleMeasurementNote || `We calibrated scale using the ${label} next to the part${sizePhrase}. Exact tool sizes are unlocked for this repair.`;
+    return {
+      status: "calibrated",
+      detectedObject: resolvedObject,
+      detectedObjectLabel: label,
+      referenceDimensionMm: refMm,
+      estimatedPartSizeMm,
+      scaleMeasurementNote,
+      anchorBox: input.anchorBox ?? null,
+      confidence,
+      confirmed: true,
+      optedOut: false,
+      userDeclinedInSpeech: false,
+      bannerTitle: `Scale Confirmed (${label})`,
+      bannerText,
+      whyScaleMatters,
+      spokenScaleNotice: `Scale confirmed using the ${label}${sizePhrase}.`
+    };
+  }
+  const declinedInSpeech = Boolean(input.userDeclinedInSpeech) || detectScaleDeclineIntent(input.userTranscript);
+  const optedOut = Boolean(input.explicitOptOut) || declinedInSpeech;
+  if (optedOut) {
+    return {
+      status: "opted_out",
+      detectedObject: "none",
+      detectedObjectLabel: "none",
+      referenceDimensionMm: null,
+      estimatedPartSizeMm: null,
+      scaleMeasurementNote: null,
+      anchorBox: null,
+      confidence: 0,
+      confirmed: false,
+      optedOut: true,
+      userDeclinedInSpeech: declinedInSpeech,
+      bannerTitle: "Continuing Without Scale Object",
+      bannerText: whyScaleMatters,
+      whyScaleMatters,
+      spokenScaleNotice: WHY_SCALE_MATTERS_SPOKEN
+    };
+  }
+  return {
+    status: "needs_anchor",
+    detectedObject: "none",
+    detectedObjectLabel: "none",
+    referenceDimensionMm: null,
+    estimatedPartSizeMm: null,
+    scaleMeasurementNote: null,
+    anchorBox: null,
+    confidence: 0,
+    confirmed: false,
+    optedOut: false,
+    userDeclinedInSpeech: false,
+    bannerTitle: "Place a Scale Object Next to the Part",
+    bannerText: SCALE_REQUEST_BANNER,
+    whyScaleMatters,
+    spokenScaleNotice: SCALE_REQUEST_SPOKEN
+  };
+}
 
-  // Sample up to 4 recent video frames from the client's rolling buffer
-  const safeFrames = Array.isArray(frames) ? frames : [];
-  const stride = Math.max(1, Math.floor(safeFrames.length / 4));
-  const sampled = safeFrames.filter((_f, i) => i % stride === 0).slice(0, 4);
+// src/lib/ontologyMapper.ts
+var VALID_MOTION_CUES = /* @__PURE__ */ new Set([
+  "rotate_cw",
+  "rotate_ccw",
+  "slide",
+  "lift",
+  "press",
+  "align",
+  "inspect"
+]);
+function normalizeBoxToPct(rawBox, fallback) {
+  if (!Array.isArray(rawBox) || rawBox.length !== 4) {
+    return fallback ?? null;
+  }
+  const nums = rawBox.map((n) => Number(n));
+  if (nums.some((n) => !Number.isFinite(n))) {
+    return fallback ?? null;
+  }
+  const [rawYmin, rawXmin, rawYmax, rawXmax] = nums;
+  const maxVal = Math.max(rawYmin, rawXmin, rawYmax, rawXmax);
+  const scale = maxVal > 100 ? 10 : 1;
+  const y1 = Math.max(4, Math.min(92, rawYmin / scale));
+  const x1 = Math.max(4, Math.min(92, rawXmin / scale));
+  const y2 = Math.max(y1 + 8, Math.min(96, rawYmax / scale));
+  const x2 = Math.max(x1 + 8, Math.min(96, rawXmax / scale));
+  const wPct = Math.max(12, Math.min(88, Math.round((x2 - x1) * 10) / 10));
+  const hPct = Math.max(12, Math.min(84, Math.round((y2 - y1) * 10) / 10));
+  const xPct = Math.max(4, Math.min(96 - wPct, Math.round(x1 * 10) / 10));
+  const yPct = Math.max(8, Math.min(92 - hPct, Math.round(y1 * 10) / 10));
+  return { xPct, yPct, wPct, hPct };
+}
+function normalizeMotionCue(raw) {
+  if (typeof raw !== "string") return "inspect";
+  const cleaned = raw.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (VALID_MOTION_CUES.has(cleaned)) {
+    return cleaned;
+  }
+  if (cleaned.includes("counter") || cleaned.includes("ccw") || cleaned.includes("left") || cleaned.includes("loosen")) {
+    return "rotate_ccw";
+  }
+  if (cleaned.includes("clock") || cleaned.includes("cw") || cleaned.includes("tighten") || cleaned.includes("twist") || cleaned.includes("turn")) {
+    return "rotate_cw";
+  }
+  if (cleaned.includes("slide") || cleaned.includes("pull") || cleaned.includes("linear")) {
+    return "slide";
+  }
+  if (cleaned.includes("lift") || cleaned.includes("pry") || cleaned.includes("raise") || cleaned.includes("open")) {
+    return "lift";
+  }
+  if (cleaned.includes("press") || cleaned.includes("push") || cleaned.includes("snap") || cleaned.includes("click")) {
+    return "press";
+  }
+  if (cleaned.includes("align") || cleaned.includes("angle") || cleaned.includes("tilt") || cleaned.includes("seat")) {
+    return "align";
+  }
+  return "inspect";
+}
+function mapPgHierarchyRow(row) {
+  const id = Number(row.id ?? 0);
+  const parentId = row.parent_id !== null && row.parent_id !== void 0 ? Number(row.parent_id) : row.parentId !== null && row.parentId !== void 0 ? Number(row.parentId) : null;
+  return {
+    id,
+    parentId,
+    name: String(row.name ?? "Unnamed Component"),
+    componentClass: String(row.component_class ?? row.componentClass ?? "part"),
+    depth: Number(row.depth ?? 0),
+    breadcrumbPath: String(row.breadcrumb_path ?? row.breadcrumbPath ?? row.name ?? ""),
+    failurePrecursorCue: String(row.failure_precursor_cue ?? row.failurePrecursorCue ?? ""),
+    toolRequired: String(row.tool_required ?? row.toolRequired ?? "Standard hand tool"),
+    toolSizeSpec: String(row.tool_size_spec ?? row.toolSizeSpec ?? "Standard size"),
+    requiresScaleAnchor: Boolean(row.requires_scale_anchor ?? row.requiresScaleAnchor ?? false),
+    successRate: Number(row.success_rate ?? row.successRate ?? 0.85),
+    correctionCount: Number(row.correction_count ?? row.correctionCount ?? 0)
+  };
+}
+function mapPgComponentNodeRow(row) {
+  const measurementRaw = String(row.measurement_system ?? row.measurementSystem ?? "universal");
+  const measurementSystem = measurementRaw === "metric" || measurementRaw === "imperial" ? measurementRaw : "universal";
+  const rawClass = String(row.component_class ?? row.componentClass ?? "subassembly").toLowerCase();
+  const componentClass = rawClass === "assembly" || rawClass === "fastener" || rawClass === "seal" || rawClass === "subassembly" ? rawClass : "subassembly";
+  const rawRot = String(row.rotation_direction ?? row.rotationDirection ?? "linear").toLowerCase();
+  const rotationDirection = rawRot === "clockwise" || rawRot === "counter_clockwise" || rawRot === "angled" || rawRot === "linear" ? rawRot : "linear";
+  return {
+    id: Number(row.id ?? 0),
+    parentId: row.parent_id !== null && row.parent_id !== void 0 ? Number(row.parent_id) : null,
+    manualSku: String(row.manual_sku ?? row.manualSku ?? "FIELD-LEARNED"),
+    brandName: String(row.brand_name ?? row.brandName ?? "Community Ontology"),
+    name: String(row.name ?? "Unnamed Component"),
+    partCode: String(row.part_code ?? row.partCode ?? `PART-${row.id ?? 0}`),
+    componentClass,
+    measurementSystem,
+    threadPitchMm: row.thread_pitch_mm !== null && row.thread_pitch_mm !== void 0 ? Number(row.thread_pitch_mm) : null,
+    nominalDiameterMm: row.nominal_diameter_mm !== null && row.nominal_diameter_mm !== void 0 ? Number(row.nominal_diameter_mm) : null,
+    visualCueNotes: String(row.visual_cue_notes ?? row.visualCueNotes ?? ""),
+    failurePrecursorCue: String(row.failure_precursor_cue ?? row.failurePrecursorCue ?? ""),
+    actionType: String(row.action_type ?? row.actionType ?? "inspect"),
+    toolRequired: String(row.tool_required ?? row.toolRequired ?? "Standard hand tool"),
+    toolSizeSpec: String(row.tool_size_spec ?? row.toolSizeSpec ?? "Standard size"),
+    requiresScaleAnchor: Boolean(row.requires_scale_anchor ?? row.requiresScaleAnchor ?? false),
+    rotationDirection,
+    instructionText: String(row.instruction_text ?? row.instructionText ?? ""),
+    pipMotionPrompt: String(row.pip_motion_prompt ?? row.pipMotionPrompt ?? ""),
+    successRate: Number(row.success_rate ?? row.successRate ?? 0.85),
+    correctionCount: Number(row.correction_count ?? row.correctionCount ?? 0),
+    embedding: []
+  };
+}
+function mapPgFeedbackRow(row) {
+  const createdRaw = row.created_at ?? row.createdAt;
+  const timestamp = createdRaw instanceof Date ? createdRaw.toISOString() : typeof createdRaw === "string" && createdRaw ? createdRaw : (/* @__PURE__ */ new Date()).toISOString();
+  return {
+    id: String(row.id ?? ""),
+    timestamp,
+    predictedComponentId: row.predicted_component_id !== null && row.predicted_component_id !== void 0 ? Number(row.predicted_component_id) : 0,
+    predictedName: String(row.predicted_name ?? row.predictedName ?? "Auto-Detected Part"),
+    correctedComponentId: Number(row.corrected_component_id ?? row.correctedComponentId ?? 0),
+    correctedName: String(row.corrected_name ?? row.correctedName ?? "Verified Component"),
+    tag: String(row.user_correction_tag ?? row.tag ?? "user_correction"),
+    regionCode: String(row.region_code ?? row.regionCode ?? "GLOBAL")
+  };
+}
+function computeLiveFlywheelMetrics(agg) {
+  const deflectedReturns = Math.max(0, Number(agg.deflectedReturns) || 0);
+  const grossBountyRevenueUsd = Math.round((Number(agg.grossBountyRevenueUsd) || 0) * 100) / 100;
+  const totalComputeUsd = Math.round((Number(agg.totalComputeUsd) || 0) * 1e4) / 1e4;
+  const bountyPerDeflectionUsd = deflectedReturns > 0 ? Math.round(grossBountyRevenueUsd / deflectedReturns * 100) / 100 : 30;
+  const marginMultiple = totalComputeUsd > 0 ? Math.round(grossBountyRevenueUsd / totalComputeUsd * 10) / 10 : deflectedReturns > 0 ? 20 : 0;
+  return {
+    deflectedReturns,
+    bountyPerDeflectionUsd,
+    grossBountyRevenueUsd,
+    totalComputeUsd: Number(totalComputeUsd.toFixed(2)),
+    marginMultiple,
+    totalCorrections: Math.max(0, Number(agg.totalCorrections) || 0),
+    totalSessions: agg.totalSessions !== void 0 ? Math.max(0, Number(agg.totalSessions) || 0) : void 0
+  };
+}
 
-  const multimodalInput = [
-    ...sampled
-      .filter((f) => typeof f?.dataUrl === 'string' && f.dataUrl.length >= 32)
-      .map((frame) => {
-        const { mimeType, base64 } = parseBase64Frame(frame.dataUrl);
-        return { type: 'image', data: base64, mime_type: mimeType, resolution: 'medium' };
-      }),
-    // Raw microphone audio passed as an inline audio part alongside visual frames
-    { type: 'audio', data: cleanAudioBase64, mime_type: cleanAudioMime },
-    {
-      type: 'text',
-      text:
-        '1. Listen carefully to the attached audio clip. Set speechDetected=true ONLY if intelligible human speech is actually audible; set speechDetected=false if the clip is silent or contains only noise.\n' +
-        '2. If speechDetected=true, write the exact verbatim words heard in userTranscript (in the original spoken language) and set detectedLanguageCode to the matching BCP-47 tag (e.g., "es-ES", "es-MX", "fr-FR", "ja-JP", "de-DE", "pt-BR", "zh-CN", "ar-EG", "hi-IN", "en-US").\n' +
-        `3. If speechDetected=false, set userTranscript="", set detectedLanguageCode="${fallbackLanguage}", do NOT invent a repair problem, and write a brief polite prompt in "${fallbackLanguage}" asking the user to hold the button and speak closer to the microphone.\n` +
-        '4. Write spokenResponse STRICTLY in detectedLanguageCode — never switch languages. Keep spokenResponse under 3 short, direct, actionable sentences with no markdown.',
-    },
-  ];
-
-  let spokenText;
-  let detectedLanguageCode = fallbackLanguage;
-  let detectedLanguageName = 'Auto';
-  try {
-    const reasoning = await clients.interactionsAi.interactions.create({
-      model: 'gemini-4-neon',
-      system_instruction: EXPERT_MECHANIC_SYSTEM_PROMPT,
-      input: multimodalInput,
-      store: false,
-      generation_config: { thinking_level: 'low' },
-      response_format: {
-        type: Type.OBJECT,
-        properties: {
-          speechDetected: { type: Type.BOOLEAN },
-          userTranscript: { type: Type.STRING },
-          detectedLanguageCode: { type: Type.STRING },
-          detectedLanguageName: { type: Type.STRING },
-          spokenResponse: { type: Type.STRING },
-        },
-        required: [
-          'speechDetected',
-          'userTranscript',
-          'detectedLanguageCode',
-          'detectedLanguageName',
-          'spokenResponse',
-        ],
-      },
-    });
-    const rawOutput = reasoning.output_text || '';
-    try {
-      const parsed = JSON.parse(rawOutput);
-      const rawCode =
-        parsed.speechDetected === false ? fallbackLanguage : parsed.detectedLanguageCode;
-      detectedLanguageCode = normalizeBcp47Language(rawCode, fallbackLanguage);
-      detectedLanguageName = parsed.detectedLanguageName?.trim() || detectedLanguageCode;
-      spokenText = capToThreeSentences(parsed.spokenResponse || rawOutput);
-    } catch {
-      spokenText = capToThreeSentences(rawOutput);
+// server.ts
+var __filename = fileURLToPath(import.meta.url);
+var __dirname = path.dirname(__filename);
+var PORT = Number(process.env.PORT || 3e3);
+var kService = process.env.K_SERVICE || "";
+var isProduction = process.env.NODE_ENV === "production" || Boolean(kService) && !kService.startsWith("ais-dev-");
+var cloudSqlConfig = resolveCloudSqlPoolConfig({
+  ...process.env,
+  SQL_SSL: "true"
+});
+var pgPool = null;
+if (cloudSqlConfig.poolConfig) {
+  pgPool = new Pool(cloudSqlConfig.poolConfig);
+  pgPool.on("error", (err) => {
+    console.error("[PostgreSQL Pool Error]", err.message);
+  });
+}
+var localOntology = new InMemoryOntologyGraph();
+var signalingRooms = /* @__PURE__ */ new Map();
+function getGeminiClients() {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === "MY_GEMINI_API_KEY") {
+    return null;
+  }
+  const decisionsAi = new GoogleGenAI({
+    apiKey,
+    apiVersion: "v1beta",
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build"
+      }
     }
-  } catch (err) {
-    return res.status(502).json({ error: `Multimodal voice analysis failed: ${err.message}` });
+  });
+  const interactionsAi = new GoogleGenAI({
+    apiKey,
+    apiVersion: "v1beta",
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build"
+      }
+    }
+  });
+  return { decisionsAi, interactionsAi };
+}
+function stripDataUrlPrefix(dataUrl) {
+  const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (match) {
+    return { mimeType: match[1], base64: match[2] };
   }
-
-  try {
-    // Request native WAV audio output in the exact detected BCP-47 language
-    const tts = await clients.interactionsAi.interactions.create({
-      model: 'gemini-3.8-flash-lite-tts',
-      input: [
-        {
-          type: 'text',
-          text: spokenText,
-          annotations: [
-            {
-              type: 'speech_metadata',
-              style: `Calm, confident, direct expert mechanic speaking naturally in ${detectedLanguageName}`,
-            },
-          ],
-        },
-      ],
-      store: false,
-      response_format: { type: 'audio' },
-      generation_config: { speech_config: [{ language: detectedLanguageCode, voice: 'Kore' }] },
+  return { mimeType: "image/jpeg", base64: dataUrl };
+}
+function extractErrorDetails(err) {
+  const anyErr = err;
+  const status = typeof anyErr?.status === "number" && anyErr.status >= 400 && anyErr.status < 600 ? anyErr.status : typeof anyErr?.code === "number" && anyErr.code >= 400 && anyErr.code < 600 ? anyErr.code : 502;
+  const rawMessage = anyErr?.message || "Gemini API request failed.";
+  return { status, message: rawMessage };
+}
+async function createApp() {
+  const app = express();
+  app.use(express.json({ limit: "25mb" }));
+  app.get(["/api/health", "/healthz"], (_req, res) => {
+    res.json({
+      status: "ok",
+      service: "jackofalltrades",
+      license: "AGPL-3.0-only",
+      postgresConfigured: Boolean(pgPool),
+      databaseTransport: cloudSqlConfig.transport,
+      sqlConnectionName: cloudSqlConfig.connectionName,
+      sqlPublicIp: cloudSqlConfig.publicIp,
+      sqlOutgoingIp: cloudSqlConfig.outgoingIp,
+      sqlPort: cloudSqlConfig.port,
+      sqlSslEnabled: cloudSqlConfig.sslEnabled,
+      sqlTarget: cloudSqlConfig.hostSummary,
+      geminiConfigured: Boolean(getGeminiClients()),
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
     });
-
-    const outputAudio = tts.output_audio;
-    if (!outputAudio?.data) {
-      return res.status(502).json({
-        error: 'Gemini speech synthesis returned no audio.',
+  });
+  app.get("/api/db/status", async (req, res) => {
+    if (!pgPool) {
+      return res.json({
+        connected: false,
+        configured: false,
+        transport: cloudSqlConfig.transport,
+        connectionName: cloudSqlConfig.connectionName,
+        publicIp: cloudSqlConfig.publicIp,
+        outgoingIp: cloudSqlConfig.outgoingIp,
+        port: cloudSqlConfig.port,
+        message: "Set DB_NAME/DB_USER/DB_PASS (or SQL_DB_NAME/SQL_USER/SQL_PASSWORD) in runtime secrets to enable live Cloud SQL queries. Falling back to InMemoryOntologyGraph."
+      });
+    }
+    try {
+      const { rows } = await pgPool.query(
+        "SELECT current_database() AS database_name, current_user AS db_user, EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') AS pgvector_enabled"
+      );
+      return res.json({
+        connected: true,
+        configured: true,
+        transport: cloudSqlConfig.transport,
+        connectionName: cloudSqlConfig.connectionName,
+        target: cloudSqlConfig.hostSummary,
+        sslEnabled: cloudSqlConfig.sslEnabled,
+        details: rows[0] ?? null
+      });
+    } catch (err) {
+      const statusCode = req.query.strict === "1" ? 503 : 200;
+      return res.status(statusCode).json({
+        connected: false,
+        configured: true,
+        fallbackActive: true,
+        transport: cloudSqlConfig.transport,
+        connectionName: cloudSqlConfig.connectionName,
+        target: cloudSqlConfig.hostSummary,
+        sslEnabled: cloudSqlConfig.sslEnabled,
+        error: err.message
+      });
+    }
+  });
+  app.get("/api/deliverables", async (_req, res) => {
+    const deliverablePaths = {
+      "schema.sql": path.join(__dirname, "schema.sql"),
+      "server.ts": path.join(__dirname, "server.ts"),
+      "server.js": path.join(__dirname, "server.js"),
+      "App.jsx": path.join(__dirname, "App.jsx"),
+      Dockerfile: path.join(__dirname, "Dockerfile"),
+      "docs/ARCHITECTURE.md": path.join(__dirname, "docs", "ARCHITECTURE.md"),
+      "docs/RUNBOOK.md": path.join(__dirname, "docs", "RUNBOOK.md"),
+      LICENSE: path.join(__dirname, "LICENSE")
+    };
+    try {
+      const files = {};
+      for (const [label, filePath] of Object.entries(deliverablePaths)) {
+        try {
+          files[label] = await fs2.readFile(filePath, "utf8");
+        } catch {
+          files[label] = `// File ${label} not found on disk.`;
+        }
+      }
+      res.json({ license: "AGPL-3.0-only", files });
+    } catch {
+      res.status(500).json({ error: "Failed to load AGPL-3.0 source deliverables." });
+    }
+  });
+  app.post("/api/webrtc/signal", (req, res) => {
+    const { roomId, type, payload } = req.body ?? {};
+    if (!roomId || typeof roomId !== "string") {
+      return res.status(400).json({ error: "roomId is required for WebRTC signaling." });
+    }
+    const room = signalingRooms.get(roomId) ?? { candidates: [], updatedAt: Date.now() };
+    room.updatedAt = Date.now();
+    if (type === "offer") room.offer = payload;
+    else if (type === "answer") room.answer = payload;
+    else if (type === "ice-candidate" && payload) room.candidates.push(payload);
+    else return res.status(400).json({ error: "Unsupported signaling payload type." });
+    signalingRooms.set(roomId, room);
+    return res.json({ roomId, status: "relayed", candidateCount: room.candidates.length });
+  });
+  app.get("/api/webrtc/signal/:roomId", (req, res) => {
+    const room = signalingRooms.get(req.params.roomId);
+    if (!room) {
+      return res.status(404).json({ error: "Signaling room not found." });
+    }
+    return res.json({ roomId: req.params.roomId, ...room });
+  });
+  async function loadLiveOntologySnapshot(rootId) {
+    if (!pgPool) return null;
+    const treeQuery = rootId ? "SELECT * FROM get_component_hierarchy($1)" : "SELECT * FROM v_component_hierarchy ORDER BY depth ASC, id ASC";
+    const [treeRes, nodesRes, feedbackRes, flywheelRes] = await Promise.all([
+      pgPool.query(treeQuery, rootId ? [rootId] : []),
+      pgPool.query(
+        `SELECT DISTINCT ON (c.id)
+                c.id, c.parent_id, c.name, c.part_code, c.component_class,
+                c.measurement_system, c.thread_pitch_mm, c.nominal_diameter_mm,
+                c.visual_cue_notes, c.failure_precursor_cue, c.correction_count,
+                ra.tool_required, ra.tool_size_spec, ra.requires_scale_anchor,
+                ra.instruction_text, ra.pip_motion_prompt, ra.success_rate
+           FROM components c
+           LEFT JOIN repair_actions ra ON ra.component_id = c.id
+          ORDER BY c.id ASC, ra.success_rate DESC NULLS LAST`
+      ),
+      pgPool.query(
+        `SELECT e.id, e.created_at, e.predicted_component_id,
+                p.name AS predicted_name,
+                e.corrected_component_id,
+                c.name AS corrected_name,
+                e.user_correction_tag, e.region_code
+           FROM ontology_feedback_events e
+           LEFT JOIN components p ON p.id = e.predicted_component_id
+           LEFT JOIN components c ON c.id = e.corrected_component_id
+          ORDER BY e.created_at DESC
+          LIMIT 25`
+      ),
+      pgPool.query(
+        `SELECT
+           (SELECT COUNT(*)::int FROM deflection_bounties) AS deflected_returns,
+           (SELECT COALESCE(SUM(bounty_usd), 0)::float FROM deflection_bounties) AS gross_bounty_usd,
+           (SELECT COALESCE(SUM(compute_cost_usd), 0)::float FROM deflection_bounties) AS bounty_compute_usd,
+           (SELECT COALESCE(SUM(estimated_compute_usd), 0)::float FROM diagnostic_sessions) AS session_compute_usd,
+           (SELECT COUNT(*)::int FROM diagnostic_sessions) AS total_sessions,
+           (SELECT COUNT(*)::int FROM ontology_feedback_events) AS total_feedback_events,
+           (SELECT COALESCE(SUM(correction_count), 0)::int FROM components) AS total_component_corrections`
+      )
+    ]);
+    const agg = flywheelRes.rows[0] ?? {};
+    const totalCompute = Math.max(
+      Number(agg.bounty_compute_usd || 0),
+      Number(agg.session_compute_usd || 0)
+    );
+    const totalCorrections = Math.max(
+      Number(agg.total_feedback_events || 0),
+      Number(agg.total_component_corrections || 0)
+    );
+    return {
+      source: "postgresql_pgvector",
+      tree: treeRes.rows.map((r) => mapPgHierarchyRow(r)),
+      nodes: nodesRes.rows.map((r) => mapPgComponentNodeRow(r)),
+      feedbackLog: feedbackRes.rows.map((r) => mapPgFeedbackRow(r)),
+      flywheel: computeLiveFlywheelMetrics({
+        deflectedReturns: Number(agg.deflected_returns || 0),
+        grossBountyRevenueUsd: Number(agg.gross_bounty_usd || 0),
+        totalComputeUsd: totalCompute,
+        totalCorrections,
+        totalSessions: Number(agg.total_sessions || 0)
+      })
+    };
+  }
+  async function recordLiveDiagnosisToCloudSql(params) {
+    if (!pgPool) return { sessionId: null, componentId: null };
+    const safeAnchor = params.scaleAnchor === "us_quarter" || params.scaleAnchor === "credit_card" || params.scaleAnchor === "human_thumb" || params.scaleAnchor === "webxr_depth" ? params.scaleAnchor : "none";
+    const safeIngest = params.ingestMode === "burst_photo_3x" ? "burst_photo_3x" : "webrtc_video";
+    let sessionId = null;
+    let componentId = null;
+    try {
+      const sessionRes = await pgPool.query(
+        `INSERT INTO diagnostic_sessions
+           (ingest_mode, has_webxr_depth, scale_anchor_type, decision_calls_count, neon_calls_count, estimated_compute_usd, outcome)
+         VALUES ($1, $2, $3, 1, 1, 0.0450, 'active')
+         RETURNING id`,
+        [safeIngest, Boolean(params.hasWebXRDepth), safeAnchor]
+      );
+      sessionId = sessionRes.rows[0]?.id ?? null;
+      let vectorLiteral = null;
+      if (params.clients && params.frameDataUrl && params.frameDataUrl.length > 32) {
+        try {
+          const { mimeType, base64 } = stripDataUrlPrefix(params.frameDataUrl);
+          const embRes = await params.clients.interactionsAi.models.embedContent({
+            model: "gemini-embedding-2",
+            contents: [
+              `Physical hardware component: ${params.componentName}. ${params.diagnosisSummary}`,
+              { inlineData: { data: base64, mimeType } }
+            ]
+          });
+          const vec = embRes.embeddings?.[0]?.values?.slice(0, 768);
+          if (Array.isArray(vec) && vec.length === 768) {
+            vectorLiteral = `[${vec.join(",")}]`;
+          }
+        } catch {
+        }
+      }
+      const cleanName = params.componentName.trim().slice(0, 240);
+      if (cleanName && cleanName.toLowerCase() !== "highlighted area" && cleanName.toLowerCase() !== "visual repair guidance") {
+        const existing = await pgPool.query(
+          `SELECT id, visual_signature_embedding IS NOT NULL AS has_emb
+             FROM components
+            WHERE LOWER(name) = LOWER($1)
+            LIMIT 1`,
+          [cleanName]
+        );
+        if (existing.rows.length > 0) {
+          componentId = Number(existing.rows[0].id);
+          if (vectorLiteral && !existing.rows[0].has_emb) {
+            await pgPool.query(
+              `UPDATE components
+                  SET visual_signature_embedding = $1::vector,
+                      updated_at = NOW()
+                WHERE id = $2`,
+              [vectorLiteral, componentId]
+            );
+          }
+        } else {
+          const inserted = await pgPool.query(
+            `INSERT INTO components
+               (name, part_code, component_class, measurement_system, nominal_diameter_mm, visual_cue_notes, failure_precursor_cue, visual_signature_embedding)
+             VALUES ($1, $2, 'part', 'universal', $3, $4, $5, $6::vector)
+             RETURNING id`,
+            [
+              cleanName,
+              `USER-${Date.now().toString(36).toUpperCase().slice(-6)}`,
+              params.estimatedPartSizeMm && params.estimatedPartSizeMm > 0 ? params.estimatedPartSizeMm : null,
+              params.diagnosisSummary.slice(0, 400),
+              "Learned from live end-user camera scan",
+              vectorLiteral
+            ]
+          );
+          componentId = Number(inserted.rows[0]?.id ?? 0) || null;
+          if (componentId) {
+            const rotDir = params.motionCue === "rotate_cw" ? "clockwise" : params.motionCue === "rotate_ccw" ? "counter_clockwise" : params.motionCue === "slide" || params.motionCue === "lift" || params.motionCue === "press" ? "linear" : params.motionCue === "align" ? "angled" : "none";
+            await pgPool.query(
+              `INSERT INTO repair_actions
+                 (component_id, action_type, tool_required, tool_size_spec, requires_scale_anchor, rotation_direction, instruction_text, pip_motion_prompt, success_rate, execution_count)
+               VALUES ($1, 'repair', $2, $3, $4, $5, $6, $7, 0.8500, 1)`,
+              [
+                componentId,
+                params.toolRequired.slice(0, 96) || "Hand Inspection",
+                params.toolSizeSpec ? params.toolSizeSpec.slice(0, 78) : null,
+                Boolean(params.requiresScaleAnchor),
+                rotDir,
+                params.nextStepInstruction.slice(0, 600),
+                params.pipMotionPrompt ? params.pipMotionPrompt.slice(0, 500) : null
+              ]
+            );
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("[Self-Learning Cloud SQL write skipped]", err.message);
+    }
+    return { sessionId, componentId };
+  }
+  app.get("/api/ontology/tree", async (req, res) => {
+    const rootId = req.query.rootId ? Number(req.query.rootId) : void 0;
+    if (pgPool) {
+      try {
+        const snapshot = await loadLiveOntologySnapshot(rootId);
+        if (snapshot) {
+          return res.json(snapshot);
+        }
+      } catch (err) {
+        console.error("[Ontology DB Fallback]", err.message);
+      }
+    }
+    return res.json({
+      source: "in_memory_cte_parity",
+      tree: localOntology.getHierarchyTree(rootId),
+      nodes: localOntology.getAllNodes(),
+      feedbackLog: localOntology.getFeedbackLog(),
+      flywheel: localOntology.getFlywheelMetrics()
+    });
+  });
+  app.post("/api/ontology/search", async (req, res) => {
+    const {
+      queryVector,
+      scaleAnchor = "none",
+      hasWebXRDepth = false,
+      limit = 4
+    } = req.body ?? {};
+    const hasScaleAnchor = Boolean(hasWebXRDepth) || scaleAnchor !== "none";
+    const maxRows = Number(limit) || 4;
+    if (pgPool && Array.isArray(queryVector) && queryVector.length === 768) {
+      try {
+        const vectorLiteral = `[${queryVector.map(Number).join(",")}]`;
+        const { rows } = await pgPool.query(
+          "SELECT * FROM rag_search_ontology_subgraph($1::vector, $2, $3, $4)",
+          [vectorLiteral, hasScaleAnchor, 0.55, maxRows]
+        );
+        return res.json({
+          source: "postgresql_pgvector",
+          hasScaleAnchor,
+          matches: rows
+        });
+      } catch (err) {
+        console.error("[PostgreSQL rag_search_ontology_subgraph fallback]", err.message);
+      }
+    }
+    const vector = Array.isArray(queryVector) && queryVector.length > 0 ? buildFeatureVector(queryVector.map(Number)) : buildFeatureVector([0.14, 0.16, 0.87, 0.43, 0.1, 0.07, 0.06, 0.09]);
+    const matches = localOntology.searchRagSubgraph(
+      vector,
+      scaleAnchor,
+      Boolean(hasWebXRDepth),
+      maxRows
+    );
+    return res.json({
+      source: "in_memory_cte_parity",
+      hasScaleAnchor,
+      matches
+    });
+  });
+  app.post("/api/ontology/feedback", async (req, res) => {
+    const {
+      sessionId = null,
+      predictedComponentId,
+      correctedComponentId,
+      correctedName,
+      tag,
+      capturedVector,
+      frameDataUrl,
+      regionCode = "US-CHI"
+    } = req.body ?? {};
+    if (!correctedComponentId && !correctedName || !tag) {
+      return res.status(400).json({
+        error: "correctedComponentId (or correctedName) and tag are required to update the ontology graph."
+      });
+    }
+    let embeddingModelUsed = null;
+    const clients = getGeminiClients();
+    let fullEmbedding768 = null;
+    if (clients) {
+      try {
+        const contents = [
+          `Hardware component user correction: ${String(correctedName || tag)} (${String(tag)})`
+        ];
+        if (typeof frameDataUrl === "string" && frameDataUrl.length > 32) {
+          const { mimeType, base64 } = stripDataUrlPrefix(frameDataUrl);
+          contents.push({ inlineData: { data: base64, mimeType } });
+        }
+        const embResult = await clients.interactionsAi.models.embedContent({
+          model: "gemini-embedding-2",
+          contents
+        });
+        const values = embResult.embeddings?.[0]?.values;
+        if (Array.isArray(values) && values.length > 0) {
+          fullEmbedding768 = values.slice(0, 768);
+          embeddingModelUsed = "gemini-embedding-2";
+        }
+      } catch (err) {
+        console.warn("[gemini-embedding-2 warning]", err.message);
+      }
+    }
+    const compactVector = Array.isArray(capturedVector) && capturedVector.length > 0 ? capturedVector.map(Number) : fullEmbedding768 ? fullEmbedding768.slice(0, 8) : [0.14, 0.16, 0.87, 0.43, 0.1, 0.07, 0.06, 0.09];
+    let targetComponentId = correctedComponentId ? Number(correctedComponentId) : 0;
+    let persistedToSql = false;
+    if (pgPool) {
+      try {
+        if (!targetComponentId && typeof correctedName === "string" && correctedName.trim()) {
+          const cleanNewName = correctedName.trim().slice(0, 240);
+          const existing = await pgPool.query(
+            "SELECT id FROM components WHERE LOWER(name) = LOWER($1) LIMIT 1",
+            [cleanNewName]
+          );
+          if (existing.rows.length > 0) {
+            targetComponentId = Number(existing.rows[0].id);
+          } else {
+            const ins = await pgPool.query(
+              `INSERT INTO components (name, part_code, component_class, measurement_system, visual_cue_notes, failure_precursor_cue)
+               VALUES ($1, $2, 'part', 'universal', $3, 'Created via live end-user correction')
+               RETURNING id`,
+              [
+                cleanNewName,
+                `CORR-${Date.now().toString(36).toUpperCase().slice(-6)}`,
+                `User correction: ${String(tag).slice(0, 120)}`
+              ]
+            );
+            targetComponentId = Number(ins.rows[0]?.id ?? 0);
+            if (targetComponentId) {
+              await pgPool.query(
+                `INSERT INTO repair_actions (component_id, action_type, tool_required, requires_scale_anchor, instruction_text, success_rate)
+                 VALUES ($1, 'inspect', 'Verify fit before turning', TRUE, $2, 0.9000)`,
+                [targetComponentId, `User verified part as ${cleanNewName} (${String(tag).slice(0, 80)}).`]
+              );
+            }
+          }
+        }
+        if (targetComponentId) {
+          const vectorLiteral = fullEmbedding768 && fullEmbedding768.length === 768 ? `[${fullEmbedding768.join(",")}]` : null;
+          if (vectorLiteral) {
+            await pgPool.query(
+              "SELECT * FROM apply_ontology_correction($1, $2, $3, $4, $5::vector, $6)",
+              [
+                sessionId || null,
+                predictedComponentId ? Number(predictedComponentId) : null,
+                targetComponentId,
+                String(tag).slice(0, 80),
+                vectorLiteral,
+                String(regionCode).slice(0, 32)
+              ]
+            );
+          } else {
+            await pgPool.query(
+              `UPDATE components SET correction_count = correction_count + 1, updated_at = NOW() WHERE id = $1`,
+              [targetComponentId]
+            );
+            await pgPool.query(
+              `INSERT INTO ontology_feedback_events (session_id, predicted_component_id, corrected_component_id, user_correction_tag, region_code)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [
+                sessionId || null,
+                predictedComponentId ? Number(predictedComponentId) : null,
+                targetComponentId,
+                String(tag).slice(0, 80),
+                String(regionCode).slice(0, 32)
+              ]
+            );
+          }
+          persistedToSql = true;
+        }
+      } catch (err) {
+        console.error("[PostgreSQL apply_ontology_correction failed]", err.message);
+      }
+    }
+    if (persistedToSql && pgPool) {
+      try {
+        const snapshot = await loadLiveOntologySnapshot();
+        if (snapshot) {
+          return res.json({
+            ...snapshot,
+            status: "updated",
+            source: "postgresql_pgvector",
+            embeddingModelUsed: embeddingModelUsed ?? "metadata_only",
+            correctedComponentId: targetComponentId
+          });
+        }
+      } catch {
+      }
+    }
+    try {
+      const localTargetId = targetComponentId || Number(predictedComponentId) || 3;
+      const { updated, event } = localOntology.applyCorrection({
+        predictedComponentId: Number(predictedComponentId || localTargetId),
+        correctedComponentId: localTargetId,
+        capturedEmbedding: compactVector,
+        tag: String(tag).slice(0, 80),
+        regionCode: String(regionCode).slice(0, 32)
+      });
+      return res.json({
+        status: "updated",
+        source: persistedToSql ? "postgresql_pgvector" : "in_memory_cte_parity",
+        embeddingModelUsed: embeddingModelUsed ?? "compact_signature_fallback",
+        updatedComponent: updated,
+        feedbackEvent: event,
+        tree: localOntology.getHierarchyTree(),
+        feedbackLog: localOntology.getFeedbackLog(),
+        flywheel: localOntology.getFlywheelMetrics()
+      });
+    } catch (err) {
+      return res.json({
+        status: "updated",
+        source: persistedToSql ? "postgresql_pgvector" : "in_memory_cte_parity",
+        embeddingModelUsed: embeddingModelUsed ?? "metadata_only",
+        message: "Correction recorded."
+      });
+    }
+  });
+  app.post("/api/ontology/confirm-fix", async (req, res) => {
+    const { sessionId = null, componentId = null, computeCostUsd = 0.08 } = req.body ?? {};
+    const safeCost = Number.isFinite(Number(computeCostUsd)) && Number(computeCostUsd) > 0 ? Number(computeCostUsd) : 0.08;
+    let persistedToSql = false;
+    if (pgPool) {
+      try {
+        let resolvedSessionId = typeof sessionId === "string" && sessionId.length > 10 ? sessionId : null;
+        if (resolvedSessionId) {
+          await pgPool.query(
+            `UPDATE diagnostic_sessions
+                SET outcome = 'resolved_deflected',
+                    completed_at = NOW()
+              WHERE id = $1`,
+            [resolvedSessionId]
+          );
+        } else {
+          const ins = await pgPool.query(
+            `INSERT INTO diagnostic_sessions (outcome, estimated_compute_usd, completed_at)
+             VALUES ('resolved_deflected', $1, NOW())
+             RETURNING id`,
+            [safeCost]
+          );
+          resolvedSessionId = ins.rows[0]?.id ?? null;
+        }
+        if (resolvedSessionId) {
+          await pgPool.query(
+            `INSERT INTO deflection_bounties (session_id, brand_id, bounty_usd, compute_cost_usd)
+             VALUES ($1, 1, 30.00, $2)
+             ON CONFLICT (session_id) DO NOTHING`,
+            [resolvedSessionId, safeCost]
+          );
+        }
+        if (componentId && Number.isFinite(Number(componentId))) {
+          await pgPool.query(
+            `UPDATE repair_actions
+                SET execution_count = execution_count + 1,
+                    success_rate = LEAST(0.9999, ROUND(((success_rate * GREATEST(execution_count, 1) + 1.0) / (GREATEST(execution_count, 1) + 1.0))::numeric, 4)),
+                    updated_at = NOW()
+              WHERE component_id = $1`,
+            [Number(componentId)]
+          );
+        }
+        persistedToSql = true;
+      } catch (err) {
+        console.error("[PostgreSQL confirm-fix warning]", err.message);
+      }
+    }
+    const flywheel = localOntology.recordDeflection(safeCost);
+    return res.json({
+      status: "confirmed",
+      source: persistedToSql ? "postgresql_pgvector" : "in_memory_cte_parity",
+      flywheel
+    });
+  });
+  app.post("/api/ontology/deflection", async (req, res) => {
+    const computeCostUsd = Number(req.body?.computeCostUsd ?? 1.45);
+    const safeCost = Number.isFinite(computeCostUsd) && computeCostUsd > 0 ? computeCostUsd : 1.45;
+    let persistedToSql = false;
+    if (pgPool) {
+      try {
+        const sessionRes = await pgPool.query(
+          `INSERT INTO diagnostic_sessions (outcome, estimated_compute_usd, completed_at)
+           VALUES ('resolved_deflected', $1, NOW())
+           RETURNING id`,
+          [safeCost]
+        );
+        const sessionId = sessionRes.rows[0]?.id;
+        if (sessionId) {
+          await pgPool.query(
+            `INSERT INTO deflection_bounties (session_id, brand_id, bounty_usd, compute_cost_usd)
+             VALUES ($1, 1, 30.00, $2)`,
+            [sessionId, safeCost]
+          );
+          persistedToSql = true;
+        }
+        const snapshot = await loadLiveOntologySnapshot();
+        if (snapshot) {
+          return res.json({
+            status: "recorded",
+            source: "postgresql_pgvector",
+            flywheel: snapshot.flywheel
+          });
+        }
+      } catch (err) {
+        console.error("[PostgreSQL deflection_bounties fallback]", err.message);
+      }
+    }
+    const flywheel = localOntology.recordDeflection(safeCost);
+    return res.json({
+      status: "recorded",
+      source: persistedToSql ? "postgresql_pgvector" : "in_memory_cte_parity",
+      flywheel
+    });
+  });
+  app.post("/api/analyze-buffer", async (req, res) => {
+    const {
+      frames = [],
+      ingestMode = "webrtc_15fps",
+      scaleAnchor = "none",
+      hasWebXRDepth = false,
+      scaleOptOut = false,
+      preferredLanguage = "en-US",
+      stillDurationMs = 0,
+      scenarioHint = "",
+      userQuestion = "",
+      queryVector
+    } = req.body ?? {};
+    if (!Array.isArray(frames) || frames.length === 0) {
+      return res.status(400).json({
+        error: "A 15-second frame buffer or 3-shot burst payload with at least 1 frame is required."
+      });
+    }
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: "GEMINI_API_KEY is not configured on the server. Configure a valid Gemini 4 API key in Secrets to invoke gemini-decision-1 and gemini-4-neon.",
+        code: "API_KEY_MISSING"
+      });
+    }
+    const incomingFrames = frames;
+    const step = Math.max(1, Math.floor(incomingFrames.length / 6));
+    const sampledFrames = incomingFrames.filter((_f, idx) => idx % step === 0).slice(0, 6);
+    const multimodalInput = [
+      {
+        type: "text",
+        text: `JackOfAllTrades 15-second visual buffer (${sampledFrames.length} chronological frames, ingestMode=${ingestMode}, handStillMs=${Math.round(Number(stillDurationMs))}, scaleAnchor=${scaleAnchor}, webXRDepth=${Boolean(hasWebXRDepth)}). ` + (scenarioHint ? `Workshop context: ${String(scenarioHint)}. ` : "") + (userQuestion ? `User voice query: "${String(userQuestion)}".
+` : "\n")
+      }
+    ];
+    for (const frame of sampledFrames) {
+      const { mimeType, base64 } = stripDataUrlPrefix(frame.dataUrl);
+      multimodalInput.push({
+        type: "image",
+        data: base64,
+        mime_type: mimeType,
+        resolution: ingestMode === "burst_photo_3x" ? "medium" : "low"
+      });
+    }
+    let decisionScores;
+    let decisionUsage = { total_input_tokens: 0, total_output_tokens: 0 };
+    try {
+      const decisionResponse = await clients.decisionsAi.decisions.create({
+        model: "gemini-decision-1",
+        input: multimodalInput,
+        questions: {
+          user_stalled: {
+            type: "noul",
+            instructions: "Has the user hesitated, stalled, or kept hands stationary on an unresolved physical assembly/repair step?",
+            criteria: {
+              true_description: "Hands are stalled, confused, or waiting for the next physical step.",
+              false_description: "User is smoothly and confidently progressing through assembly."
+            }
+          },
+          hazard_proximity: {
+            type: "noul",
+            instructions: "Are the user hands or tool near a mechanical hazard, active leak, or forcing a clip/fastener in a damaging direction?",
+            criteria: {
+              true_description: "Clear risk of snapping a clip, stripping a fastener, water spray, or hand injury.",
+              false_description: "Safe hand placement and controlled tool orientation."
+            }
+          },
+          alignment_anomaly: {
+            type: "noul",
+            instructions: "Is there a visible physical misalignment, wrong fastener/tool mismatch, or crooked bracket/nut in the frame?",
+            criteria: {
+              true_description: "Visible crooked hinge, mismatched screw/bolt size, cross-threading, or wrong rotation direction.",
+              false_description: "All visible components are properly aligned and matched."
+            }
+          },
+          visual_noise_extreme: {
+            type: "noul",
+            instructions: "Is the image buffer severely degraded by water droplets on the lens, harsh chrome flashlight glare, or extreme motion blur?",
+            criteria: {
+              true_description: "Cannot reliably read threads or component geometry due to glare, water, or blur.",
+              false_description: "Component geometry is legible enough for visual inspection."
+            }
+          },
+          camera_focused: {
+            type: "noul",
+            instructions: "Is the primary physical component sharply focused?"
+          },
+          object_in_frame: {
+            type: "noul",
+            instructions: "Is the target physical object completely inside the camera frame?"
+          }
+        }
+      });
+      const answers = decisionResponse.answers;
+      if (!answers) {
+        return res.status(400).json({
+          error: "gemini-decision-1 returned no answers (content may have been filtered).",
+          promptFeedback: decisionResponse.prompt_feedback ?? null
+        });
+      }
+      const readNoul = (key) => {
+        const a = answers[key];
+        return a?.type === "noul" ? Number(a.noul.toFixed(4)) : 0.01;
+      };
+      decisionScores = {
+        userStalled: readNoul("user_stalled"),
+        hazardProximity: readNoul("hazard_proximity"),
+        alignmentAnomaly: readNoul("alignment_anomaly"),
+        visualNoiseExtreme: readNoul("visual_noise_extreme"),
+        cameraFocused: readNoul("camera_focused"),
+        objectInFrame: readNoul("object_in_frame")
+      };
+      const usageAny = decisionResponse.usage;
+      decisionUsage = {
+        total_input_tokens: usageAny?.total_input_tokens ?? 0,
+        total_output_tokens: usageAny?.total_output_tokens ?? 0
+      };
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Gemini Decisions API (gemini-decision-1) failed: ${message}`,
+        stage: "gemini-decision-1"
+      });
+    }
+    const route = evaluateDecisionsRouting(decisionScores, ANOMALY_CONFIDENCE_THRESHOLD);
+    const ragMatches = localOntology.searchRagSubgraph(
+      Array.isArray(queryVector) && queryVector.length > 0 ? buildFeatureVector(queryVector.map(Number)) : buildFeatureVector([0.14, 0.16, 0.87, 0.43, 0.1, 0.07, 0.06, 0.09]),
+      scaleAnchor,
+      Boolean(hasWebXRDepth),
+      3
+    );
+    if (route.shouldDowngradeToBurst) {
+      return res.json({
+        escalatedToNeon: false,
+        downgradeToBurst: true,
+        decisionModel: "gemini-decision-1",
+        decisionScores,
+        decisionUsage,
+        route,
+        voiceInstruction: "I can't see the threading clearly. Wipe the lens and hold still for three high-contrast burst photos.",
+        ragMatches
+      });
+    }
+    const hasExplicitQuestion = typeof userQuestion === "string" && userQuestion.trim().length > 0;
+    if (!route.shouldEscalateToNeon && !hasExplicitQuestion) {
+      return res.json({
+        escalatedToNeon: false,
+        downgradeToBurst: false,
+        decisionModel: "gemini-decision-1",
+        decisionScores,
+        decisionUsage,
+        route,
+        ragMatches
+      });
+    }
+    const clientHasScale = Boolean(hasWebXRDepth) || scaleAnchor !== "none";
+    const responseLang = normalizeBcp47Language(
+      typeof preferredLanguage === "string" ? preferredLanguage : void 0,
+      "en-US"
+    );
+    const ragContextText = ragMatches.map(
+      (m, i) => `${i + 1}. [ID ${m.component.id}] ${m.component.name} (${m.ancestryPath}) | Similarity=${m.similarity} | Pitch=${m.component.threadPitchMm ?? "N/A"}mm | Precursor=${m.component.failurePrecursorCue} | Tool=${m.scaleGatedAdvice.toolRequired} (${m.scaleGatedAdvice.toolSizeSpec}) | Step=${m.scaleGatedAdvice.instructionText}`
+    ).join("\n");
+    try {
+      const neonInteraction = await clients.interactionsAi.interactions.create({
+        model: "gemini-4-neon",
+        system_instruction: "You are Jack of All Trades, a precision physical repair and assembly diagnostic engine. Analyze the visual frames alongside the Ontology RAG matches and produce plain-English, actionable multi-step instructions.\nCRITICAL SCALE CALIBRATION RULE (Break 2 \u2014 Scale Hallucination Guard):\n" + SCALE_CALIBRATION_PROMPT_GUIDE + '\n1. Inspect the image(s) carefully for any known-size physical reference object placed beside the part: a US quarter / coin ("us_quarter" or "coin"), a credit/debit/ID card ("credit_card"), a human thumb/finger ("human_thumb"), or a ruler/tape measure ("ruler"). If none is clearly visible beside the part, set detectedScaleObject="none" and scaleCalibrated=false.\n2. ONLY set scaleCalibrated=true if a reference object is clearly visible right next to the part on the same depth plane (or WebXR depth is active: ' + String(clientHasScale) + ').\n3. If scaleCalibrated=true, explicitly state the measured millimeter comparison in scaleMeasurementNote AND confirm in voiceCoachingLine which object calibrated scale along with the exact tool size.\n4. If scaleCalibrated=false, you are STRICTLY BARRED from recommending a specific numeric tool size (e.g., 10mm, M4, 3/8"). Set requiresScaleAnchor=true and toolSizeSpec="". ' + (scaleOptOut ? "The user chose to continue without scaling: briefly note why a reference object helps avoid wrong tool sizes, and still give safe actionable multi-step repair steps." : "Ask the user in voiceCoachingLine to place a quarter, credit card, or their thumb next to the part so we can calibrate exact tool size\u2014or let them know they can continue without scaling.") + "\n5. SPATIAL AR OVERLAY & PER-STEP PiP VIDEO RULE:\n   - Return targetBox as [ymin, xmin, ymax, xmax] (0..1000 image coordinates) tightly around the part to repair.\n   - If a scale anchor object is visible, return anchorBox as [ymin, xmin, ymax, xmax] (0..1000) around the coin/card/thumb.\n   - Break complex repairs into 2 to 5 clear sequential steps[]. For EACH step, specify motionCue (rotate_cw, rotate_ccw, slide, lift, press, align, inspect), targetBox, and a dedicated pipMotionPrompt showing close-up hands performing THAT step\u2019s physical repair motion.\n   - NEVER write a pipMotionPrompt about placing a coin, card, or thumb\u2014PiP videos must ALWAYS demonstrate the actual mechanical repair hand motion.\nReturn concise JSON only.",
+        input: [
+          ...multimodalInput,
+          {
+            type: "text",
+            text: `
+Decisions API trigger: ${route.dominantTrigger} (confidence=${route.maxAnomalyConfidence}).
+scaleOptOut=${Boolean(scaleOptOut)}, clientScaleAnchor=${scaleAnchor}, webXRDepth=${Boolean(hasWebXRDepth)}.
+Ontology RAG Subgraph:
+${ragContextText}
+Return the detected scale object, millimeter comparison (if calibrated), targetBox, anchorBox, component diagnosis, 2-5 sequential repair steps[] each with its own motionCue and repair pipMotionPrompt, tool required, and a concise spoken voiceCoachingLine (under 3 sentences).`
+          }
+        ],
+        response_format: {
+          type: Type.OBJECT,
+          properties: {
+            componentId: { type: Type.INTEGER },
+            componentName: { type: Type.STRING },
+            diagnosisSummary: { type: Type.STRING },
+            failurePrecursor: { type: Type.STRING },
+            nextStepInstruction: { type: Type.STRING },
+            toolRequired: { type: Type.STRING },
+            toolSizeSpec: { type: Type.STRING },
+            requiresScaleAnchor: { type: Type.BOOLEAN },
+            detectedScaleObject: {
+              type: Type.STRING,
+              description: "One of: us_quarter, coin, credit_card, human_thumb, ruler, webxr_depth, or none."
+            },
+            scaleCalibrated: {
+              type: Type.BOOLEAN,
+              description: "True ONLY if a known-size reference object is clearly visible beside the target part and scale was properly calibrated."
+            },
+            scaleConfidence: {
+              type: Type.NUMBER,
+              description: "Confidence from 0.0 to 1.0 in the detected scale reference object."
+            },
+            estimatedPartSizeMm: {
+              type: Type.NUMBER,
+              description: "Estimated target part width or diameter in millimeters when scaleCalibrated=true (0 if uncalibrated)."
+            },
+            scaleMeasurementNote: {
+              type: Type.STRING,
+              description: "1-sentence explanation comparing the part size to the visible reference object (empty if uncalibrated)."
+            },
+            targetBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: "Bounding box [ymin, xmin, ymax, xmax] in 0..1000 image coordinates around the part to fix."
+            },
+            anchorBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: "Bounding box [ymin, xmin, ymax, xmax] in 0..1000 coordinates around the detected scale anchor object (empty array if none)."
+            },
+            motionCue: {
+              type: Type.STRING,
+              description: "Primary AR motion cue: rotate_cw, rotate_ccw, slide, lift, press, align, or inspect."
+            },
+            steps: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  detail: { type: Type.STRING },
+                  motionCue: { type: Type.STRING },
+                  targetBox: {
+                    type: Type.ARRAY,
+                    items: { type: Type.NUMBER }
+                  },
+                  pipMotionPrompt: {
+                    type: Type.STRING,
+                    description: "Close-up hand-motion prompt showing the physical repair action for THIS step (never coin placement)."
+                  },
+                  toolNeeded: { type: Type.STRING }
+                },
+                required: ["title", "detail", "motionCue", "pipMotionPrompt"]
+              }
+            },
+            rotationDirection: { type: Type.STRING },
+            pipMotionPrompt: { type: Type.STRING },
+            voiceCoachingLine: { type: Type.STRING }
+          },
+          required: [
+            "componentName",
+            "diagnosisSummary",
+            "nextStepInstruction",
+            "toolRequired",
+            "requiresScaleAnchor",
+            "detectedScaleObject",
+            "scaleCalibrated",
+            "targetBox",
+            "motionCue",
+            "steps",
+            "pipMotionPrompt",
+            "voiceCoachingLine"
+          ]
+        },
+        generation_config: {
+          thinking_level: "medium"
+        }
+      });
+      const rawText = neonInteraction.output_text ?? "";
+      let parsedDiagnosis = {};
+      try {
+        parsedDiagnosis = JSON.parse(rawText);
+      } catch {
+        const match = rawText.match(/\{[\s\S]*\}/);
+        parsedDiagnosis = match ? JSON.parse(match[0]) : { diagnosisSummary: rawText };
+      }
+      const resolvedAnchorBox = normalizeBoxToPct(parsedDiagnosis.anchorBox);
+      const scaleCalibration = resolveScaleCalibration({
+        detectedObject: typeof parsedDiagnosis.detectedScaleObject === "string" ? parsedDiagnosis.detectedScaleObject : "none",
+        scaleCalibrated: Boolean(parsedDiagnosis.scaleCalibrated),
+        scaleConfidence: typeof parsedDiagnosis.scaleConfidence === "number" ? parsedDiagnosis.scaleConfidence : void 0,
+        estimatedPartSizeMm: typeof parsedDiagnosis.estimatedPartSizeMm === "number" ? parsedDiagnosis.estimatedPartSizeMm : null,
+        scaleMeasurementNote: typeof parsedDiagnosis.scaleMeasurementNote === "string" ? parsedDiagnosis.scaleMeasurementNote : null,
+        anchorBox: resolvedAnchorBox,
+        explicitOptOut: Boolean(scaleOptOut),
+        hasWebXRDepth: Boolean(hasWebXRDepth),
+        clientScaleAnchor: scaleAnchor
+      });
+      const effectiveAnchor = mapDetectedObjectToScaleAnchor(scaleCalibration.detectedObject);
+      const scaleGated = enforceScaleAnchorInvariant(
+        {
+          toolRequired: String(parsedDiagnosis.toolRequired || "Hand Inspection"),
+          toolSizeSpec: scaleCalibration.confirmed && parsedDiagnosis.toolSizeSpec ? String(parsedDiagnosis.toolSizeSpec) : null,
+          requiresScaleAnchor: !scaleCalibration.confirmed,
+          instructionText: String(parsedDiagnosis.nextStepInstruction || "")
+        },
+        effectiveAnchor,
+        Boolean(hasWebXRDepth)
+      );
+      const primaryFrameDataUrl = sampledFrames[sampledFrames.length - 1]?.dataUrl ?? null;
+      const learned = await recordLiveDiagnosisToCloudSql({
+        componentName: String(parsedDiagnosis.componentName || "Highlighted Area"),
+        diagnosisSummary: String(parsedDiagnosis.diagnosisSummary || ""),
+        nextStepInstruction: scaleGated.instructionText,
+        toolRequired: scaleGated.toolRequired,
+        toolSizeSpec: scaleGated.toolSizeSpec,
+        requiresScaleAnchor: !scaleCalibration.confirmed,
+        pipMotionPrompt: typeof parsedDiagnosis.pipMotionPrompt === "string" ? parsedDiagnosis.pipMotionPrompt : void 0,
+        motionCue: normalizeMotionCue(parsedDiagnosis.motionCue || parsedDiagnosis.rotationDirection),
+        estimatedPartSizeMm: scaleCalibration.estimatedPartSizeMm,
+        scaleAnchor: effectiveAnchor,
+        hasWebXRDepth: Boolean(hasWebXRDepth),
+        ingestMode: ingestMode === "burst_photo_3x" ? "burst_photo_3x" : "webrtc_video",
+        frameDataUrl: primaryFrameDataUrl,
+        clients
+      });
+      const baseCoaching = String(
+        parsedDiagnosis.voiceCoachingLine || parsedDiagnosis.nextStepInstruction || ""
+      ).trim();
+      let spokenText = baseCoaching;
+      if (scaleCalibration.status === "calibrated") {
+        const alreadyMentionsScale = /scale|calibrat|quarter|coin|card|thumb|ruler/i.test(baseCoaching);
+        spokenText = alreadyMentionsScale ? baseCoaching : `${scaleCalibration.spokenScaleNotice} ${baseCoaching}`.trim();
+      } else if (scaleCalibration.status === "opted_out") {
+        spokenText = `${scaleCalibration.spokenScaleNotice} ${baseCoaching}`.trim();
+      } else {
+        const alreadyAsksAnchor = /quarter|credit card|thumb|scale/i.test(baseCoaching);
+        spokenText = alreadyAsksAnchor ? baseCoaching : `${baseCoaching} ${scaleCalibration.spokenScaleNotice}`.trim();
+      }
+      let audioBase64 = null;
+      let audioMimeType = null;
+      if (spokenText.length > 0) {
+        try {
+          const ttsRes = await clients.interactionsAi.interactions.create({
+            model: "gemini-3.8-flash-lite-tts",
+            input: [
+              {
+                type: "text",
+                text: spokenText,
+                annotations: [
+                  {
+                    type: "speech_metadata",
+                    style: "Calm, clear, helpful expert mechanic speaking concisely"
+                  }
+                ]
+              }
+            ],
+            store: false,
+            response_format: { type: "audio" },
+            generation_config: {
+              speech_config: [{ language: responseLang, voice: "Kore" }]
+            }
+          });
+          if (ttsRes.output_audio?.data) {
+            audioBase64 = ttsRes.output_audio.data;
+            audioMimeType = ttsRes.output_audio.mime_type || "audio/wav";
+          }
+        } catch (ttsErr) {
+          console.warn("[Scan TTS fallback]", ttsErr.message);
+        }
+      }
+      return res.json({
+        escalatedToNeon: true,
+        downgradeToBurst: false,
+        decisionModel: "gemini-decision-1",
+        reasoningModel: "gemini-4-neon",
+        decisionScores,
+        decisionUsage,
+        route,
+        ragMatches,
+        scaleCalibration,
+        spokenText,
+        audioBase64,
+        audioMimeType,
+        sessionId: learned.sessionId,
+        componentId: learned.componentId,
+        diagnosis: {
+          ...parsedDiagnosis,
+          toolRequired: scaleGated.toolRequired,
+          toolSizeSpec: scaleGated.toolSizeSpec,
+          scaleGuardBlocked: scaleGated.scaleGuardBlocked,
+          nextStepInstruction: scaleGated.instructionText,
+          anchorPrompt: scaleGated.anchorPrompt
+        }
+      });
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Gemini 4 Neon (gemini-4-neon) failed: ${message}`,
+        stage: "gemini-4-neon",
+        decisionScores,
+        route
+      });
+    }
+  });
+  app.post("/api/generate-pip", async (req, res) => {
+    const { prompt, referenceFrameDataUrl, duration = "6s" } = req.body ?? {};
+    if (!prompt || typeof prompt !== "string") {
+      return res.status(400).json({ error: "A motion guidance prompt is required." });
+    }
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: "GEMINI_API_KEY is not configured on the server. Configure a billing-enabled Gemini 4 API key to generate PiP video loops via gemini-omni-1.2-flash.",
+        code: "API_KEY_MISSING"
+      });
+    }
+    try {
+      const inputParts = [];
+      if (typeof referenceFrameDataUrl === "string" && referenceFrameDataUrl.length > 32) {
+        const { mimeType, base64 } = stripDataUrlPrefix(referenceFrameDataUrl);
+        inputParts.push({ type: "image", mime_type: mimeType, data: base64 });
+      }
+      inputParts.push({
+        type: "text",
+        text: `Clean instructional workbench close-up showing exact hand mechanics for repair guidance: ${prompt}`
+      });
+      const interaction = await clients.interactionsAi.interactions.create(
+        {
+          model: "gemini-omni-1.2-flash",
+          input: inputParts,
+          background: false,
+          store: false,
+          stream: false,
+          response_format: {
+            type: "video",
+            aspect_ratio: "16:9",
+            duration: duration === "10s" ? "10s" : "6s",
+            resolution: "720p"
+          }
+        },
+        { timeout: 3e5 }
+      );
+      const videoPart = interaction.output_video;
+      if (!videoPart || !videoPart.data && !videoPart.uri) {
+        return res.status(502).json({
+          error: "gemini-omni-1.2-flash returned no video payload."
+        });
+      }
+      return res.json({
+        model: "gemini-omni-1.2-flash",
+        mimeType: videoPart.mime_type || "video/mp4",
+        videoDataUrl: videoPart.data ? `data:${videoPart.mime_type || "video/mp4"};base64,${videoPart.data}` : null,
+        videoUri: videoPart.uri || null
+      });
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Gemini Omni Flash (gemini-omni-1.2-flash) PiP generation failed: ${message}`,
+        stage: "gemini-omni-1.2-flash"
+      });
+    }
+  });
+  app.post("/api/voice-assist", async (req, res) => {
+    const {
+      frames = [],
+      audio,
+      audioDataUrl,
+      audioBase64,
+      audioMimeType = "audio/webm",
+      preferredLanguage,
+      scaleAnchor = "none",
+      hasWebXRDepth = false,
+      scaleOptOut = false,
+      format
+    } = req.body ?? {};
+    const rawAudioInput = typeof audio === "string" ? audio : typeof audio?.data === "string" ? audio.data : typeof audioDataUrl === "string" ? audioDataUrl : typeof audioBase64 === "string" ? audioBase64 : "";
+    const rawMime = typeof audio === "object" && audio?.mimeType || (typeof audioMimeType === "string" ? audioMimeType : "audio/webm");
+    const fallbackLanguage = normalizeBcp47Language(
+      typeof preferredLanguage === "string" ? preferredLanguage : void 0,
+      "en-US"
+    );
+    const { mimeType: cleanAudioMime, base64: cleanAudioBase64 } = stripAudioDataUrl(
+      rawAudioInput,
+      rawMime
+    );
+    const validation = validateAudioPayload(cleanAudioBase64);
+    if (!validation.ok) {
+      return res.status(400).json({ error: validation.error });
+    }
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: "GEMINI_API_KEY is not configured on the server. Configure a valid Gemini 4 API key in Secrets.",
+        code: "API_KEY_MISSING"
+      });
+    }
+    const incomingFrames = Array.isArray(frames) ? frames : [];
+    const stride = Math.max(1, Math.floor(incomingFrames.length / 4));
+    const sampledFrames = incomingFrames.filter((_f, i) => i % stride === 0).slice(0, 4);
+    const multimodalParts = [];
+    for (const frame of sampledFrames) {
+      if (typeof frame?.dataUrl !== "string" || frame.dataUrl.length < 32) continue;
+      const { mimeType, base64 } = stripDataUrlPrefix(frame.dataUrl);
+      multimodalParts.push({
+        type: "image",
+        data: base64,
+        mime_type: mimeType,
+        resolution: "medium"
+      });
+    }
+    multimodalParts.push({
+      type: "audio",
+      data: cleanAudioBase64,
+      mime_type: cleanAudioMime
+    });
+    multimodalParts.push({
+      type: "text",
+      text: '1. Listen carefully to the attached audio clip. Set speechDetected=true ONLY if intelligible human speech is actually audible; set speechDetected=false if the clip is silent or contains only noise.\n2. If speechDetected=true, write the exact verbatim words heard in userTranscript (in the original spoken language) and set detectedLanguageCode to the matching BCP-47 tag (e.g., "es-ES", "es-MX", "fr-FR", "ja-JP", "de-DE", "pt-BR", "zh-CN", "ar-EG", "hi-IN", "en-US").\n3. If speechDetected=false, set userTranscript="", set detectedLanguageCode="' + fallbackLanguage + '", do NOT invent a repair problem, and write a brief polite prompt in "' + fallbackLanguage + '" asking the user to hold the button and speak closer to the microphone.\n4. SCALE ANCHOR CHECK (MANDATORY):\n' + SCALE_CALIBRATION_PROMPT_GUIDE + "\nInspect the attached camera frame(s) for a known-size reference object placed beside the part: us_quarter, coin, credit_card, human_thumb, or ruler. Set detectedScaleObject and set scaleCalibrated=true ONLY if clearly visible right beside the target part on the same depth plane.\n5. SCALE OPT-OUT CHECK: Set userDeclinedScale=true if the user says they do not want to scale, want to skip scaling, or do not have a scale object (client scaleOptOut=" + String(Boolean(scaleOptOut)) + ").\n6. Write ALL user-facing text (spokenResponse, componentName, diagnosisSummary, nextStepInstruction, steps, scaleMeasurementNote, and whyScaleMattersLocalized) STRICTLY in detectedLanguageCode \u2014 never switch languages.\n7. In spokenResponse (3 short sentences max, no markdown):\n   - If scaleCalibrated=true: explicitly confirm you calibrated scale using the detected object (and estimated size), then give the direct mechanic fix (exact tool size allowed).\n   - If scaleCalibrated=false AND (userDeclinedScale=true OR scaleOptOut=true): acknowledge continuing without scaling, include a 1-sentence summary of why a reference object matters (camera lenses distort close-up size so tool sizes are approximate), and give the safe repair step without claiming exact numeric tool sizes.\n   - If scaleCalibrated=false AND NOT opted out: give safe preliminary guidance (NO specific numeric tool sizes) AND ask the user to hold a quarter, credit card, or their thumb next to the part so you can confirm exact scale\u2014or say if they prefer to continue without scaling.\n8. SPATIAL AR OVERLAY & MULTI-STEP PiP VIDEO RULE:\n   - Return targetBox [ymin, xmin, ymax, xmax] (0..1000) tightly around the part to repair, and anchorBox [ymin, xmin, ymax, xmax] around the scale object if visible.\n   - Break the fix into 2 to 5 clear sequential steps[]. For EACH step include motionCue (rotate_cw, rotate_ccw, slide, lift, press, align, inspect), targetBox, and a dedicated pipMotionPrompt showing close-up hands performing THAT step\u2019s physical repair action.\n   - NEVER make pipMotionPrompt about placing a coin/card/thumb\u2014PiP videos must ALWAYS show the actual physical repair motion."
+    });
+    let spokenText = "";
+    let detectedLanguageCode = fallbackLanguage;
+    let detectedLanguageName = "Auto";
+    let speechDetected = true;
+    let userTranscript = "";
+    let scaleCalibration = null;
+    let structuredDiagnosis = null;
+    let learnedSessionId = null;
+    let learnedComponentId = null;
+    try {
+      const reasoning = await clients.interactionsAi.interactions.create({
+        model: "gemini-4-neon",
+        system_instruction: EXPERT_MECHANIC_SYSTEM_PROMPT,
+        input: multimodalParts,
+        store: false,
+        generation_config: {
+          thinking_level: "low"
+        },
+        response_format: {
+          type: Type.OBJECT,
+          properties: {
+            speechDetected: {
+              type: Type.BOOLEAN,
+              description: "True only if intelligible human speech is present in the audio clip; false if silent or unintelligible noise."
+            },
+            userTranscript: {
+              type: Type.STRING,
+              description: "Verbatim transcription of the user speech in its original spoken language (empty string if speechDetected is false)."
+            },
+            detectedLanguageCode: {
+              type: Type.STRING,
+              description: "BCP-47 locale tag matching userTranscript (e.g., es-ES, fr-FR, ja-JP, pt-BR, en-US), or the fallback locale if speechDetected is false."
+            },
+            detectedLanguageName: {
+              type: Type.STRING,
+              description: "Human-readable name of the detected language (e.g., Spanish, French, Japanese, English)."
+            },
+            detectedScaleObject: {
+              type: Type.STRING,
+              description: "Detected scale object beside the part: us_quarter, coin, credit_card, human_thumb, ruler, webxr_depth, or none."
+            },
+            scaleCalibrated: {
+              type: Type.BOOLEAN,
+              description: "True ONLY if a known-size reference object is clearly visible right next to the part and scale was properly calibrated."
+            },
+            scaleConfidence: {
+              type: Type.NUMBER,
+              description: "Confidence 0.0 to 1.0 in the detected scale reference object."
+            },
+            estimatedPartSizeMm: {
+              type: Type.NUMBER,
+              description: "Estimated target part width/diameter in mm when calibrated (0 if uncalibrated)."
+            },
+            scaleMeasurementNote: {
+              type: Type.STRING,
+              description: "1-sentence measurement comparison against the reference object in detectedLanguageCode."
+            },
+            targetBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: "Bounding box [ymin, xmin, ymax, xmax] in 0..1000 coordinates around the part to fix."
+            },
+            anchorBox: {
+              type: Type.ARRAY,
+              items: { type: Type.NUMBER },
+              description: "Bounding box [ymin, xmin, ymax, xmax] in 0..1000 coordinates around the scale object (empty if none)."
+            },
+            motionCue: {
+              type: Type.STRING,
+              description: "Primary AR motion cue: rotate_cw, rotate_ccw, slide, lift, press, align, or inspect."
+            },
+            userDeclinedScale: {
+              type: Type.BOOLEAN,
+              description: "True if the user explicitly asked to skip scaling or continue without using a reference object."
+            },
+            whyScaleMattersLocalized: {
+              type: Type.STRING,
+              description: "A short 1-2 sentence explanation in detectedLanguageCode explaining why placing a quarter, credit card, or thumb beside the part matters for accurate tool sizing."
+            },
+            spokenResponse: {
+              type: Type.STRING,
+              description: "Direct, actionable mechanic guidance written strictly in detectedLanguageCode, under 3 sentences, including scale confirmation, anchor prompt, or opt-out explanation as appropriate."
+            },
+            componentName: {
+              type: Type.STRING,
+              description: "Short plain-language name of the visible part/assembly in detectedLanguageCode."
+            },
+            diagnosisSummary: {
+              type: Type.STRING,
+              description: "Concise 1-2 sentence summary of the visual issue and fix in detectedLanguageCode."
+            },
+            nextStepInstruction: {
+              type: Type.STRING,
+              description: "Primary actionable repair step in detectedLanguageCode."
+            },
+            toolRequired: {
+              type: Type.STRING,
+              description: "Tool category needed (e.g., Phillips screwdriver, Hex key, No tools needed)."
+            },
+            toolSizeSpec: {
+              type: Type.STRING,
+              description: "Exact numeric size ONLY if scaleCalibrated=true; otherwise empty string."
+            },
+            steps: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  detail: { type: Type.STRING },
+                  motionCue: { type: Type.STRING },
+                  targetBox: {
+                    type: Type.ARRAY,
+                    items: { type: Type.NUMBER }
+                  },
+                  pipMotionPrompt: {
+                    type: Type.STRING,
+                    description: "Close-up hand-motion prompt showing the physical repair action for THIS step (never coin placement)."
+                  },
+                  toolNeeded: { type: Type.STRING }
+                },
+                required: ["title", "detail", "motionCue", "pipMotionPrompt"]
+              }
+            },
+            pipMotionPrompt: {
+              type: Type.STRING,
+              description: "Short visual hand-motion prompt for optional PiP demonstration of the repair."
+            }
+          },
+          required: [
+            "speechDetected",
+            "userTranscript",
+            "detectedLanguageCode",
+            "detectedLanguageName",
+            "detectedScaleObject",
+            "scaleCalibrated",
+            "userDeclinedScale",
+            "whyScaleMattersLocalized",
+            "spokenResponse",
+            "componentName",
+            "diagnosisSummary",
+            "nextStepInstruction",
+            "toolRequired",
+            "targetBox",
+            "motionCue",
+            "steps"
+          ]
+        }
+      });
+      const rawOutput = reasoning.output_text || "";
+      try {
+        const parsed = JSON.parse(rawOutput);
+        speechDetected = parsed.speechDetected !== false;
+        userTranscript = parsed.userTranscript?.trim() || "";
+        const rawCode = speechDetected ? parsed.detectedLanguageCode : fallbackLanguage;
+        detectedLanguageCode = normalizeBcp47Language(rawCode, fallbackLanguage);
+        detectedLanguageName = parsed.detectedLanguageName?.trim() || detectedLanguageCode;
+        spokenText = enforceThreeSentenceCap(parsed.spokenResponse || rawOutput);
+        const resolvedAnchorBox = normalizeBoxToPct(parsed.anchorBox);
+        scaleCalibration = resolveScaleCalibration({
+          detectedObject: parsed.detectedScaleObject,
+          scaleCalibrated: Boolean(parsed.scaleCalibrated),
+          scaleConfidence: parsed.scaleConfidence,
+          estimatedPartSizeMm: typeof parsed.estimatedPartSizeMm === "number" ? parsed.estimatedPartSizeMm : null,
+          scaleMeasurementNote: parsed.scaleMeasurementNote ?? null,
+          anchorBox: resolvedAnchorBox,
+          explicitOptOut: Boolean(scaleOptOut),
+          userDeclinedInSpeech: Boolean(parsed.userDeclinedScale),
+          userTranscript,
+          hasWebXRDepth: Boolean(hasWebXRDepth),
+          clientScaleAnchor: scaleAnchor,
+          localizedWhyScaleMatters: parsed.whyScaleMattersLocalized
+        });
+        const effectiveAnchor = mapDetectedObjectToScaleAnchor(scaleCalibration.detectedObject);
+        const scaleGated = enforceScaleAnchorInvariant(
+          {
+            toolRequired: parsed.toolRequired?.trim() || "Hand Inspection",
+            toolSizeSpec: scaleCalibration.confirmed && parsed.toolSizeSpec?.trim() ? parsed.toolSizeSpec.trim() : null,
+            requiresScaleAnchor: !scaleCalibration.confirmed,
+            instructionText: parsed.nextStepInstruction?.trim() || spokenText
+          },
+          effectiveAnchor,
+          Boolean(hasWebXRDepth)
+        );
+        if (speechDetected) {
+          const primaryMotion = normalizeMotionCue(parsed.motionCue || parsed.nextStepInstruction);
+          structuredDiagnosis = {
+            componentName: parsed.componentName?.trim() || "Visual Repair Guidance",
+            diagnosisSummary: parsed.diagnosisSummary?.trim() || spokenText,
+            nextStepInstruction: scaleGated.instructionText,
+            toolRequired: scaleGated.toolRequired,
+            toolSizeSpec: scaleGated.toolSizeSpec,
+            scaleGuardBlocked: scaleGated.scaleGuardBlocked,
+            anchorPrompt: scaleGated.anchorPrompt,
+            targetBox: parsed.targetBox,
+            anchorBox: parsed.anchorBox,
+            motionCue: primaryMotion,
+            pipMotionPrompt: parsed.pipMotionPrompt?.trim() || void 0,
+            steps: Array.isArray(parsed.steps) ? parsed.steps : []
+          };
+          const primaryFrame = sampledFrames[sampledFrames.length - 1]?.dataUrl ?? null;
+          const learned = await recordLiveDiagnosisToCloudSql({
+            componentName: String(structuredDiagnosis.componentName),
+            diagnosisSummary: String(structuredDiagnosis.diagnosisSummary),
+            nextStepInstruction: scaleGated.instructionText,
+            toolRequired: scaleGated.toolRequired,
+            toolSizeSpec: scaleGated.toolSizeSpec,
+            requiresScaleAnchor: !scaleCalibration.confirmed,
+            pipMotionPrompt: parsed.pipMotionPrompt?.trim() || void 0,
+            motionCue: primaryMotion,
+            estimatedPartSizeMm: scaleCalibration.estimatedPartSizeMm,
+            scaleAnchor: effectiveAnchor,
+            hasWebXRDepth: Boolean(hasWebXRDepth),
+            ingestMode: "webrtc_video",
+            frameDataUrl: primaryFrame,
+            clients
+          });
+          learnedSessionId = learned.sessionId;
+          learnedComponentId = learned.componentId;
+        }
+      } catch {
+        spokenText = enforceThreeSentenceCap(rawOutput);
+      }
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Multimodal voice analysis failed: ${message}`,
+        stage: "gemini-4-neon"
+      });
+    }
+    try {
+      const ttsInteraction = await clients.interactionsAi.interactions.create({
+        model: "gemini-3.8-flash-lite-tts",
+        input: [
+          {
+            type: "text",
+            text: spokenText,
+            annotations: [
+              {
+                type: "speech_metadata",
+                style: `Calm, confident, direct expert mechanic speaking naturally in ${detectedLanguageName}`
+              }
+            ]
+          }
+        ],
+        store: false,
+        response_format: { type: "audio" },
+        generation_config: {
+          speech_config: [
+            {
+              language: detectedLanguageCode,
+              voice: "Kore"
+            }
+          ]
+        }
+      });
+      const outputAudio = ttsInteraction.output_audio;
+      if (!outputAudio?.data) {
+        return res.status(502).json({
+          error: "Gemini speech synthesis returned no audio payload.",
+          spokenText,
+          detectedLanguageCode,
+          detectedLanguageName,
+          diagnosis: structuredDiagnosis,
+          scaleCalibration,
+          sessionId: learnedSessionId,
+          componentId: learnedComponentId
+        });
+      }
+      const wavMime = outputAudio.mime_type || "audio/wav";
+      const wantsBinary = format === "binary" || typeof req.headers.accept === "string" && req.headers.accept.includes("audio/");
+      if (wantsBinary) {
+        const wavBuffer = Buffer.from(outputAudio.data, "base64");
+        res.setHeader("Content-Type", wavMime);
+        res.setHeader("Content-Length", String(wavBuffer.length));
+        res.setHeader("Cache-Control", "no-store");
+        res.setHeader("X-MakerLens-Transcript", encodeURIComponent(spokenText));
+        res.setHeader("X-MakerLens-Language", detectedLanguageCode);
+        res.setHeader("X-MakerLens-Language-Name", encodeURIComponent(detectedLanguageName));
+        if (scaleCalibration) {
+          res.setHeader("X-MakerLens-Scale-Status", scaleCalibration.status);
+          res.setHeader("X-MakerLens-Scale-Object", scaleCalibration.detectedObject);
+        }
+        res.setHeader("X-MakerLens-Vision-Model", "gemini-4-neon");
+        res.setHeader("X-MakerLens-Speech-Model", "gemini-3.8-flash-lite-tts");
+        return res.status(200).send(wavBuffer);
+      }
+      return res.json({
+        speechDetected,
+        userTranscript,
         spokenText,
         detectedLanguageCode,
         detectedLanguageName,
+        audioBase64: outputAudio.data,
+        audioMimeType: wavMime,
+        diagnosis: structuredDiagnosis,
+        scaleCalibration,
+        sessionId: learnedSessionId,
+        componentId: learnedComponentId,
+        visionModel: "gemini-4-neon",
+        speechModel: "gemini-3.8-flash-lite-tts"
+      });
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Speech synthesis failed: ${message}`,
+        spokenText,
+        detectedLanguageCode,
+        detectedLanguageName,
+        diagnosis: structuredDiagnosis,
+        scaleCalibration,
+        stage: "gemini-3.8-flash-lite-tts"
       });
     }
-
-    const wavMime = outputAudio.mime_type || 'audio/wav';
-    const wantsBinary =
-      format === 'binary' ||
-      (typeof req.headers.accept === 'string' && req.headers.accept.includes('audio/'));
-
-    if (wantsBinary) {
-      const wavBuffer = Buffer.from(outputAudio.data, 'base64');
-      res.setHeader('Content-Type', wavMime);
-      res.setHeader('Content-Length', String(wavBuffer.length));
-      res.setHeader('Cache-Control', 'no-store');
-      res.setHeader('X-MakerLens-Transcript', encodeURIComponent(spokenText));
-      res.setHeader('X-MakerLens-Language', detectedLanguageCode);
-      res.setHeader('X-MakerLens-Language-Name', encodeURIComponent(detectedLanguageName));
-      res.setHeader('X-MakerLens-Vision-Model', 'gemini-4-neon');
-      res.setHeader('X-MakerLens-Speech-Model', 'gemini-3.8-flash-lite-tts');
+  });
+  const spokenNoticeCache = /* @__PURE__ */ new Map();
+  app.post("/api/speak-notice", async (req, res) => {
+    const rawText = typeof req.body?.text === "string" && req.body.text.trim().length > 0 ? req.body.text.trim().slice(0, 480) : WHY_SCALE_MATTERS_SPOKEN;
+    const lang = normalizeBcp47Language(
+      typeof req.body?.language === "string" ? req.body.language : void 0,
+      "en-US"
+    );
+    const cacheKey = `${lang}:${rawText}`;
+    const cached = spokenNoticeCache.get(cacheKey);
+    if (cached) {
+      res.setHeader("Content-Type", cached.mimeType);
+      res.setHeader("Content-Length", String(cached.wavBuffer.length));
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return res.status(200).send(cached.wavBuffer);
+    }
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: "GEMINI_API_KEY is not configured.",
+        fallbackText: rawText
+      });
+    }
+    try {
+      const ttsInteraction = await clients.interactionsAi.interactions.create({
+        model: "gemini-3.8-flash-lite-tts",
+        input: [
+          {
+            type: "text",
+            text: rawText,
+            annotations: [
+              {
+                type: "speech_metadata",
+                style: "Warm, clear, reassuring repair assistant speaking concisely"
+              }
+            ]
+          }
+        ],
+        store: false,
+        response_format: { type: "audio" },
+        generation_config: {
+          speech_config: [{ language: lang, voice: "Kore" }]
+        }
+      });
+      const outputAudio = ttsInteraction.output_audio;
+      if (!outputAudio?.data) {
+        return res.status(502).json({ error: "No audio payload returned.", fallbackText: rawText });
+      }
+      const wavBuffer = Buffer.from(outputAudio.data, "base64");
+      const mimeType = outputAudio.mime_type || "audio/wav";
+      if (spokenNoticeCache.size < 32) {
+        spokenNoticeCache.set(cacheKey, { wavBuffer, mimeType });
+      }
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Content-Length", String(wavBuffer.length));
       return res.status(200).send(wavBuffer);
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({ error: message, fallbackText: rawText });
     }
-
-    return res.json({
-      spokenText,
-      detectedLanguageCode,
-      detectedLanguageName,
-      audioBase64: outputAudio.data,
-      audioMimeType: wavMime,
-      visionModel: 'gemini-4-neon',
-      speechModel: 'gemini-3.8-flash-lite-tts',
-    });
-  } catch (err) {
-    return res.status(502).json({
-      error: `Speech synthesis failed: ${err.message}`,
-      spokenText,
-      detectedLanguageCode,
-      detectedLanguageName,
-    });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// 6c. Guided Demo Narration: Cached Neural Voiceover (`gemini-3.8-flash-lite-tts`)
-// -----------------------------------------------------------------------------
-const DEMO_NARRATION_SCRIPTS = {
-  intro:
-    'Welcome to Jack of All Trades. This is a quick interactive demo showing how visual repair guidance works. Tap the highlighted battery latch on screen to see step-by-step instructions.',
-  'step-1':
-    'Step one: Press down gently with your thumb on the ridged release latch near the top of the cover.',
-  'step-2':
-    'Step two: Keep light pressure and slide the cover straight down toward the molded arrow until it clicks loose.',
-  'step-3':
-    'Step three: Lift the cover up to reveal the batteries. You are all set—tap Got It, Open Camera whenever you are ready for a live repair.',
-};
-const demoNarrationCache = new Map();
-
-app.get('/api/demo-narration', async (req, res) => {
-  const rawCue = typeof req.query.cue === 'string' ? req.query.cue.trim() : 'intro';
-  const spokenText = DEMO_NARRATION_SCRIPTS[rawCue];
-  if (!spokenText) {
-    return res.status(400).json({ error: 'Invalid demo narration cue.' });
-  }
-
-  const cached = demoNarrationCache.get(rawCue);
-  if (cached) {
-    res.setHeader('Content-Type', cached.mimeType);
-    res.setHeader('Content-Length', String(cached.wavBuffer.length));
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.setHeader('X-Demo-Cue', rawCue);
-    res.setHeader('X-Demo-Cache', 'HIT');
-    return res.status(200).send(cached.wavBuffer);
-  }
-
-  const clients = initGeminiClients();
-  if (!clients) {
-    return res.status(503).json({ error: 'GEMINI_API_KEY is not configured.', fallbackText: spokenText });
-  }
-
-  try {
-    const tts = await clients.interactionsAi.interactions.create({
-      model: 'gemini-3.8-flash-lite-tts',
-      input: [
-        {
-          type: 'text',
-          text: spokenText,
-          annotations: [
-            {
-              type: 'speech_metadata',
-              style: 'Warm, reassuring, natural product guide speaking clearly at a conversational pace',
-            },
-          ],
-        },
-      ],
-      store: false,
-      response_format: { type: 'audio' },
-      generation_config: { speech_config: [{ language: 'en-US', voice: 'Kore' }] },
-    });
-
-    const outputAudio = tts.output_audio;
-    if (!outputAudio?.data) {
-      return res.status(502).json({ error: 'Demo narration TTS returned no audio.', fallbackText: spokenText });
+  });
+  const demoNarrationCache = /* @__PURE__ */ new Map();
+  app.get("/api/demo-narration", async (req, res) => {
+    const rawCue = typeof req.query.cue === "string" ? req.query.cue.trim() : "intro";
+    if (!isValidDemoCueId(rawCue)) {
+      return res.status(400).json({ error: "Invalid demo narration cue." });
     }
-
-    const wavBuffer = Buffer.from(outputAudio.data, 'base64');
-    const mimeType = outputAudio.mime_type || 'audio/wav';
-    demoNarrationCache.set(rawCue, { wavBuffer, mimeType });
-
-    res.setHeader('Content-Type', mimeType);
-    res.setHeader('Content-Length', String(wavBuffer.length));
-    res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.setHeader('X-Demo-Cue', rawCue);
-    res.setHeader('X-Demo-Cache', 'MISS');
-    return res.status(200).send(wavBuffer);
-  } catch (err) {
-    return res.status(502).json({ error: `Demo narration failed: ${err.message}`, fallbackText: spokenText });
+    const cue = DEMO_NARRATION_CUES[rawCue];
+    const cached = demoNarrationCache.get(rawCue);
+    if (cached) {
+      res.setHeader("Content-Type", cached.mimeType);
+      res.setHeader("Content-Length", String(cached.wavBuffer.length));
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("X-Demo-Cue", rawCue);
+      res.setHeader("X-Demo-Cache", "HIT");
+      return res.status(200).send(cached.wavBuffer);
+    }
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: "GEMINI_API_KEY is not configured on the server.",
+        fallbackText: cue.spokenText
+      });
+    }
+    try {
+      const tts = await clients.interactionsAi.interactions.create({
+        model: "gemini-3.8-flash-lite-tts",
+        input: [
+          {
+            type: "text",
+            text: cue.spokenText,
+            annotations: [
+              {
+                type: "speech_metadata",
+                style: "Warm, reassuring, natural product guide speaking clearly at a conversational pace"
+              }
+            ]
+          }
+        ],
+        store: false,
+        response_format: { type: "audio" },
+        generation_config: {
+          speech_config: [{ language: "en-US", voice: "Kore" }]
+        }
+      });
+      const outputAudio = tts.output_audio;
+      if (!outputAudio?.data) {
+        return res.status(502).json({
+          error: "Demo narration TTS returned no audio.",
+          fallbackText: cue.spokenText
+        });
+      }
+      const wavBuffer = Buffer.from(outputAudio.data, "base64");
+      const mimeType = outputAudio.mime_type || "audio/wav";
+      demoNarrationCache.set(rawCue, { wavBuffer, mimeType });
+      res.setHeader("Content-Type", mimeType);
+      res.setHeader("Content-Length", String(wavBuffer.length));
+      res.setHeader("Cache-Control", "public, max-age=86400");
+      res.setHeader("X-Demo-Cue", rawCue);
+      res.setHeader("X-Demo-Cache", "MISS");
+      return res.status(200).send(wavBuffer);
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({
+        error: `Demo narration synthesis failed: ${message}`,
+        fallbackText: cue.spokenText
+      });
+    }
+  });
+  const httpServer = http.createServer(app);
+  if (!isProduction) {
+    const { createServer: createViteServer } = await import("vite");
+    const disableHmr = process.env.DISABLE_HMR === "true" || Boolean(process.env.K_SERVICE);
+    if (disableHmr) {
+      const NOOP_VITE_CLIENT_ESM = [
+        "const sheetsMap = new Map();",
+        "export function updateStyle(id, content) {",
+        "  let style = sheetsMap.get(id);",
+        "  if (!style) {",
+        '    style = document.createElement("style");',
+        '    style.setAttribute("type", "text/css");',
+        '    style.setAttribute("data-vite-dev-id", id);',
+        "    style.textContent = content;",
+        "    document.head.appendChild(style);",
+        "    sheetsMap.set(id, style);",
+        "  } else {",
+        "    style.textContent = content;",
+        "  }",
+        "}",
+        "export function removeStyle(id) {",
+        "  const style = sheetsMap.get(id);",
+        "  if (style) {",
+        "    document.head.removeChild(style);",
+        "    sheetsMap.delete(id);",
+        "  }",
+        "}",
+        "export function injectQuery(url, queryToInject) {",
+        '  if (!url || (!url.startsWith(".") && !url.startsWith("/"))) return url;',
+        '  const [pathname, search] = url.split("?");',
+        '  return `${pathname}?${queryToInject}${search ? "&" + search : ""}`;',
+        "}",
+        "export function createHotContext() {",
+        "  return {",
+        "    data: {},",
+        "    accept() {},",
+        "    acceptExports() {},",
+        "    dispose() {},",
+        "    prune() {},",
+        "    decline() {},",
+        "    invalidate() {},",
+        "    on() {},",
+        "    off() {},",
+        "    send() {},",
+        "  };",
+        "}",
+        "export class ErrorOverlay extends HTMLElement {}"
+      ].join("\n");
+      app.get("/@vite/client", (_req, res) => {
+        res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+        res.setHeader("Cache-Control", "no-store");
+        res.send(NOOP_VITE_CLIENT_ESM);
+      });
+    }
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        hmr: disableHmr ? false : { server: httpServer },
+        ws: disableHmr ? false : void 0
+      },
+      appType: "spa"
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distDir = path.join(__dirname, "dist");
+    app.use(express.static(distDir));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distDir, "index.html"));
+    });
   }
-});
-
-// -----------------------------------------------------------------------------
-// 7. Serve Compiled Vite React PWA (`dist/`) on Google Cloud Run Port 8080
-// -----------------------------------------------------------------------------
-const distDir = path.join(__dirname, 'dist');
-app.use(express.static(distDir));
-app.get('*', (_req, res) => {
-  res.sendFile(path.join(distDir, 'index.html'));
-});
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[JackOfAllTrades] Cloud Run backend listening on port ${PORT}`);
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(`[JackOfAllTrades] Express + PWA listening on http://0.0.0.0:${PORT}`);
+  });
+}
+createApp().catch((err) => {
+  console.error("[JackOfAllTrades] Fatal startup error:", err);
+  process.exit(1);
 });

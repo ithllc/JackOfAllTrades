@@ -13,14 +13,14 @@
 
 ## Key Capabilities
 
-- **Magic Window Live Camera UI** — Full-screen rear-facing viewfinder (`MediaDevices` API) with hardware torch/screen-fill flashlight control, **Scan Problem** analysis, and zero cluttered telemetry.
+- **Magic Window Live Camera UI & Spatial AR Overlay** — Full-screen rear-facing viewfinder (`MediaDevices` API) with hardware torch/screen-fill flashlight control, **Scan Problem** + **Hold to Explain**, and a live `<SpatialRepairOverlay/>` rendering Gemini bounding boxes, animated directional SVG motion cues (`rotate_cw`, `rotate_ccw`, `slide`, `lift`, `press`, `align`), verified scale-anchor overlays, and a **View AR** sheet toggle.
 - **Voice-Guided Interactive Onboarding Demo** — First-time visitors experience a safe, interactive battery-latch walkthrough with automated neural voice narration (`GET /api/demo-narration`) synchronized step-by-step with visual highlights and animated motion cues.
-- **Native Two-Way Multilingual Voice Assist** — Press and hold **Hold to Explain** to capture raw microphone audio (`MediaRecorder`) alongside live visual frames. The backend detects the user's spoken language automatically and replies aloud in the exact same language (under 3 direct, actionable sentences) as a binary 24 kHz RIFF WAV stream.
+- **Unified Native Two-Way Multilingual Voice Assist** — Press and hold **Hold to Explain** to capture raw microphone audio (`MediaRecorder`) alongside live visual frames. Enforces the exact same Scale Anchor calibration, multi-step AR overlay, per-step PiP video clips, and Cloud SQL self-learning write-back as **Scan Problem**, while replying aloud in the user's detected language as a 24 kHz RIFF WAV stream.
 - **Zero-Token Decision Routing (ADR 003)** — Client-side stillness gating and `gemini-decision-1` (`v1beta` Decisions API, `0` output tokens) filter nominal frames and escalate to `gemini-4-neon` only on high-confidence anomalies (`>= 0.78`), reducing compute cost and preventing mobile thermal throttling.
-- **Scale Anchor Guard (Break 2 Invariant)** — Prevents tool-size hallucinations by redacting exact metric/imperial tool specifications unless WebXR depth or a physical scale anchor (US quarter, credit card, or thumb reference) is present.
-- **PostgreSQL Recursive CTE + `pgvector` Ontology RAG (ADR 001)** — Models hardware assemblies, fastener confusion edges, and 768-dimensional visual embeddings in PostgreSQL 16 (`pgvector` HNSW). User bounding-box corrections update embeddings immediately without model retraining, with an automatic in-memory parity engine when offline.
-- **On-the-Fly Picture-in-Picture Motion Clips** — Generates short hand-motion guidance loops via `gemini-omni-1.2-flash` (`POST /api/generate-pip`) for complex mechanical gestures.
-- **Built-In Admin & Operations Platform (`/admin`)** — Live system health monitoring, Cloud SQL diagnostics, Scale Anchor Guard tester, Ontology RAG explorer, architecture diagrams, corresponding source downloads, and QA runbook.
+- **Pixel-Ratio Scale Anchor Guard (ADR 006 / Break 2)** — Compares target hardware against known reference dimensions (`24.26 mm` US quarter, `85.6 mm` credit card, `20 mm` thumb, or ruler), reports `estimatedPartSizeMm`, and redacts exact metric/imperial tool specs unless calibrated (or explicitly opted out with written + spoken explanation).
+- **Self-Learning PostgreSQL Recursive CTE + `pgvector` Ontology RAG (ADR 001 & ADR 007)** — Every live Scan and Hold-to-Explain session automatically logs to Cloud SQL (`diagnostic_sessions`), embeds frames with `gemini-embedding-2`, learns new parts/actions, and updates live `success_rate` & `$30` return-deflection bounties when users tap **Done — This Fixed It!** or **Wrong Part or Size?**.
+- **Multi-Step Repairs with On-Demand Per-Step PiP Clips (ADR 005)** — Supports multi-step guided repairs (up to 6 steps) where each step carries its own AR reticle, directional cue, and repair-only hand-motion prompt. Tapping **Show Step N Motion** generates and caches a 6-second `gemini-omni-1.2-flash` loop on demand (playable inline or in a floating corner Mini-PiP over the live camera).
+- **Built-In Admin & Operations Platform (`/admin`)** — Live system health monitoring (`/api/health`), Cloud SQL diagnostics, Scale Anchor Guard tester, live Cloud SQL Ontology RAG explorer, architecture diagrams, one-click copy/download AGPL-3.0 corresponding source (`server.ts`, `server.js`, `schema.sql`, `Dockerfile`, `docs/*`), and embedded QA runbook.
 
 ---
 
@@ -63,30 +63,33 @@ For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Re
 
 ```text
 .
-├── server.ts                  # Primary Express + Vite dev/prod backend (TypeScript)
-├── server.js                  # Standalone Cloud Run production server (Node.js ESM)
+├── server.ts                  # Unified Express + Vite dev/prod backend source (TypeScript)
+├── server.js                  # Compiled Cloud Run production bundle (generated from server.ts)
 ├── schema.sql                 # PostgreSQL 16 + pgvector schema, Recursive CTEs & seed data
-├── Dockerfile                 # Multi-stage production container (Node.js 22, Port 8080)
+├── Dockerfile                 # Multi-stage container (compiles server.ts -> server.js, Port 8080)
 ├── App.jsx                    # Standalone AGPL-3.0 reference client deliverable
 ├── docs/
-│   ├── ARCHITECTURE.md        # System topology, sequence diagrams, ER diagram & ADRs
-│   └── RUNBOOK.md             # Cloud SQL setup, Cloud Run deployment, QA matrix & playbooks
+│   ├── ARCHITECTURE.md        # System topology, sequence diagrams, ER diagram & ADRs 001–007
+│   └── RUNBOOK.md             # Cloud SQL setup, Cloud Run env vars & deploy, QA matrix & playbooks
 ├── src/
 │   ├── App.tsx                # Root SPA router (DemoMode <-> LiveCameraView <-> AdminPlatform)
 │   ├── components/
 │   │   ├── DemoMode.tsx       # Voice-narrated interactive battery-latch onboarding demo
-│   │   ├── LiveCameraView.tsx # Magic Window camera, Scan Problem & Hold-to-Explain voice UI
-│   │   ├── InstructionSheet.tsx # Plain-English step-by-step sheet synced with voice playback
+│   │   ├── LiveCameraView.tsx # Magic Window camera, Scan Problem, Hold-to-Explain & Stepper
+│   │   ├── SpatialRepairOverlay.tsx # Live AR bounding boxes, directional SVG cues & Mini-PiP
+│   │   ├── InstructionSheet.tsx # Compact multi-step guide, per-step PiP & Cloud SQL feedback
 │   │   ├── AdminPlatform.tsx  # 4-tab Admin & Operations Console (/admin)
-│   │   ├── OntologyExplorer.tsx # Recursive CTE hierarchy, RAG search & M4/M6 feedback UI
-│   │   ├── ArchitectureBlueprint.tsx # Interactive topology + AGPL source viewer/downloader
-│   │   ├── RunbookView.tsx    # QA verification launcher & embedded operations runbook
+│   │   ├── OntologyExplorer.tsx # Live Cloud SQL Recursive CTE hierarchy, RAG & M4/M6 feedback
+│   │   ├── ArchitectureBlueprint.tsx # Interactive topology + AGPL source copy/downloader
+│   │   ├── RunbookView.tsx    # QA verification launcher & embedded copyable operations runbook
 │   │   └── BrandMark.tsx      # Jack of Spades holding a claw hammer brand lockup
 │   └── lib/
 │       ├── audioUtils.ts      # MIME normalization, BCP-47 resolver & 3-sentence cap (+ tests)
 │       ├── dbConfig.ts        # Cloud SQL Unix socket / Public IP TLS pool resolver (+ tests)
 │       ├── demoNarration.ts   # Synchronized onboarding script & visual phase mapping (+ tests)
-│       ├── makerLensState.ts  # Pure onboarding & scan lifecycle reducer (+ tests)
+│       ├── makerLensState.ts  # Pure onboarding, multi-step hotspot & scan reducer (+ tests)
+│       ├── ontologyMapper.ts  # Gemini 0..1000 box normalizer & PG snake_case mappers (+ tests)
+│       ├── scaleCalibration.ts # Pixel-ratio scale calibration & opt-out enforcement (+ tests)
 │       └── routingLogic.ts    # Adaptive ingest, motion gate, Decisions gate & ontology (+ tests)
 └── LICENSE                    # GNU Affero General Public License v3.0 (AGPL-3.0-only)
 ```
@@ -146,15 +149,11 @@ npm start
 # TypeScript type checking
 npm run lint
 
-# Full pure-logic unit test suite (30 tests across 5 modules)
-npx --yes tsx --test \
-  src/lib/audioUtils.test.ts \
-  src/lib/dbConfig.test.ts \
-  src/lib/demoNarration.test.ts \
-  src/lib/makerLensState.test.ts \
-  src/lib/routingLogic.test.ts
+# Full pure-logic unit test suite
+npx --yes tsx --test src/lib/*.test.ts
 
-# Standalone Cloud Run server syntax verification
+# Recompile unified Cloud Run bundle & verify syntax
+npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js
 node --check server.js
 ```
 
@@ -180,17 +179,19 @@ The console is organized into four tabs:
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/healthz` | Liveness probe, Gemini API key status, and Cloud SQL transport summary. |
+| `GET` | `/api/health` | Cloud Run–safe liveness probe (`/healthz` alias locally), Gemini API key status, and Cloud SQL transport summary. |
 | `GET` | `/api/db/status` | Live PostgreSQL 16 + `pgvector` connectivity probe (`?strict=1` returns HTTP `503` when unreachable). |
-| `POST` | `/api/analyze-buffer` | Runs `gemini-decision-1` zero-token anomaly gating and conditionally escalates to `gemini-4-neon` + Ontology RAG. |
-| `POST` | `/api/voice-assist` | Accepts recorded microphone audio + visual frames, detects spoken language, and streams a same-language 24 kHz WAV reply. |
+| `POST` | `/api/analyze-buffer` | Runs `gemini-decision-1` gating → `gemini-4-neon` scale-calibrated multi-step diagnosis + live Cloud SQL write-back + WAV voiceover. |
+| `POST` | `/api/voice-assist` | Accepts recorded microphone audio + visual frames, detects spoken language, enforces Scale Anchor + multi-step AR diagnosis, logs to Cloud SQL, and returns same-language 24 kHz WAV speech. |
+| `POST` | `/api/speak-notice` | Synthesizes on-demand WAV voice guidance for single repair steps or scale opt-out explanations. |
 | `GET` | `/api/demo-narration` | Serves cached neural WAV voiceover clips (`?cue=intro\|step-1\|step-2\|step-3`) for the interactive onboarding demo. |
-| `POST` | `/api/generate-pip` | Generates a Picture-in-Picture hand-motion video loop via `gemini-omni-1.2-flash`. |
-| `GET` | `/api/ontology/tree` | Returns the Recursive CTE hardware assembly hierarchy and flywheel metrics. |
-| `POST` | `/api/ontology/search` | Executes `pgvector` cosine RAG search with Scale Anchor Guard enforcement. |
-| `POST` | `/api/ontology/feedback` | Records user bounding-box corrections and updates component embeddings immediately. |
-| `POST` | `/api/ontology/deflection` | Logs a verified B2B2C hardware return deflection bounty. |
-| `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source deliverables for the running revision. |
+| `POST` | `/api/generate-pip` | Generates an on-demand 6-second per-step hand-motion PiP video loop via `gemini-omni-1.2-flash`. |
+| `GET` | `/api/ontology/tree` | Returns the live Cloud SQL Recursive CTE hardware assembly hierarchy, learned components, feedback log, and flywheel metrics. |
+| `POST` | `/api/ontology/search` | Executes `pgvector` cosine RAG search with Break 2 Scale Anchor Guard enforcement. |
+| `POST` | `/api/ontology/feedback` | Records end-user part/size corrections, embeds frames via `gemini-embedding-2`, and updates or creates Cloud SQL ontology nodes immediately. |
+| `POST` | `/api/ontology/confirm-fix` | Marks a live diagnostic session `resolved_deflected`, updates `repair_actions.success_rate`, and logs a `$30` return-deflection bounty. |
+| `POST` | `/api/ontology/deflection` | Logs a verified B2B2C hardware return deflection bounty from the Admin console. |
+| `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source (`schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/*`, `LICENSE`) for the running revision. |
 
 ---
 
