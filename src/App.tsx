@@ -13,7 +13,7 @@
  *  - Deep links or automated runs passing `?autostart=1` jump directly to `'live'`.
  */
 
-import React, { useCallback, useEffect, useReducer } from 'react';
+import React, { useCallback, useEffect, useReducer, useState } from 'react';
 import {
   createInitialSessionState,
   makerLensReducer,
@@ -22,6 +22,7 @@ import {
 } from './lib/makerLensState';
 import { DemoMode } from './components/DemoMode';
 import { LiveCameraView } from './components/LiveCameraView';
+import { AdminPlatform } from './components/AdminPlatform';
 
 function readOnboardingCompletion(): boolean {
   if (typeof window === 'undefined') return false;
@@ -32,7 +33,16 @@ function readOnboardingCompletion(): boolean {
   }
 }
 
+function isAdminLocation(): boolean {
+  if (typeof window === 'undefined') return false;
+  const pathname = window.location.pathname.toLowerCase();
+  const params = new URLSearchParams(window.location.search);
+  return pathname === '/admin' || pathname.startsWith('/admin/') || params.get('admin') === '1';
+}
+
 export default function App() {
+  const [showAdmin, setShowAdmin] = useState<boolean>(() => isAdminLocation());
+
   // Single reducer owns the mode switch ('demo' | 'live'), flashlight toggle,
   // and human-readable scan lifecycle ('idle' | 'scanning' | 'result' | 'error').
   const [state, dispatch] = useReducer(
@@ -45,6 +55,15 @@ export default function App() {
       )
   );
 
+  // Sync browser back/forward navigation between `/` and `/admin`
+  useEffect(() => {
+    const handlePopState = () => {
+      setShowAdmin(isAdminLocation());
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
   // Persist onboarding completion so returning visits open directly into the Magic Window
   useEffect(() => {
     if (!state.hasCompletedOnboarding) return;
@@ -54,6 +73,46 @@ export default function App() {
       // Ignore storage quota / private-browsing restrictions
     }
   }, [state.hasCompletedOnboarding]);
+
+  const handleOpenAdmin = useCallback(() => {
+    setShowAdmin(true);
+    try {
+      if (!isAdminLocation()) {
+        window.history.pushState({}, '', '/admin');
+      }
+    } catch {
+      // Ignore restricted history API in sandboxed iframes
+    }
+  }, []);
+
+  const handleReturnToCamera = useCallback(() => {
+    dispatch({ type: 'COMPLETE_DEMO' });
+    setShowAdmin(false);
+    try {
+      if (isAdminLocation()) {
+        window.history.pushState({}, '', '/');
+      }
+    } catch {
+      // Ignore restricted history API
+    }
+  }, []);
+
+  const handleReplayDemo = useCallback(() => {
+    try {
+      window.localStorage.removeItem(ONBOARDING_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+    dispatch({ type: 'ENTER_DEMO' });
+    setShowAdmin(false);
+    try {
+      if (isAdminLocation()) {
+        window.history.pushState({}, '', '/');
+      }
+    } catch {
+      // Ignore restricted history API
+    }
+  }, []);
 
   const handleCompleteDemo = useCallback(() => {
     dispatch({ type: 'COMPLETE_DEMO' });
@@ -79,10 +138,19 @@ export default function App() {
     dispatch({ type: 'RESET_SCAN' });
   }, []);
 
+  if (showAdmin) {
+    return (
+      <AdminPlatform
+        onOpenCamera={handleReturnToCamera}
+        onReplayDemo={handleReplayDemo}
+      />
+    );
+  }
+
   return (
     <main className="h-dvh w-screen overflow-hidden bg-black">
       {state.mode === 'demo' ? (
-        <DemoMode onComplete={handleCompleteDemo} />
+        <DemoMode onComplete={handleCompleteDemo} onOpenAdmin={handleOpenAdmin} />
       ) : (
         <LiveCameraView
           flashlightOn={state.flashlightOn}
@@ -94,6 +162,7 @@ export default function App() {
           onScanSucceeded={handleScanSucceeded}
           onScanFailed={handleScanFailed}
           onResetScan={handleResetScan}
+          onOpenAdmin={handleOpenAdmin}
         />
       )}
     </main>

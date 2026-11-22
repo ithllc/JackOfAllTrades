@@ -11,6 +11,8 @@ export const JACK_OF_SPADES_LOGO_URL =
 interface BrandMarkProps {
   compact?: boolean;
   subtitle?: string;
+  onClick?: () => void;
+  title?: string;
 }
 
 /**
@@ -18,11 +20,16 @@ interface BrandMarkProps {
  * paired with the "Jack of All Trades" wordmark. Includes a vector SVG playing-card
  * fallback so the logo never renders a broken image frame.
  */
-export const BrandMark: React.FC<BrandMarkProps> = ({ compact = false, subtitle }) => {
+export const BrandMark: React.FC<BrandMarkProps> = ({
+  compact = false,
+  subtitle,
+  onClick,
+  title,
+}) => {
   const [imgFailed, setImgFailed] = useState(false);
 
-  return (
-    <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
+  const innerContent = (
+    <>
       <div
         className={`relative shrink-0 overflow-hidden rounded-[5px] bg-[#FAF6EE] border border-white/30 shadow-md shadow-black/50 ${
           compact ? 'h-9 w-[27px]' : 'h-10 w-[30px] sm:h-11 sm:w-[33px]'
@@ -70,6 +77,26 @@ export const BrandMark: React.FC<BrandMarkProps> = ({ compact = false, subtitle 
           </span>
         )}
       </div>
+    </>
+  );
+
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        title={title || 'Open Jack of All Trades Admin Platform'}
+        aria-label={title || 'Open Jack of All Trades Admin Platform'}
+        className="group flex items-center gap-2 sm:gap-2.5 min-w-0 text-left cursor-pointer rounded-lg pr-1.5 py-0.5 transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400"
+      >
+        {innerContent}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
+      {innerContent}
     </div>
   );
 };

@@ -249,7 +249,7 @@ app.get('/healthz', (_req, res) => {
   });
 });
 
-app.get('/api/db/status', async (_req, res) => {
+app.get('/api/db/status', async (req, res) => {
   if (!pool) {
     return res.json({
       connected: false,
@@ -275,9 +275,11 @@ app.get('/api/db/status', async (_req, res) => {
       details: rows[0] ?? null,
     });
   } catch (err) {
-    return res.status(503).json({
+    const statusCode = req.query.strict === '1' ? 503 : 200;
+    return res.status(statusCode).json({
       connected: false,
       configured: true,
+      fallbackActive: true,
       transport: cloudSqlConfig.transport,
       connectionName: cloudSqlConfig.connectionName,
       target: cloudSqlConfig.hostSummary,

@@ -156,7 +156,7 @@ async function createApp() {
     });
   });
 
-  app.get('/api/db/status', async (_req: Request, res: Response) => {
+  app.get('/api/db/status', async (req: Request, res: Response) => {
     if (!pgPool) {
       return res.json({
         connected: false,
@@ -185,9 +185,11 @@ async function createApp() {
         details: rows[0] ?? null,
       });
     } catch (err) {
-      return res.status(503).json({
+      const statusCode = req.query.strict === '1' ? 503 : 200;
+      return res.status(statusCode).json({
         connected: false,
         configured: true,
+        fallbackActive: true,
         transport: cloudSqlConfig.transport,
         connectionName: cloudSqlConfig.connectionName,
         target: cloudSqlConfig.hostSummary,

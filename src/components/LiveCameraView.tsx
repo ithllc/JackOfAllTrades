@@ -31,6 +31,7 @@ interface LiveCameraViewProps {
   onScanSucceeded: (hotspot: HighlightHotspot) => void;
   onScanFailed: (message: string) => void;
   onResetScan: () => void;
+  onOpenAdmin?: () => void;
 }
 
 type VoicePhase = 'idle' | 'recording' | 'thinking' | 'speaking';
@@ -78,6 +79,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
   onScanSucceeded,
   onScanFailed,
   onResetScan,
+  onOpenAdmin,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fallbackCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -683,7 +685,18 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
 
       {/* TOP CONTROL: Brand Logo + Flashlight Toggle (zero technical settings) */}
       <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-3 px-5 pt-5 sm:px-8 sm:pt-6">
-        <BrandMark compact />
+        <BrandMark
+          compact
+          onClick={
+            onOpenAdmin
+              ? () => {
+                  stopAudioPlayback();
+                  onOpenAdmin();
+                }
+              : undefined
+          }
+          title="Open Admin Platform"
+        />
 
         <button
           type="button"
