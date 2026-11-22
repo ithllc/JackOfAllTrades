@@ -1,0 +1,102 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: jackofalltrades
+  namespace: 575313344781
+  selfLink: >-
+    /apis/serving.knative.dev/v1/namespaces/575313344781/services/jackofalltrades
+  uid: d328c3aa-5545-4134-bdb8-313064d1510d
+  resourceVersion: AAZg2B0wlno
+  generation: 14
+  creationTimestamp: '2026-11-21T23:16:12.959231Z'
+  labels:
+    managed-by: google-ai-studio
+    cloud.googleapis.com/location: us-east1
+  annotations:
+    serving.knative.dev/creator: devstar2273@gcplab.me
+    serving.knative.dev/lastModifier: devstar2273@gcplab.me
+    generativelanguage.googleapis.com/type: fullstack-applet
+    generativelanguage.googleapis.com/applet-id: 318df64b-963e-4184-bc72-eb2a36b88c18
+    run.googleapis.com/client-name: cloud-console
+    run.googleapis.com/ingress: all
+    run.googleapis.com/operation-id: cf7a47d5-417f-490e-b038-40c5a688cb8d
+    run.googleapis.com/ingress-status: all
+    run.googleapis.com/invoker-iam-disabled: 'true'
+    run.googleapis.com/maxScale: 1
+    run.googleapis.com/build-enable-automatic-updates: 'false'
+    run.googleapis.com/urls: >-
+      ["https://jackofalltrades-575313344781.us-east1.run.app","https://jackofalltrades-f7xgwgsrsq-ue.a.run.app"]
+spec:
+  template:
+    metadata:
+      labels:
+        run.googleapis.com/startupProbeType: Custom
+      annotations:
+        run.googleapis.com/sessionAffinity: 'true'
+        generativelanguage.googleapis.com/nonce: 693fef18-84d1-4cc6-b11c-17d9071834af
+        autoscaling.knative.dev/minScale: 0
+        run.googleapis.com/cloudsql-instances: gemini4nyc26nyc-2273:us-east1:free-trial-first-project
+        run.googleapis.com/client-name: cloud-console
+        run.googleapis.com/base-images: >-
+          {"app-container":"us-central1-docker.pkg.dev/serverless-runtimes/google-22/runtimes/nodejs22"}
+        run.googleapis.com/sources: >-
+          {"app-container":"gs://run-sources-gemini4nyc26nyc-2273-us-east1/services/jackofalltrades/1795330622.028-1a74736d.tar.gz"}
+        run.googleapis.com/cpu-throttling: 'true'
+    spec:
+      containerConcurrency: 1000
+      timeoutSeconds: 300
+      serviceAccountName: 575313344781-compute@developer.gserviceaccount.com
+      containers:
+      - name: app-container
+        image: scratch
+        command:
+        - /bin/sh
+        args:
+        - '-c'
+        - if [ -f server.js ]; then node server.js; else npm start; fi
+        ports:
+        - name: http1
+          containerPort: 3000
+        env:
+        - name: SQL_DB_NAME
+          value: stuff
+        - name: DB_PORT
+          value: stuff
+        - name: SQL_PUBLIC_IP
+          value: stuff
+        - name: AUTH_ENFORCEMENT_MODE
+          value: No_Value
+        - name: DB_HOST
+          value: stuff
+        - name: SQL_PORT
+          value: stuff
+        - name: SQL_CONNECTION_NAME
+          value: stuff
+        - name: DB_NAME
+          value: stuff
+        - name: DB_USER
+          value: stuff
+        - name: SQL_OUTGOING_IP
+          value: stuff
+        - name: DB_PASS
+          value: stuff
+        - name: SQL_SSL
+          value: 'false'
+        - name: GEMINI_API_KEY
+          value: stuff
+        - name: APP_URL
+          value: stuff
+        resources:
+          limits:
+            cpu: 1
+            memory: 3Gi
+        startupProbe:
+          timeoutSeconds: 1
+          periodSeconds: 1
+          failureThreshold: 10
+          tcpSocket:
+            port: 3000
+      runtimeClassName: run.googleapis.com/linux-base-image-update
+  traffic:
+  - percent: 100
+    latestRevision: true
