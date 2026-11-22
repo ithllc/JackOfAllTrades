@@ -20,11 +20,12 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci
 
-# Copy application source and compile the production PWA bundle + Service Worker
-COPY index.html vite.config.ts tsconfig.json ./
+# Copy application source and compile the production PWA bundle + unified backend
+COPY index.html vite.config.ts tsconfig.json server.ts ./
 COPY public ./public
 COPY src ./src
-RUN npm run build
+RUN npm run build && \
+    npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.mjs
 
 # -----------------------------------------------------------------------------
 # Stage 2: Minimal Production Runtime Image (Cloud Run Stateless Container)
@@ -46,9 +47,11 @@ ENV NODE_ENV=production \
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-# Copy built static PWA assets from Stage 1 and the production Express server
+# Copy built static PWA assets + compiled unified Express server + AGPL-3.0 deliverables
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/server.mjs ./server.mjs
 COPY server.js ./server.js
+COPY App.jsx ./App.jsx
 COPY schema.sql ./schema.sql
 COPY LICENSE ./LICENSE
 COPY docs ./docs
@@ -60,9 +63,9 @@ USER node
 # Expose Google Cloud Run's standard HTTP port
 EXPOSE 8080
 
-# Container healthcheck targeting the Express /healthz endpoint
+# Container healthcheck targeting the Cloud Run-safe Express /api/health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/healthz || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:${PORT}/api/health || exit 1
 
-# Launch the stateless Express backend (API proxy + WebRTC signaling + PWA static host)
-CMD ["node", "server.js"]
+# Launch the unified Express backend (API proxy + Cloud SQL pgvector + Scale Guard + PWA static host)
+CMD ["node", "server.mjs"]

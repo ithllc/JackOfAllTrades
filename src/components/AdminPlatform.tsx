@@ -84,9 +84,9 @@ const DEFAULT_FLYWHEEL: FlywheelMetrics = {
 const API_ENDPOINTS = [
   {
     method: 'GET',
-    path: '/healthz',
+    path: '/api/health',
     service: 'Express + Cloud Run',
-    purpose: 'Liveness probe, Gemini key status, and Cloud SQL transport summary',
+    purpose: 'Cloud Run–safe liveness probe, Gemini key status, and Cloud SQL transport summary',
   },
   {
     method: 'GET',
@@ -171,27 +171,51 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
   const [voiceTestNote, setVoiceTestNote] = useState<string>('');
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
+  const fetchJsonSafe = useCallback(async <T,>(url: string): Promise<T | null> => {
+    try {
+      const resp = await fetch(url, { headers: { Accept: 'application/json' } });
+      const contentType = resp.headers.get('content-type') || '';
+      if (!resp.ok || !contentType.includes('application/json')) {
+        return null;
+      }
+      return (await resp.json()) as T;
+    } catch {
+      return null;
+    }
+  }, []);
+
   const loadSystemData = useCallback(async () => {
     setRefreshing(true);
     try {
       const [healthRes, dbRes, treeRes] = await Promise.all([
-        fetch('/healthz').then((r) => r.json()),
-        fetch('/api/db/status').then((r) => r.json()),
-        fetch('/api/ontology/tree').then((r) => r.json()),
+        fetchJsonSafe<HealthPayload>('/api/health'),
+        fetchJsonSafe<DbStatusPayload>('/api/db/status'),
+        fetchJsonSafe<{
+          source?: string;
+          tree?: OntologyHierarchyRow[];
+          nodes?: OntologyComponentNode[];
+          feedbackLog?: OntologyFeedbackRecord[];
+          flywheel?: FlywheelMetrics;
+        }>('/api/ontology/tree'),
       ]);
-      setHealth(healthRes);
-      setDbStatus(dbRes);
-      setOntologySource(treeRes.source || 'in_memory_cte_parity');
-      setTree(Array.isArray(treeRes.tree) ? treeRes.tree : []);
-      setNodes(Array.isArray(treeRes.nodes) ? treeRes.nodes : []);
-      setFeedbackLog(Array.isArray(treeRes.feedbackLog) ? treeRes.feedbackLog : []);
-      if (treeRes.flywheel) setFlywheel(treeRes.flywheel);
-    } catch {
-      // Keep previous data on transient error
+
+      if (healthRes) {
+        setHealth(healthRes);
+      }
+      if (dbRes) {
+        setDbStatus(dbRes);
+      }
+      if (treeRes) {
+        setOntologySource(treeRes.source || 'in_memory_cte_parity');
+        setTree(Array.isArray(treeRes.tree) ? treeRes.tree : []);
+        setNodes(Array.isArray(treeRes.nodes) ? treeRes.nodes : []);
+        setFeedbackLog(Array.isArray(treeRes.feedbackLog) ? treeRes.feedbackLog : []);
+        if (treeRes.flywheel) setFlywheel(treeRes.flywheel);
+      }
     } finally {
       setRefreshing(false);
     }
-  }, []);
+  }, [fetchJsonSafe]);
 
   const loadDeliverables = useCallback(async () => {
     setDeliverablesLoading(true);
@@ -438,7 +462,11 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
 
               <div className="rounded-xl border border-slate-200 bg-white p-5">
                 <p className="text-xs font-medium text-slate-500">Cloud SQL (PostgreSQL 16)</p>
-                <p className="mt-2 text-xl font-bold text-slate-900">
+                <p
+                  className={`mt-2 text-xl font-bold ${
+                    dbStatus?.connected ? 'text-emerald-700' : 'text-slate-900'
+                  }`}
+                >
                   {dbStatus
                     ? dbStatus.connected
                       ? 'Connected'
@@ -448,7 +476,7 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
                     : 'Checking...'}
                 </p>
                 <p className="mt-1.5 font-mono text-[11px] text-slate-600 truncate">
-                  {health?.sqlTarget || 'InMemoryOntologyGraph parity'}
+                  {dbStatus?.target || health?.sqlTarget || 'InMemoryOntologyGraph parity'}
                 </p>
               </div>
 
@@ -560,7 +588,7 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
                   </h2>
                 </div>
                 <span className="font-mono text-xs text-slate-500">
-                  Transport: {health?.databaseTransport || 'detecting'}
+                  Transport: {dbStatus?.transport || health?.databaseTransport || 'detecting'}
                 </span>
               </div>
 
@@ -568,24 +596,41 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
                 <div>
                   <dt className="text-xs font-medium text-slate-500">Instance Connection Name</dt>
                   <dd className="mt-1 font-mono text-xs text-slate-900 break-all">
-                    {health?.sqlConnectionName || '—'}
+                    {dbStatus?.connectionName || health?.sqlConnectionName || '—'}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-xs font-medium text-slate-500">Public IP / Port</dt>
-                  <dd className="mt-1 font-mono text-xs text-slate-900 tabular-nums">
-                    {health ? `${health.sqlPublicIp}:${health.sqlPort}` : '—'}
+                  <dt className="text-xs font-medium text-slate-500">Active Target / Endpoint</dt>
+                  <dd className="mt-1 font-mono text-xs text-slate-900 break-all tabular-nums">
+                    {dbStatus?.target || (health ? `${health.sqlPublicIp}:${health.sqlPort}` : '—')}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-xs font-medium text-slate-500">Outgoing IP · TLS</dt>
+                  <dt className="text-xs font-medium text-slate-500">Database · pgvector · TLS</dt>
                   <dd className="mt-1 font-mono text-xs text-slate-900 tabular-nums">
-                    {health
-                      ? `${health.sqlOutgoingIp} · SSL ${health.sqlSslEnabled ? 'Enabled' : 'Disabled'}`
-                      : '—'}
+                    {dbStatus?.connected
+                      ? `${dbStatus.details?.database_name || 'postgres'} (${dbStatus.details?.db_user || 'postgres'}) · pgvector ${dbStatus.details?.pgvector_enabled ? 'ON' : 'OFF'} · ${
+                          dbStatus.transport === 'cloud_sql_socket'
+                            ? 'Proxy Encrypted'
+                            : dbStatus.sslEnabled
+                              ? 'TLS ON'
+                              : 'TLS OFF'
+                        }`
+                      : health
+                        ? `${health.sqlOutgoingIp} · SSL ${health.sqlSslEnabled ? 'Enabled' : 'Disabled'}`
+                        : '—'}
                   </dd>
                 </div>
               </dl>
+
+              {dbStatus?.connected && (
+                <p className="mt-4 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-950 leading-relaxed">
+                  <strong>Cloud SQL Connected:</strong> Live PostgreSQL 16 connection verified on{' '}
+                  <code className="font-mono">{dbStatus.target || dbStatus.connectionName}</code>{' '}
+                  (database <code className="font-mono">{dbStatus.details?.database_name || 'postgres'}</code>,{' '}
+                  pgvector {dbStatus.details?.pgvector_enabled ? 'enabled' : 'disabled'}).
+                </p>
+              )}
 
               {dbStatus && !dbStatus.connected && (dbStatus.error || dbStatus.message) && (
                 <p className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-950 leading-relaxed">

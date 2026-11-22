@@ -106,12 +106,29 @@ export function resolveCloudSqlPoolConfig(
   let transport: CloudSqlTransport;
 
   if (explicitHost) {
-    host = explicitHost;
     if (explicitHost.startsWith('/cloudsql/')) {
-      transport = 'cloud_sql_socket';
+      // If running inside Cloud Run / preview without the /cloudsql socket mounted,
+      // fall back cleanly to Cloud SQL Public IP TCP + TLS instead of failing on ENOENT.
+      if (Boolean(env.K_SERVICE?.trim()) && !checkSocketExists(explicitHost)) {
+        host = publicIp;
+        transport = 'public_ip_tcp';
+      } else {
+        host = explicitHost;
+        transport = 'cloud_sql_socket';
+      }
+    } else if (
+      explicitHost.toLowerCase() === 'postgres' &&
+      Boolean(env.K_SERVICE?.trim()) &&
+      publicIp
+    ) {
+      // Avoid unresolvable Docker-Compose hostname "postgres" inside Cloud Run / preview sandboxes
+      host = publicIp;
+      transport = 'public_ip_tcp';
     } else if (explicitHost === publicIp) {
+      host = explicitHost;
       transport = 'public_ip_tcp';
     } else {
+      host = explicitHost;
       transport = 'custom_tcp';
     }
   } else if (useUnixSocket) {

@@ -95,12 +95,28 @@ function resolveCloudSqlPoolConfig(env) {
   let host;
   let transport;
   if (explicitHost) {
-    host = explicitHost;
-    transport = explicitHost.startsWith('/cloudsql/')
-      ? 'cloud_sql_socket'
-      : explicitHost === publicIp
-        ? 'public_ip_tcp'
-        : 'custom_tcp';
+    if (explicitHost.startsWith('/cloudsql/')) {
+      if (Boolean(env.K_SERVICE?.trim()) && !fs.existsSync(explicitHost)) {
+        host = publicIp;
+        transport = 'public_ip_tcp';
+      } else {
+        host = explicitHost;
+        transport = 'cloud_sql_socket';
+      }
+    } else if (
+      explicitHost.toLowerCase() === 'postgres' &&
+      Boolean(env.K_SERVICE?.trim()) &&
+      publicIp
+    ) {
+      host = publicIp;
+      transport = 'public_ip_tcp';
+    } else if (explicitHost === publicIp) {
+      host = explicitHost;
+      transport = 'public_ip_tcp';
+    } else {
+      host = explicitHost;
+      transport = 'custom_tcp';
+    }
   } else if (useUnixSocket) {
     host = socketPath;
     transport = 'cloud_sql_socket';
@@ -132,7 +148,7 @@ function resolveCloudSqlPoolConfig(env) {
   }
 
   const sslCa = (env.SQL_SSL_CA || env.DB_SSL_CA || '').trim();
-  const sslFlag = (env.SQL_SSL ?? env.DB_SSL)?.trim().toLowerCase();
+  const sslFlag = (env.SQL_SSL ?? env.DB_SSL ?? 'true')?.trim().toLowerCase();
   const isLocalHost = LOCAL_SQL_HOSTS.has(host.toLowerCase());
   let ssl = false;
   if (sslCa) ssl = { ca: sslCa, rejectUnauthorized: true };
@@ -232,12 +248,13 @@ const rtcRooms = new Map();
 // -----------------------------------------------------------------------------
 // 3. Healthcheck & WebRTC Signaling Routes (ADR 002)
 // -----------------------------------------------------------------------------
-app.get('/healthz', (_req, res) => {
+app.get(['/api/health', '/healthz'], (_req, res) => {
   res.json({
     status: 'ok',
     service: 'jackofalltrades',
     license: 'AGPL-3.0-only',
     port: PORT,
+    postgresConfigured: Boolean(pool),
     databaseConnected: Boolean(pool),
     databaseTransport: cloudSqlConfig.transport,
     sqlConnectionName: cloudSqlConfig.connectionName,
@@ -246,6 +263,8 @@ app.get('/healthz', (_req, res) => {
     sqlPort: cloudSqlConfig.port,
     sqlSslEnabled: cloudSqlConfig.sslEnabled,
     sqlTarget: cloudSqlConfig.hostSummary,
+    geminiConfigured: Boolean(initGeminiClients()),
+    timestamp: new Date().toISOString(),
   });
 });
 

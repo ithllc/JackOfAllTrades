@@ -57,7 +57,10 @@ const isProduction = process.env.NODE_ENV === 'production';
 // -----------------------------------------------------------------------------
 // PostgreSQL Pool (ADR 001 — Object Method, Cloud SQL Auth Proxy + Public IP TLS)
 // -----------------------------------------------------------------------------
-const cloudSqlConfig = resolveCloudSqlPoolConfig(process.env);
+const cloudSqlConfig = resolveCloudSqlPoolConfig({
+  ...process.env,
+  SQL_SSL: 'true',
+});
 let pgPool: Pool | null = null;
 if (cloudSqlConfig.poolConfig) {
   pgPool = new Pool(cloudSqlConfig.poolConfig);
@@ -144,7 +147,7 @@ async function createApp() {
   // ---------------------------------------------------------------------------
   // Health & AGPL-3.0 Corresponding Source Disclosure Endpoints
   // ---------------------------------------------------------------------------
-  app.get('/healthz', (_req: Request, res: Response) => {
+  app.get(['/api/health', '/healthz'], (_req: Request, res: Response) => {
     res.json({
       status: 'ok',
       service: 'jackofalltrades',
@@ -308,8 +311,8 @@ async function createApp() {
       try {
         const vectorLiteral = `[${queryVector.map(Number).join(',')}]`;
         const { rows } = await pgPool.query(
-          'SELECT * FROM rag_search_ontology_subgraph($1::vector, $2, $3)',
-          [vectorLiteral, hasScaleAnchor, maxRows]
+          'SELECT * FROM rag_search_ontology_subgraph($1::vector, $2, $3, $4)',
+          [vectorLiteral, hasScaleAnchor, 0.55, maxRows]
         );
         return res.json({
           source: 'postgresql_pgvector',
@@ -437,12 +440,21 @@ async function createApp() {
 
     if (pgPool) {
       try {
-        await pgPool.query(
-          `INSERT INTO deflection_bounties (brand_id, bounty_usd, compute_cost_usd)
-           VALUES (1, 30.00, $1)`,
+        const sessionRes = await pgPool.query(
+          `INSERT INTO diagnostic_sessions (outcome, estimated_compute_usd, completed_at)
+           VALUES ('resolved_deflected', $1, NOW())
+           RETURNING id`,
           [safeCost]
         );
-        persistedToSql = true;
+        const sessionId = sessionRes.rows[0]?.id;
+        if (sessionId) {
+          await pgPool.query(
+            `INSERT INTO deflection_bounties (session_id, brand_id, bounty_usd, compute_cost_usd)
+             VALUES ($1, 1, 30.00, $2)`,
+            [sessionId, safeCost]
+          );
+          persistedToSql = true;
+        }
       } catch (err) {
         console.error('[PostgreSQL deflection_bounties fallback]', (err as Error).message);
       }

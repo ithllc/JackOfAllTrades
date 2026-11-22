@@ -146,3 +146,22 @@ test('supports DB_USER, DB_PASS, DB_NAME, and DB_HOST aliases for Cloud Run Unix
   assert.equal(result.poolConfig.password, 'test-special-&^#@\\-value');
   assert.equal(result.poolConfig.ssl, false);
 });
+
+test('falls back from Docker hostname postgres to Public IP TLS when K_SERVICE is set', () => {
+  const result = resolveCloudSqlPoolConfig(
+    {
+      K_SERVICE: 'preview-sandbox',
+      DB_HOST: 'postgres',
+      DB_NAME: 'postgres',
+      DB_USER: 'postgres',
+      DB_PASS: 'test-runtime-value',
+      SQL_SSL: 'true',
+    },
+    { socketExists: () => false }
+  );
+  assert.equal(result.transport, 'public_ip_tcp');
+  assert.equal(result.sslEnabled, true);
+  assert.equal(result.poolConfig?.host, DEFAULT_SQL_PUBLIC_IP);
+  assert.equal(result.poolConfig?.port, 5432);
+  assert.deepEqual(result.poolConfig?.ssl, { rejectUnauthorized: false });
+});
