@@ -538,4 +538,50 @@ INSERT INTO repair_actions (component_id, action_type, tool_required, tool_size_
     (10, 'rotate_clockwise','Flat-Blade Pry / Fingers', 'Finger grip — no wrench required',FALSE, 'clockwise', 'Follow the plastic wear-ramp indicators and twist the retaining clip 30 degrees CLOCKWISE to unlock the impeller cover.', 'Close-up fingers pressing and rotating dishwasher sump retaining clip 30 degrees clockwise to release cover', 0.9640)
 ON CONFLICT DO NOTHING;
 
+-- ============================================================================
+-- 8. AUTHENTICATION & RBAC SCAFFOLD (ADR 008 — END USERS & ADMIN OPERATORS)
+-- ============================================================================
+-- Supports both end-user accounts (`end_user`, `technician`) and Admin Platform
+-- operators (`admin`, `super_admin`) using salted `scrypt` password hashes or
+-- external OIDC / Firebase Auth subject bindings. All statements are idempotent.
+
+CREATE TABLE IF NOT EXISTS app_users (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email           TEXT NOT NULL UNIQUE,
+    display_name    TEXT NOT NULL DEFAULT '',
+    role            TEXT NOT NULL DEFAULT 'end_user'
+                        CHECK (role IN ('end_user', 'technician', 'admin', 'super_admin')),
+    auth_provider   TEXT NOT NULL DEFAULT 'email_password_scrypt'
+                        CHECK (auth_provider IN ('email_password_scrypt', 'oidc_google', 'firebase_auth')),
+    external_sub    TEXT UNIQUE,
+    password_hash   TEXT,
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    last_login_at   TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_app_users_role ON app_users (role);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+    token_sha256    TEXT NOT NULL UNIQUE,
+    role_snapshot   TEXT NOT NULL
+                        CHECK (role_snapshot IN ('end_user', 'technician', 'admin', 'super_admin')),
+    issued_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    revoked_at      TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expires ON auth_sessions (expires_at);
+
+-- Associate repair sessions with authenticated end users once login is enabled
+ALTER TABLE diagnostic_sessions
+    ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES app_users(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_diagnostic_sessions_user ON diagnostic_sessions (user_id);
+
 COMMIT;
+

@@ -2,10 +2,11 @@
  * Jack of All Trades — Admin & Operations Platform
  * License: GNU Affero General Public License v3.0 (AGPL-3.0-only)
  *
- * Accessible via `/admin`, `?admin=1`, or by clicking the Jack of Spades logo
- * in the camera header. Unifies live system health, Cloud SQL status,
- * PostgreSQL Recursive CTE & pgvector Ontology management, Architecture &
- * AGPL-3.0 source explorer, and Production Operations Runbook.
+ * Accessible ONLY via direct operator navigation to `/admin` (never linked from
+ * the end-user camera or demo views). Unifies live system health, Identity &
+ * RBAC scaffold status, Cloud SQL diagnostics, PostgreSQL Recursive CTE &
+ * pgvector Ontology management, Architecture & AGPL-3.0 source explorer, and
+ * Production Operations Runbook.
  */
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
@@ -25,6 +26,9 @@ import { JACK_OF_SPADES_LOGO_URL } from './BrandMark';
 import { ArchitectureBlueprint } from './ArchitectureBlueprint';
 import { OntologyExplorer, type FlywheelMetrics } from './OntologyExplorer';
 import { RunbookView } from './RunbookView';
+import { AdminAuthScaffoldCard, AdminLoginGate } from './AdminAuthScaffoldCard';
+import { useAuth } from '../lib/authContext';
+import { hasRequiredRole } from '../lib/authScaffold';
 import type {
   OntologyComponentNode,
   OntologyFeedbackRecord,
@@ -154,12 +158,37 @@ const API_ENDPOINTS = [
     service: 'AGPL-3.0 Disclosure',
     purpose: 'Serves schema.sql, server.ts, server.js, App.jsx, Dockerfile, docs, and LICENSE',
   },
+  {
+    method: 'GET',
+    path: '/api/auth/session',
+    service: 'RBAC Scaffold (ADR 008)',
+    purpose: 'Verifies optional Bearer token and reports enforcement mode + active principal',
+  },
+  {
+    method: 'GET',
+    path: '/api/auth/config',
+    service: 'RBAC Scaffold (ADR 008)',
+    purpose: 'Publishes supported identity providers, role hierarchy, and route access policies',
+  },
+  {
+    method: 'POST',
+    path: '/api/auth/login',
+    service: 'Cloud SQL app_users + scrypt',
+    purpose: 'Authenticates end users or admins and issues a signed HMAC-SHA256 Bearer token',
+  },
+  {
+    method: 'POST',
+    path: '/api/auth/logout',
+    service: 'Token Revocation Scaffold',
+    purpose: 'Revokes the caller’s active Bearer session token',
+  },
 ];
 
 export const AdminPlatform: React.FC<AdminPlatformProps> = ({
   onOpenCamera,
   onReplayDemo,
 }) => {
+  const { session, login, logout, authFetch } = useAuth();
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [dbStatus, setDbStatus] = useState<DbStatusPayload | null>(null);
@@ -183,18 +212,21 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
   const [voiceTestNote, setVoiceTestNote] = useState<string>('');
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  const fetchJsonSafe = useCallback(async <T,>(url: string): Promise<T | null> => {
-    try {
-      const resp = await fetch(url, { headers: { Accept: 'application/json' } });
-      const contentType = resp.headers.get('content-type') || '';
-      if (!resp.ok || !contentType.includes('application/json')) {
+  const fetchJsonSafe = useCallback(
+    async <T,>(url: string): Promise<T | null> => {
+      try {
+        const resp = await authFetch(url, { headers: { Accept: 'application/json' } });
+        const contentType = resp.headers.get('content-type') || '';
+        if (!resp.ok || !contentType.includes('application/json')) {
+          return null;
+        }
+        return (await resp.json()) as T;
+      } catch {
         return null;
       }
-      return (await resp.json()) as T;
-    } catch {
-      return null;
-    }
-  }, []);
+    },
+    [authFetch]
+  );
 
   const loadSystemData = useCallback(async () => {
     setRefreshing(true);
@@ -246,7 +278,7 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
 
   const handleRunRagSearch = useCallback(
     async (queryVector: number[]): Promise<OntologyRagMatch[]> => {
-      const resp = await fetch('/api/ontology/search', {
+      const resp = await authFetch('/api/ontology/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -259,12 +291,12 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
       const data = await resp.json();
       return Array.isArray(data.matches) ? data.matches : [];
     },
-    [scaleAnchor, hasWebXRDepth]
+    [authFetch, scaleAnchor, hasWebXRDepth]
   );
 
   const handleSubmitCorrection = useCallback(
     async (predictedId: number, correctedId: number, tag: string) => {
-      const resp = await fetch('/api/ontology/feedback', {
+      const resp = await authFetch('/api/ontology/feedback', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -280,11 +312,11 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
         if (data.flywheel) setFlywheel(data.flywheel);
       }
     },
-    []
+    [authFetch]
   );
 
   const handleRecordDeflection = useCallback(async () => {
-    const resp = await fetch('/api/ontology/deflection', {
+    const resp = await authFetch('/api/ontology/deflection', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ computeCostUsd: 1.45 }),
@@ -293,7 +325,7 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
       const data = await resp.json();
       if (data.flywheel) setFlywheel(data.flywheel);
     }
-  }, []);
+  }, [authFetch]);
 
   const handleTestDemoVoice = useCallback(async () => {
     setVoiceTestState('testing');
@@ -341,6 +373,15 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
     { id: 'architecture', label: 'Architecture' },
     { id: 'runbook', label: 'Runbook' },
   ];
+
+  // When AUTH_ENFORCEMENT_MODE=enforced is active on the server, require an admin session
+  const requiresAdminSignIn =
+    session.enforcementMode === 'enforced' &&
+    !hasRequiredRole(session.principal?.role ?? 'anonymous', 'admin');
+
+  if (requiresAdminSignIn) {
+    return <AdminLoginGate onLogin={login} onOpenCamera={onOpenCamera} />;
+  }
 
   return (
     <div className="min-h-dvh w-full bg-[#F7F8FA] text-slate-900 overflow-y-auto">
@@ -582,6 +623,9 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
                 </button>
               </div>
             </section>
+
+            {/* Identity, RBAC & Admin Isolation Scaffold (ADR 008) */}
+            <AdminAuthScaffoldCard session={session} onLogout={logout} />
 
             {/* Cloud SQL Connection Details & Diagnostics */}
             <section

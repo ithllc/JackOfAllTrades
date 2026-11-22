@@ -23,6 +23,7 @@ import {
 import { DemoMode } from './components/DemoMode';
 import { LiveCameraView } from './components/LiveCameraView';
 import { AdminPlatform } from './components/AdminPlatform';
+import { AuthProvider } from './lib/authContext';
 
 function readOnboardingCompletion(): boolean {
   if (typeof window === 'undefined') return false;
@@ -33,11 +34,15 @@ function readOnboardingCompletion(): boolean {
   }
 }
 
+/**
+ * Security Boundary (ADR 008):
+ * The Admin Platform is reachable ONLY via direct navigation to `/admin` (never via
+ * clickable UI links in the end-user camera/demo app or `?admin=1` query params).
+ */
 function isAdminLocation(): boolean {
   if (typeof window === 'undefined') return false;
   const pathname = window.location.pathname.toLowerCase();
-  const params = new URLSearchParams(window.location.search);
-  return pathname === '/admin' || pathname.startsWith('/admin/') || params.get('admin') === '1';
+  return pathname === '/admin' || pathname.startsWith('/admin/');
 }
 
 export default function App() {
@@ -73,17 +78,6 @@ export default function App() {
       // Ignore storage quota / private-browsing restrictions
     }
   }, [state.hasCompletedOnboarding]);
-
-  const handleOpenAdmin = useCallback(() => {
-    setShowAdmin(true);
-    try {
-      if (!isAdminLocation()) {
-        window.history.pushState({}, '', '/admin');
-      }
-    } catch {
-      // Ignore restricted history API in sandboxed iframes
-    }
-  }, []);
 
   const handleReturnToCamera = useCallback(() => {
     dispatch({ type: 'COMPLETE_DEMO' });
@@ -138,33 +132,32 @@ export default function App() {
     dispatch({ type: 'RESET_SCAN' });
   }, []);
 
-  if (showAdmin) {
-    return (
-      <AdminPlatform
-        onOpenCamera={handleReturnToCamera}
-        onReplayDemo={handleReplayDemo}
-      />
-    );
-  }
-
   return (
-    <main className="h-dvh w-screen overflow-hidden bg-black">
-      {state.mode === 'demo' ? (
-        <DemoMode onComplete={handleCompleteDemo} onOpenAdmin={handleOpenAdmin} />
-      ) : (
-        <LiveCameraView
-          flashlightOn={state.flashlightOn}
-          scanPhase={state.scanPhase}
-          activeHotspot={state.activeHotspot}
-          errorMessage={state.errorMessage}
-          onToggleFlashlight={handleToggleFlashlight}
-          onStartScan={handleStartScan}
-          onScanSucceeded={handleScanSucceeded}
-          onScanFailed={handleScanFailed}
-          onResetScan={handleResetScan}
-          onOpenAdmin={handleOpenAdmin}
+    <AuthProvider>
+      {showAdmin ? (
+        <AdminPlatform
+          onOpenCamera={handleReturnToCamera}
+          onReplayDemo={handleReplayDemo}
         />
+      ) : (
+        <main className="h-dvh w-screen overflow-hidden bg-black">
+          {state.mode === 'demo' ? (
+            <DemoMode onComplete={handleCompleteDemo} />
+          ) : (
+            <LiveCameraView
+              flashlightOn={state.flashlightOn}
+              scanPhase={state.scanPhase}
+              activeHotspot={state.activeHotspot}
+              errorMessage={state.errorMessage}
+              onToggleFlashlight={handleToggleFlashlight}
+              onStartScan={handleStartScan}
+              onScanSucceeded={handleScanSucceeded}
+              onScanFailed={handleScanFailed}
+              onResetScan={handleResetScan}
+            />
+          )}
+        </main>
       )}
-    </main>
+    </AuthProvider>
   );
 }

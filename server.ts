@@ -56,6 +56,21 @@ import {
   normalizeBoxToPct,
   normalizeMotionCue,
 } from './src/lib/ontologyMapper.ts';
+import {
+  ROUTE_ACCESS_POLICIES,
+  normalizeUserRole,
+  resolveAuthEnforcementMode,
+} from './src/lib/authScaffold.ts';
+import {
+  createRequireAuthMiddleware,
+  extractBearerToken,
+  isTokenRevoked,
+  revokeSessionToken,
+  signSessionToken,
+  verifyPasswordScrypt,
+  verifySessionToken,
+  type AuthenticatedRequest,
+} from './src/lib/serverAuth.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -156,6 +171,11 @@ async function createApp() {
   // Support 15-second frame buffers (up to 30 sampled JPEGs) + 3-shot high-contrast bursts
   app.use(express.json({ limit: '25mb' }));
 
+  // Role-Based Access Control middleware (ADR 008):
+  // Non-blocking in `AUTH_ENFORCEMENT_MODE=scaffold` (default); enforces 401/403 in `enforced` mode.
+  const requireEndUser = createRequireAuthMiddleware('end_user');
+  const requireAdmin = createRequireAuthMiddleware('admin');
+
   // ---------------------------------------------------------------------------
   // Health & AGPL-3.0 Corresponding Source Disclosure Endpoints
   // ---------------------------------------------------------------------------
@@ -164,6 +184,7 @@ async function createApp() {
       status: 'ok',
       service: 'jackofalltrades',
       license: 'AGPL-3.0-only',
+      authEnforcementMode: resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE),
       postgresConfigured: Boolean(pgPool),
       databaseTransport: cloudSqlConfig.transport,
       sqlConnectionName: cloudSqlConfig.connectionName,
@@ -177,7 +198,125 @@ async function createApp() {
     });
   });
 
-  app.get('/api/db/status', async (req: Request, res: Response) => {
+  // ---------------------------------------------------------------------------
+  // Authentication & RBAC Scaffold Endpoints (ADR 008: End Users + Admin)
+  // ---------------------------------------------------------------------------
+  app.get('/api/auth/config', (_req: Request, res: Response) => {
+    res.json({
+      enforcementMode: resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE),
+      supportedRoles: ['end_user', 'technician', 'admin', 'super_admin'],
+      supportedProviders: ['email_password_scrypt', 'oidc_google', 'firebase_auth'],
+      routePolicies: ROUTE_ACCESS_POLICIES,
+    });
+  });
+
+  app.get('/api/auth/session', (req: AuthenticatedRequest, res: Response) => {
+    const enforcementMode = resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
+    const bearer = extractBearerToken(req.headers.authorization);
+    const principal =
+      bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer) : null;
+
+    res.json({
+      authenticated: Boolean(principal),
+      enforcementMode,
+      principal,
+      supportedProviders: ['email_password_scrypt', 'oidc_google', 'firebase_auth'],
+    });
+  });
+
+  app.post('/api/auth/login', async (req: Request, res: Response) => {
+    const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password : '';
+    const enforcementMode = resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
+
+    if (!email || !password || email.length > 254 || password.length > 256) {
+      return res.status(400).json({
+        error: 'Please enter a valid email address and password.',
+        code: 'INVALID_CREDENTIALS_INPUT',
+      });
+    }
+
+    if (!pgPool) {
+      return res.status(501).json({
+        error:
+          'Authentication login is scaffolded and ready. Connect Cloud SQL and seed app_users (or enable an OIDC/Firebase provider) to activate sign-in.',
+        code: 'AUTH_SCAFFOLD_PENDING',
+        enforcementMode,
+      });
+    }
+
+    try {
+      const { rows } = await pgPool.query(
+        `SELECT id, email, display_name, role, auth_provider, password_hash, is_active
+           FROM app_users
+          WHERE LOWER(email) = LOWER($1)
+          LIMIT 1`,
+        [email]
+      );
+
+      const user = rows[0];
+      if (
+        !user ||
+        !user.is_active ||
+        typeof user.password_hash !== 'string' ||
+        !verifyPasswordScrypt(password, user.password_hash)
+      ) {
+        return res.status(401).json({
+          error: 'Invalid email or password.',
+          code: 'INVALID_CREDENTIALS',
+        });
+      }
+
+      const role = normalizeUserRole(user.role);
+      const { token, principal } = signSessionToken({
+        userId: String(user.id),
+        email: String(user.email),
+        displayName: String(user.display_name || user.email),
+        role,
+        provider:
+          user.auth_provider === 'oidc_google' || user.auth_provider === 'firebase_auth'
+            ? user.auth_provider
+            : 'email_password_scrypt',
+      });
+
+      await pgPool
+        .query('UPDATE app_users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1', [
+          user.id,
+        ])
+        .catch(() => undefined);
+
+      return res.json({
+        token,
+        principal,
+        enforcementMode,
+      });
+    } catch (err) {
+      const pgCode = (err as { code?: string })?.code;
+      // 42P01 = undefined_table (app_users not applied to Cloud SQL yet)
+      if (pgCode === '42P01') {
+        return res.status(501).json({
+          error:
+            'Auth tables are not yet applied in Cloud SQL. Run schema.sql (Section 8) to enable account sign-in.',
+          code: 'AUTH_SCHEMA_PENDING',
+          enforcementMode,
+        });
+      }
+      return res.status(503).json({
+        error: 'Authentication service is temporarily unavailable.',
+        code: 'AUTH_SERVICE_UNAVAILABLE',
+      });
+    }
+  });
+
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    const bearer = extractBearerToken(req.headers.authorization);
+    if (bearer) {
+      revokeSessionToken(bearer);
+    }
+    res.json({ status: 'signed_out' });
+  });
+
+  app.get('/api/db/status', requireAdmin, async (req: Request, res: Response) => {
     if (!pgPool) {
       return res.json({
         connected: false,
@@ -220,7 +359,7 @@ async function createApp() {
     }
   });
 
-  app.get('/api/deliverables', async (_req: Request, res: Response) => {
+  app.get('/api/deliverables', requireAdmin, async (_req: Request, res: Response) => {
     const deliverablePaths: Record<string, string> = {
       'schema.sql': path.join(__dirname, 'schema.sql'),
       'server.ts': path.join(__dirname, 'server.ts'),
@@ -492,7 +631,7 @@ async function createApp() {
   // ---------------------------------------------------------------------------
   // Ontology Graph API (ADR 001: Recursive CTEs + pgvector RAG + Test Case 2)
   // ---------------------------------------------------------------------------
-  app.get('/api/ontology/tree', async (req: Request, res: Response) => {
+  app.get('/api/ontology/tree', requireAdmin, async (req: Request, res: Response) => {
     const rootId = req.query.rootId ? Number(req.query.rootId) : undefined;
 
     if (pgPool) {
@@ -515,7 +654,7 @@ async function createApp() {
     });
   });
 
-  app.post('/api/ontology/search', async (req: Request, res: Response) => {
+  app.post('/api/ontology/search', requireAdmin, async (req: Request, res: Response) => {
     const {
       queryVector,
       scaleAnchor = 'none',
@@ -561,7 +700,7 @@ async function createApp() {
     });
   });
 
-  app.post('/api/ontology/feedback', async (req: Request, res: Response) => {
+  app.post('/api/ontology/feedback', requireEndUser, async (req: Request, res: Response) => {
     const {
       sessionId = null,
       predictedComponentId,
@@ -738,7 +877,7 @@ async function createApp() {
   });
 
   // Live End-User "This Fixed It!" Confirmation -> Deflection Bounty + Success Rate Boost
-  app.post('/api/ontology/confirm-fix', async (req: Request, res: Response) => {
+  app.post('/api/ontology/confirm-fix', requireEndUser, async (req: Request, res: Response) => {
     const { sessionId = null, componentId = null, computeCostUsd = 0.08 } = req.body ?? {};
     const safeCost = Number.isFinite(Number(computeCostUsd)) && Number(computeCostUsd) > 0 ? Number(computeCostUsd) : 0.08;
     let persistedToSql = false;
@@ -797,7 +936,7 @@ async function createApp() {
     });
   });
 
-  app.post('/api/ontology/deflection', async (req: Request, res: Response) => {
+  app.post('/api/ontology/deflection', requireAdmin, async (req: Request, res: Response) => {
     const computeCostUsd = Number(req.body?.computeCostUsd ?? 1.45);
     const safeCost = Number.isFinite(computeCostUsd) && computeCostUsd > 0 ? computeCostUsd : 1.45;
     let persistedToSql = false;
@@ -845,7 +984,7 @@ async function createApp() {
   // Step 1: Proxy 15-second frame buffer to `gemini-decision-1` (0 output tokens).
   // Step 2: ONLY call `gemini-4-neon` if Decisions API returns a high-confidence anomaly.
   // ---------------------------------------------------------------------------
-  app.post('/api/analyze-buffer', async (req: Request, res: Response) => {
+  app.post('/api/analyze-buffer', requireEndUser, async (req: Request, res: Response) => {
     const {
       frames = [],
       ingestMode = 'webrtc_15fps',
@@ -1352,7 +1491,7 @@ async function createApp() {
   // ---------------------------------------------------------------------------
   // LIVE SPATIAL OUTPUT: PiP Hand-Motion Loop (`gemini-omni-1.2-flash`)
   // ---------------------------------------------------------------------------
-  app.post('/api/generate-pip', async (req: Request, res: Response) => {
+  app.post('/api/generate-pip', requireEndUser, async (req: Request, res: Response) => {
     const { prompt, referenceFrameDataUrl, duration = '6s' } = req.body ?? {};
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'A motion guidance prompt is required.' });
@@ -1438,7 +1577,7 @@ async function createApp() {
   //      `audio/wav` bytes directly back to the browser when `Accept: audio/*`
   //      is requested (or JSON Base64 otherwise).
   // ---------------------------------------------------------------------------
-  app.post('/api/voice-assist', async (req: Request, res: Response) => {
+  app.post('/api/voice-assist', requireEndUser, async (req: Request, res: Response) => {
     const {
       frames = [],
       audio,
@@ -1930,7 +2069,7 @@ async function createApp() {
   // ---------------------------------------------------------------------------
   const spokenNoticeCache = new Map<string, { wavBuffer: Buffer; mimeType: string }>();
 
-  app.post('/api/speak-notice', async (req: Request, res: Response) => {
+  app.post('/api/speak-notice', requireEndUser, async (req: Request, res: Response) => {
     const rawText =
       typeof req.body?.text === 'string' && req.body.text.trim().length > 0
         ? req.body.text.trim().slice(0, 480)

@@ -24,6 +24,7 @@ Required environment variables (inject credentials via Google Secret Manager on 
 | `SQL_PUBLIC_IP` | Cloud SQL Public IPv4 address for direct TLS TCP fallback | `34.74.102.222` |
 | `SQL_OUTGOING_IP` | Cloud SQL instance Outgoing IPv4 address (for firewall allowlists) | `34.73.184.213` |
 | `SQL_SSL` | Enable TLS for Public IP TCP (`true`); automatically disabled on `/cloudsql/` Unix sockets | `true` |
+| `AUTH_ENFORCEMENT_MODE` | RBAC enforcement toggle (`scaffold` pre-rollout, `enforced` once login is enabled) | `scaffold` (switch to `enforced` at rollout) |
 
 **Unified Backend & Transport Auto-Detection (`server.ts` → `server.js` & `src/lib/dbConfig.ts`):**
 - **Single Source of Truth:** `Dockerfile` compiles `server.ts` directly into `server.js` (ESM) via `esbuild` and launches `CMD ["node", "server.js"]`. Keep `/server.js` synced whenever updating `/server.ts` (`npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js`).
@@ -179,5 +180,31 @@ node --check server.js
 
 Because Jack of All Trades is licensed under **GNU AGPL-3.0**, any organization modifying and hosting this service over a network (including Google Cloud Run deployments) MUST:
 - Preserve the `LICENSE` file and AGPL-3.0 copyright notices in all source files.
-- Provide a visible link in the PWA footer and `/api/source-disclosure` endpoint offering the complete Corresponding Source of the deployed revision at no charge.
+- Provide a visible link in the PWA footer and `/api/deliverables` endpoint offering the complete Corresponding Source of the deployed revision at no charge.
+
+---
+
+## 7. Authentication & RBAC Rollout Guide (End Users & Admin Platform — ADR 008)
+
+The Admin Platform (`/admin`) is already isolated from the end-user camera and demo screens (zero clickable links in the main PWA, and `?admin=1` is disabled). When you are ready to turn on mandatory accounts and role-based sign-in for both end users and admin operators:
+
+1. **Apply Auth Schema Tables in Cloud SQL (`schema.sql` Section 8):**
+   Run the idempotent `schema.sql` script against your PostgreSQL 16 database to create `app_users`, `auth_sessions`, and `diagnostic_sessions.user_id`.
+2. **Generate a Signing Secret & Store in Google Secret Manager:**
+   Generate a high-entropy 32-byte hex signing secret (`openssl rand -hex 32`) and mount it in Cloud Run via Secret Manager as `AUTH_SESSION_SECRET` (never commit signing secrets to `.env.example` or source control).
+3. **Seed Your First Admin Operator Account (`role = 'admin'` or `'super_admin'`):**
+   Generate a salted `scrypt` password hash using `hashPasswordScrypt()` from `src/lib/serverAuth.ts` (or bind an external `oidc_google` / `firebase_auth` subject in `external_sub`) and insert the operator row into `app_users`.
+4. **Enable Strict Server-Side Enforcement:**
+   Update Cloud Run runtime configuration to set `AUTH_ENFORCEMENT_MODE=enforced`.
+   - `/admin` automatically displays `<AdminLoginGate />` until an operator signs in with an `admin` or `super_admin` account.
+   - All admin APIs (`/api/db/status`, `/api/ontology/tree`, `/api/ontology/search`, `/api/ontology/deflection`, `/api/deliverables`) return `401` without a valid Bearer token and `403` for `end_user` tokens.
+   - All end-user repair APIs (`/api/analyze-buffer`, `/api/voice-assist`, `/api/generate-pip`, `/api/ontology/confirm-fix`, `/api/ontology/feedback`) require a verified `end_user` (or higher) Bearer token.
+5. **Verify Enforcement Before Go-Live:**
+   ```bash
+   # Should return HTTP 401 once AUTH_ENFORCEMENT_MODE=enforced
+   curl -i https://<CLOUD_RUN_URL>/api/db/status
+   # Should return enforcementMode: "enforced"
+   curl -fsS https://<CLOUD_RUN_URL>/api/auth/config
+   ```
+
 

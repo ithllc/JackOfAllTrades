@@ -7,7 +7,7 @@
 
 ---
 
-## 1. End-to-End System Topology (ADR 001 – ADR 007)
+## 1. End-to-End System Topology (ADR 001 – ADR 008)
 
 ```mermaid
 flowchart TB
@@ -278,7 +278,64 @@ sequenceDiagram
 
 ---
 
-## 7. Architecture Decision Records & Engineering Mitigations
+## 7. Authentication, RBAC & Admin Isolation Scaffold (ADR 008)
+
+Exposing the Admin & Operations Platform through a clickable logo or query parameter in the public end-user PWA creates an unnecessary privilege-discovery and unauthorized-access surface. Jack of All Trades enforces strict UI isolation immediately and scaffolds full Role-Based Access Control (RBAC) for both **End Users** (`end_user`, `technician`) and **Admin Operators** (`admin`, `super_admin`) so secure sign-in can be activated with zero schema or route refactoring.
+
+### Security Boundaries & Scaffold Components
+1. **Zero In-App Admin Links (Immediate Isolation):**
+   - `DemoMode.tsx` and `LiveCameraView.tsx` render `<BrandMark />` as a strictly non-interactive `<div>` with zero `onClick` handlers or admin routes.
+   - `src/App.tsx` restricts `isAdminLocation()` strictly to `/admin` and `/admin/*` (removing `?admin=1` query-string triggers). Operators access `/admin` directly by URL.
+2. **Shared Role Hierarchy & Route Policy Matrix (`src/lib/authScaffold.ts`):**
+   - Browser-safe contract defining `UserRole` (`anonymous < end_user < technician < admin < super_admin`), `hasRequiredRole()`, `resolveAuthEnforcementMode()`, and `ROUTE_ACCESS_POLICIES` partitioning public probes, end-user repair APIs (`/api/analyze-buffer`, `/api/voice-assist`, `/api/generate-pip`, `/api/ontology/confirm-fix`, `/api/ontology/feedback`), and admin APIs (`/api/db/status`, `/api/ontology/tree`, `/api/ontology/search`, `/api/ontology/deflection`, `/api/deliverables`).
+3. **Server-Side Cryptographic & Middleware Scaffold (`src/lib/serverAuth.ts` + `server.ts`):**
+   - Uses Node.js native `crypto.scryptSync` (16-byte random salt) + `crypto.timingSafeEqual` for password hashing/verification, and compact HMAC-SHA256 Bearer tokens (`signSessionToken` / `verifySessionToken`) signed with `process.env.AUTH_SESSION_SECRET` (falling back to an ephemeral 32-byte process key when unset).
+   - `createRequireAuthMiddleware(minimumRole)` is mounted on every end-user (`requireEndUser`) and admin (`requireAdmin`) API route. In `AUTH_ENFORCEMENT_MODE=scaffold` (default prior to login rollout), it attaches verified `req.authPrincipal` without interrupting workflows; flipping `AUTH_ENFORCEMENT_MODE=enforced` immediately enforces HTTP `401` (missing/invalid/revoked Bearer token) and `403` (insufficient role).
+   - Exposes `/api/auth/session`, `/api/auth/config`, `/api/auth/login` (parameterized Cloud SQL `app_users` lookup), and `/api/auth/logout` (token revocation).
+4. **In-Memory Client Token Boundary (`src/lib/authContext.tsx` + `src/components/AdminAuthScaffoldCard.tsx`):**
+   - `AuthProvider` stores any active `Authorization: Bearer` token strictly in React memory (`useRef`)—never in `localStorage` or `sessionStorage`.
+   - When `AUTH_ENFORCEMENT_MODE=enforced` is enabled, `/admin` automatically renders `<AdminLoginGate />` until an operator authenticates with `admin` or `super_admin` privileges.
+5. **Cloud SQL Identity Schema (`schema.sql` Section 8):**
+   - Idempotent `app_users` (`email`, `role`, `auth_provider` supporting `email_password_scrypt`, `oidc_google`, `firebase_auth`, `external_sub`, `password_hash`, `is_active`), `auth_sessions` (`token_sha256`, `role_snapshot`, `expires_at`, `revoked_at`), and `diagnostic_sessions.user_id` foreign key linking repairs to end-user accounts.
+
+```mermaid
+flowchart TB
+    subgraph PublicPWA["End-User PWA Surface (/) — Zero Links to /admin"]
+        DEMO_UI["DemoMode & LiveCameraView\nStatic Non-Clickable BrandMark"]
+        USER_AUTH["AuthProvider (React Memory Only)\nAuthorization: Bearer (No localStorage)"]
+    end
+
+    subgraph AdminSurface["Isolated Admin Surface (/admin — Direct URL Only)"]
+        ADMIN_GATE["AdminLoginGate\nActive when AUTH_ENFORCEMENT_MODE=enforced"]
+        ADMIN_UI["AdminPlatform\nOverview · Ontology · Architecture · Runbook"]
+    end
+
+    subgraph ExpressRBAC["Unified Express API (server.ts -> server.js)"]
+        AUTH_API["/api/auth/session · /config · /login · /logout\nscrypt + HMAC-SHA256 + timingSafeEqual"]
+        MW_USER["requireEndUser Middleware\nminimumRole: end_user"]
+        MW_ADMIN["requireAdmin Middleware\nminimumRole: admin"]
+        USER_ROUTES["Repair & Feedback APIs\n/api/analyze-buffer · /voice-assist · /generate-pip\n/ontology/confirm-fix · /ontology/feedback"]
+        ADMIN_ROUTES["Operations & Ontology APIs\n/api/db/status · /ontology/tree · /search\n/ontology/deflection · /deliverables"]
+    end
+
+    subgraph IdentityStore["Cloud SQL PostgreSQL 16 (schema.sql §8) / OIDC / Firebase Auth"]
+        USERS["app_users\nrole: end_user | technician | admin | super_admin"]
+        SESSIONS["auth_sessions\ntoken_sha256 · expires_at · revoked_at"]
+    end
+
+    DEMO_UI --> USER_AUTH
+    ADMIN_GATE --> ADMIN_UI
+    USER_AUTH -->|"Bearer Token (Memory)"| MW_USER --> USER_ROUTES
+    ADMIN_UI -->|"Bearer Token (Memory)"| MW_ADMIN --> ADMIN_ROUTES
+    USER_AUTH --> AUTH_API
+    ADMIN_GATE --> AUTH_API
+    AUTH_API <-->|"Parameterized SQL"| USERS
+    AUTH_API <-->|"Revocation / Audit"| SESSIONS
+```
+
+---
+
+## 8. Architecture Decision Records & Engineering Mitigations
 
 | ID | Architectural Problem | Adopted Design | Verification Standard |
 | :--- | :--- | :--- | :--- |
@@ -289,7 +346,9 @@ sequenceDiagram
 | **ADR 005** | Multi-step repairs need visual hand-motion guidance without pre-generating N expensive PiP videos upfront | Per-step `pipMotionPrompt` + `motionCue` + `targetBox` returned in `steps[]`; client generates 6s `gemini-omni-1.2-flash` clips strictly on demand per step and caches them in `stepVideos[stepNumber]` with a floating Mini-PiP window | Unit tests (`makerLensState.test.ts`) + live browser stepper verification |
 | **ADR 006 / Break 2** | "Scale" hallucination & hidden AR overlays covered by tall bottom sheets | Pixel-ratio measurement prompt (`24.26 mm` US quarter, `85.6 mm` card, `20 mm` thumb) returning `estimatedPartSizeMm`, `scaleMeasurementNote`, `targetBox`, and `anchorBox`, rendered via `<SpatialRepairOverlay/>` with animated directional SVG arrows and a compact sheet + **View AR** toggle | `resolveScaleCalibration()`, `normalizeBoxToPct()`, `SpatialRepairOverlay.tsx` |
 | **ADR 007** | Admin Ontology stayed static unless operators manually inserted rows | Automatic Cloud SQL write-back (`recordLiveDiagnosisToCloudSql`) logging every live Scan & Voice session, embedding frames via `gemini-embedding-2`, auto-inserting newly discovered parts, plus in-camera **Done — This Fixed It!** (`POST /api/ontology/confirm-fix`) and **Wrong Part or Size?** (`POST /api/ontology/feedback`) | `ontologyMapper.test.ts` + live `/api/ontology/tree` PostgreSQL verification |
+| **ADR 008** | Clickable brand logo in end-user PWA exposed `/admin` directly to end users; dual-audience login needed a clean security foundation | Removed all in-app admin links and `?admin=1` triggers; isolated `/admin` to direct URL access; added RBAC role/policy contract (`authScaffold.ts`), salted `scrypt` + HMAC-SHA256 middleware (`serverAuth.ts`), in-memory React `AuthProvider`, Cloud SQL `app_users`/`auth_sessions` schema, and enforced-mode `<AdminLoginGate />` | Unit tests (`authScaffold.test.ts`) + DOM isolation check + `401`/`403` middleware verification |
 | **Hardest Input** | Water-smeared lens + chrome glare + spraying water under a kitchen sink | Automatic downgrade from WebRTC video to 3-shot high-contrast burst photography + voice instruction | QA Test Case 1 (3G throttling / visual noise fallback) |
 | **UX Accessibility** | Technical camera telemetry overwhelms non-technical DIY users | Full-screen **Magic Window** UI (`LiveCameraView.tsx`) with only Scan, Push-to-Talk, and Flashlight controls + first-visit interactive `<DemoMode/>` | Unit tests (`makerLensState.test.ts`) + browser verification |
+
 
 

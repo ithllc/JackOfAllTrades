@@ -18,8 +18,6 @@ import { BrandMark } from './BrandMark';
 interface DemoModeProps {
   /** Called when the user finishes or skips onboarding to switch into Live Camera mode */
   onComplete: () => void;
-  /** Optional handler to open the Admin & Operations Platform */
-  onOpenAdmin?: () => void;
 }
 
 /**
@@ -33,7 +31,7 @@ interface DemoModeProps {
  *     while illuminating the active step card and syncing the battery-door animation
  *     (press latch -> slide cover -> lift cover open).
  */
-export const DemoMode: React.FC<DemoModeProps> = ({ onComplete, onOpenAdmin }) => {
+export const DemoMode: React.FC<DemoModeProps> = ({ onComplete }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioCacheRef = useRef<Map<DemoNarrationCueId, string>>(new Map());
@@ -280,11 +278,6 @@ export const DemoMode: React.FC<DemoModeProps> = ({ onComplete, onOpenAdmin }) =
     stopAllAudio();
     onComplete();
   }, [onComplete, stopAllAudio]);
-
-  const handleOpenAdmin = useCallback(() => {
-    stopAllAudio();
-    onOpenAdmin?.();
-  }, [onOpenAdmin, stopAllAudio]);
 
   // Smooth looping animation of a handheld remote's battery compartment (~20 fps).
   // Stays visually synchronized with the active narrated step:
@@ -543,11 +536,7 @@ export const DemoMode: React.FC<DemoModeProps> = ({ onComplete, onOpenAdmin }) =
 
       {/* Minimal Top Bar: Brand + Audio Guide Control + Skip to Live Camera */}
       <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-2 px-4 pt-5 sm:px-8 sm:pt-6">
-        <BrandMark
-          subtitle="Interactive Demo"
-          onClick={onOpenAdmin ? handleOpenAdmin : undefined}
-          title="Open Admin Platform"
-        />
+        <BrandMark subtitle="Interactive Demo" />
 
         <div className="flex items-center gap-2 shrink-0">
           <button

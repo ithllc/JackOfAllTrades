@@ -28,6 +28,7 @@ import { ScanningOverlay } from './ScanningOverlay';
 import { InstructionSheet } from './InstructionSheet';
 import { SpatialRepairOverlay } from './SpatialRepairOverlay';
 import { BrandMark } from './BrandMark';
+import { useAuth } from '../lib/authContext';
 
 interface LiveCameraViewProps {
   flashlightOn: boolean;
@@ -39,7 +40,6 @@ interface LiveCameraViewProps {
   onScanSucceeded: (hotspot: HighlightHotspot) => void;
   onScanFailed: (message: string) => void;
   onResetScan: () => void;
-  onOpenAdmin?: () => void;
 }
 
 type VoicePhase = 'idle' | 'recording' | 'thinking' | 'speaking';
@@ -96,8 +96,8 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
   onScanSucceeded,
   onScanFailed,
   onResetScan,
-  onOpenAdmin,
 }) => {
+  const { authFetch } = useAuth();
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const fallbackCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -427,7 +427,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
       stopAudioPlayback();
       setSpokenReply(text);
       try {
-        const resp = await fetch('/api/speak-notice', {
+        const resp = await authFetch('/api/speak-notice', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -493,7 +493,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         }
 
         // 3. Send audio + visual frames + scaleOptOut and request structured JSON + Base64 WAV
-        const resp = await fetch('/api/voice-assist', {
+        const resp = await authFetch('/api/voice-assist', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -696,7 +696,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
       }
 
       try {
-        const resp = await fetch('/api/analyze-buffer', {
+        const resp = await authFetch('/api/analyze-buffer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -829,7 +829,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
       setLoadingStepVideo(stepNumber);
       try {
         const frame = captureFrameDataUrl();
-        const resp = await fetch('/api/generate-pip', {
+        const resp = await authFetch('/api/generate-pip', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -848,7 +848,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         setLoadingStepVideo((curr) => (curr === stepNumber ? null : curr));
       }
     },
-    [captureFrameDataUrl, stepVideos]
+    [authFetch, captureFrameDataUrl, stepVideos]
   );
 
   // Live Self-Learning Flywheel: Confirm that the guided repair fixed the issue
@@ -856,7 +856,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     if (!activeHotspot || fixConfirmed || confirmingFix) return;
     setConfirmingFix(true);
     try {
-      const resp = await fetch('/api/ontology/confirm-fix', {
+      const resp = await authFetch('/api/ontology/confirm-fix', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -872,7 +872,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     } finally {
       setConfirmingFix(false);
     }
-  }, [activeHotspot, confirmingFix, fixConfirmed]);
+  }, [activeHotspot, authFetch, confirmingFix, fixConfirmed]);
 
   // Live Self-Learning Flywheel: Submit an end-user part/size correction to Cloud SQL
   const handleSubmitLiveCorrection = useCallback(
@@ -881,7 +881,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
       setSubmittingCorrection(true);
       try {
         const frame = captureFrameDataUrl();
-        const resp = await fetch('/api/ontology/feedback', {
+        const resp = await authFetch('/api/ontology/feedback', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -968,18 +968,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
 
       {/* TOP CONTROL: Brand Logo + Flashlight Toggle (zero technical settings) */}
       <header className="absolute inset-x-0 top-0 z-20 flex items-center justify-between gap-3 px-5 pt-5 sm:px-8 sm:pt-6">
-        <BrandMark
-          compact
-          onClick={
-            onOpenAdmin
-              ? () => {
-                  stopAudioPlayback();
-                  onOpenAdmin();
-                }
-              : undefined
-          }
-          title="Open Admin Platform"
-        />
+        <BrandMark compact />
 
         <button
           type="button"

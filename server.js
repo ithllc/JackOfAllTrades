@@ -1014,6 +1014,246 @@ function computeLiveFlywheelMetrics(agg) {
   };
 }
 
+// src/lib/authScaffold.ts
+var ROLE_WEIGHT = {
+  anonymous: 0,
+  end_user: 10,
+  technician: 20,
+  admin: 30,
+  super_admin: 40
+};
+function hasRequiredRole(actualRole, minimumRole) {
+  return ROLE_WEIGHT[actualRole] >= ROLE_WEIGHT[minimumRole];
+}
+function normalizeUserRole(raw) {
+  const cleaned = (raw || "").trim().toLowerCase();
+  if (cleaned === "end_user" || cleaned === "technician" || cleaned === "admin" || cleaned === "super_admin") {
+    return cleaned;
+  }
+  return "anonymous";
+}
+function resolveAuthEnforcementMode(raw) {
+  return (raw || "").trim().toLowerCase() === "enforced" ? "enforced" : "scaffold";
+}
+var ROUTE_ACCESS_POLICIES = [
+  {
+    method: "GET",
+    path: "/api/health",
+    audience: "public",
+    minimumRole: "anonymous",
+    description: "Cloud Run liveness & readiness probe"
+  },
+  {
+    method: "GET",
+    path: "/api/auth/session",
+    audience: "public",
+    minimumRole: "anonymous",
+    description: "Inspect current verified session principal and enforcement mode"
+  },
+  {
+    method: "POST",
+    path: "/api/auth/login",
+    audience: "public",
+    minimumRole: "anonymous",
+    description: "Authenticate an end user or admin operator and issue a Bearer token"
+  },
+  {
+    method: "POST",
+    path: "/api/auth/logout",
+    audience: "public",
+    minimumRole: "anonymous",
+    description: "Revoke the active Bearer session token"
+  },
+  {
+    method: "POST",
+    path: "/api/analyze-buffer",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "Scan Problem visual diagnosis, scale calibration & AR steps"
+  },
+  {
+    method: "POST",
+    path: "/api/voice-assist",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "Hold to Explain multilingual voice diagnosis & WAV synthesis"
+  },
+  {
+    method: "POST",
+    path: "/api/generate-pip",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "On-demand per-step PiP hand-motion video clip generation"
+  },
+  {
+    method: "POST",
+    path: "/api/ontology/confirm-fix",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "Confirm repair success and credit the self-learning ontology flywheel"
+  },
+  {
+    method: "POST",
+    path: "/api/ontology/feedback",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "Submit part/size corrections to refine Cloud SQL pgvector embeddings"
+  },
+  {
+    method: "GET",
+    path: "/api/db/status",
+    audience: "admin",
+    minimumRole: "admin",
+    description: "Cloud SQL PostgreSQL connectivity and pgvector extension diagnostics"
+  },
+  {
+    method: "GET",
+    path: "/api/ontology/tree",
+    audience: "admin",
+    minimumRole: "admin",
+    description: "Admin Ontology hierarchy inspection and B2B2C flywheel metrics"
+  },
+  {
+    method: "POST",
+    path: "/api/ontology/search",
+    audience: "admin",
+    minimumRole: "admin",
+    description: "Admin Scale Anchor Guard & pgvector RAG search console"
+  },
+  {
+    method: "POST",
+    path: "/api/ontology/deflection",
+    audience: "admin",
+    minimumRole: "admin",
+    description: "Manual B2B2C return-deflection ledger entry (Admin only)"
+  },
+  {
+    method: "GET",
+    path: "/api/deliverables",
+    audience: "admin",
+    minimumRole: "admin",
+    description: "Admin source & runbook inspector (AGPL-3.0 Corresponding Source)"
+  }
+];
+
+// src/lib/serverAuth.ts
+import crypto from "node:crypto";
+var DEFAULT_TOKEN_TTL_SEC = 60 * 60 * 8;
+var PROCESS_FALLBACK_SECRET = crypto.randomBytes(32).toString("hex");
+function resolveSessionSigningSecret(env = process.env) {
+  const configured = env.AUTH_SESSION_SECRET?.trim();
+  if (configured && configured.length >= 16) {
+    return configured;
+  }
+  return PROCESS_FALLBACK_SECRET;
+}
+function verifyPasswordScrypt(password, storedHash) {
+  const parts = storedHash.split("$");
+  if (parts.length !== 3 || parts[0] !== "scrypt") return false;
+  const [, salt, expectedHex] = parts;
+  if (!salt || !expectedHex) return false;
+  try {
+    const derived = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(expectedHex, "hex");
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
+}
+function signSessionToken(input, secret = resolveSessionSigningSecret()) {
+  const nowSec = Math.floor(Date.now() / 1e3);
+  const ttl = Math.max(60, input.ttlSeconds ?? DEFAULT_TOKEN_TTL_SEC);
+  const principal = {
+    userId: input.userId,
+    email: input.email,
+    displayName: input.displayName,
+    role: normalizeUserRole(input.role),
+    provider: input.provider,
+    issuedAt: nowSec,
+    expiresAt: nowSec + ttl
+  };
+  const payloadEncoded = Buffer.from(JSON.stringify(principal), "utf8").toString("base64url");
+  const signature = crypto.createHmac("sha256", secret).update(payloadEncoded).digest("base64url");
+  return {
+    token: `${payloadEncoded}.${signature}`,
+    principal
+  };
+}
+function verifySessionToken(token, secret = resolveSessionSigningSecret(), nowSec = Math.floor(Date.now() / 1e3)) {
+  if (!token || typeof token !== "string") return null;
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [payloadEncoded, providedSig] = parts;
+  if (!payloadEncoded || !providedSig) return null;
+  const expectedSig = crypto.createHmac("sha256", secret).update(payloadEncoded).digest("base64url");
+  const providedBuf = Buffer.from(providedSig, "utf8");
+  const expectedBuf = Buffer.from(expectedSig, "utf8");
+  if (providedBuf.length !== expectedBuf.length) return null;
+  if (!crypto.timingSafeEqual(providedBuf, expectedBuf)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadEncoded, "base64url").toString("utf8"));
+    if (typeof parsed.userId !== "string" || typeof parsed.email !== "string" || typeof parsed.expiresAt !== "number" || parsed.expiresAt <= nowSec) {
+      return null;
+    }
+    return {
+      userId: parsed.userId,
+      email: parsed.email,
+      displayName: typeof parsed.displayName === "string" ? parsed.displayName : parsed.email,
+      role: normalizeUserRole(parsed.role),
+      provider: parsed.provider === "oidc_google" || parsed.provider === "firebase_auth" ? parsed.provider : "email_password_scrypt",
+      issuedAt: typeof parsed.issuedAt === "number" ? parsed.issuedAt : nowSec,
+      expiresAt: parsed.expiresAt
+    };
+  } catch {
+    return null;
+  }
+}
+function extractBearerToken(authHeader) {
+  if (!authHeader || typeof authHeader !== "string") return null;
+  const match = authHeader.match(/^Bearer\s+([A-Za-z0-9._~+/=-]+)$/i);
+  return match ? match[1] : null;
+}
+var revokedTokenHashes = /* @__PURE__ */ new Set();
+function revokeSessionToken(token) {
+  if (!token) return;
+  const digest = crypto.createHash("sha256").update(token).digest("hex");
+  revokedTokenHashes.add(digest);
+}
+function isTokenRevoked(token) {
+  if (!token) return false;
+  const digest = crypto.createHash("sha256").update(token).digest("hex");
+  return revokedTokenHashes.has(digest);
+}
+function createRequireAuthMiddleware(minimumRole, options) {
+  return (req, res, next) => {
+    const mode = options?.enforcementMode ?? resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
+    const secret = options?.secret ?? resolveSessionSigningSecret();
+    const bearer = extractBearerToken(req.headers.authorization);
+    const principal = bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer, secret) : null;
+    req.authPrincipal = principal;
+    if (mode === "scaffold" || minimumRole === "anonymous") {
+      return next();
+    }
+    if (!principal) {
+      return res.status(401).json({
+        error: "Authentication required. Provide a valid Authorization: Bearer token.",
+        code: "AUTH_REQUIRED",
+        requiredRole: minimumRole
+      });
+    }
+    if (!hasRequiredRole(principal.role, minimumRole)) {
+      return res.status(403).json({
+        error: `Insufficient permissions. This endpoint requires "${minimumRole}" access.`,
+        code: "FORBIDDEN_ROLE",
+        requiredRole: minimumRole,
+        actualRole: principal.role
+      });
+    }
+    return next();
+  };
+}
+
 // server.ts
 var __filename = fileURLToPath(import.meta.url);
 var __dirname = path.dirname(__filename);
@@ -1074,11 +1314,14 @@ function extractErrorDetails(err) {
 async function createApp() {
   const app = express();
   app.use(express.json({ limit: "25mb" }));
+  const requireEndUser = createRequireAuthMiddleware("end_user");
+  const requireAdmin = createRequireAuthMiddleware("admin");
   app.get(["/api/health", "/healthz"], (_req, res) => {
     res.json({
       status: "ok",
       service: "jackofalltrades",
       license: "AGPL-3.0-only",
+      authEnforcementMode: resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE),
       postgresConfigured: Boolean(pgPool),
       databaseTransport: cloudSqlConfig.transport,
       sqlConnectionName: cloudSqlConfig.connectionName,
@@ -1091,7 +1334,96 @@ async function createApp() {
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     });
   });
-  app.get("/api/db/status", async (req, res) => {
+  app.get("/api/auth/config", (_req, res) => {
+    res.json({
+      enforcementMode: resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE),
+      supportedRoles: ["end_user", "technician", "admin", "super_admin"],
+      supportedProviders: ["email_password_scrypt", "oidc_google", "firebase_auth"],
+      routePolicies: ROUTE_ACCESS_POLICIES
+    });
+  });
+  app.get("/api/auth/session", (req, res) => {
+    const enforcementMode = resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
+    const bearer = extractBearerToken(req.headers.authorization);
+    const principal = bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer) : null;
+    res.json({
+      authenticated: Boolean(principal),
+      enforcementMode,
+      principal,
+      supportedProviders: ["email_password_scrypt", "oidc_google", "firebase_auth"]
+    });
+  });
+  app.post("/api/auth/login", async (req, res) => {
+    const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase() : "";
+    const password = typeof req.body?.password === "string" ? req.body.password : "";
+    const enforcementMode = resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
+    if (!email || !password || email.length > 254 || password.length > 256) {
+      return res.status(400).json({
+        error: "Please enter a valid email address and password.",
+        code: "INVALID_CREDENTIALS_INPUT"
+      });
+    }
+    if (!pgPool) {
+      return res.status(501).json({
+        error: "Authentication login is scaffolded and ready. Connect Cloud SQL and seed app_users (or enable an OIDC/Firebase provider) to activate sign-in.",
+        code: "AUTH_SCAFFOLD_PENDING",
+        enforcementMode
+      });
+    }
+    try {
+      const { rows } = await pgPool.query(
+        `SELECT id, email, display_name, role, auth_provider, password_hash, is_active
+           FROM app_users
+          WHERE LOWER(email) = LOWER($1)
+          LIMIT 1`,
+        [email]
+      );
+      const user = rows[0];
+      if (!user || !user.is_active || typeof user.password_hash !== "string" || !verifyPasswordScrypt(password, user.password_hash)) {
+        return res.status(401).json({
+          error: "Invalid email or password.",
+          code: "INVALID_CREDENTIALS"
+        });
+      }
+      const role = normalizeUserRole(user.role);
+      const { token, principal } = signSessionToken({
+        userId: String(user.id),
+        email: String(user.email),
+        displayName: String(user.display_name || user.email),
+        role,
+        provider: user.auth_provider === "oidc_google" || user.auth_provider === "firebase_auth" ? user.auth_provider : "email_password_scrypt"
+      });
+      await pgPool.query("UPDATE app_users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1", [
+        user.id
+      ]).catch(() => void 0);
+      return res.json({
+        token,
+        principal,
+        enforcementMode
+      });
+    } catch (err) {
+      const pgCode = err?.code;
+      if (pgCode === "42P01") {
+        return res.status(501).json({
+          error: "Auth tables are not yet applied in Cloud SQL. Run schema.sql (Section 8) to enable account sign-in.",
+          code: "AUTH_SCHEMA_PENDING",
+          enforcementMode
+        });
+      }
+      return res.status(503).json({
+        error: "Authentication service is temporarily unavailable.",
+        code: "AUTH_SERVICE_UNAVAILABLE"
+      });
+    }
+  });
+  app.post("/api/auth/logout", (req, res) => {
+    const bearer = extractBearerToken(req.headers.authorization);
+    if (bearer) {
+      revokeSessionToken(bearer);
+    }
+    res.json({ status: "signed_out" });
+  });
+  app.get("/api/db/status", requireAdmin, async (req, res) => {
     if (!pgPool) {
       return res.json({
         connected: false,
@@ -1131,7 +1463,7 @@ async function createApp() {
       });
     }
   });
-  app.get("/api/deliverables", async (_req, res) => {
+  app.get("/api/deliverables", requireAdmin, async (_req, res) => {
     const deliverablePaths = {
       "schema.sql": path.join(__dirname, "schema.sql"),
       "server.ts": path.join(__dirname, "server.ts"),
@@ -1332,7 +1664,7 @@ async function createApp() {
     }
     return { sessionId, componentId };
   }
-  app.get("/api/ontology/tree", async (req, res) => {
+  app.get("/api/ontology/tree", requireAdmin, async (req, res) => {
     const rootId = req.query.rootId ? Number(req.query.rootId) : void 0;
     if (pgPool) {
       try {
@@ -1352,7 +1684,7 @@ async function createApp() {
       flywheel: localOntology.getFlywheelMetrics()
     });
   });
-  app.post("/api/ontology/search", async (req, res) => {
+  app.post("/api/ontology/search", requireAdmin, async (req, res) => {
     const {
       queryVector,
       scaleAnchor = "none",
@@ -1390,7 +1722,7 @@ async function createApp() {
       matches
     });
   });
-  app.post("/api/ontology/feedback", async (req, res) => {
+  app.post("/api/ontology/feedback", requireEndUser, async (req, res) => {
     const {
       sessionId = null,
       predictedComponentId,
@@ -1545,7 +1877,7 @@ async function createApp() {
       });
     }
   });
-  app.post("/api/ontology/confirm-fix", async (req, res) => {
+  app.post("/api/ontology/confirm-fix", requireEndUser, async (req, res) => {
     const { sessionId = null, componentId = null, computeCostUsd = 0.08 } = req.body ?? {};
     const safeCost = Number.isFinite(Number(computeCostUsd)) && Number(computeCostUsd) > 0 ? Number(computeCostUsd) : 0.08;
     let persistedToSql = false;
@@ -1599,7 +1931,7 @@ async function createApp() {
       flywheel
     });
   });
-  app.post("/api/ontology/deflection", async (req, res) => {
+  app.post("/api/ontology/deflection", requireAdmin, async (req, res) => {
     const computeCostUsd = Number(req.body?.computeCostUsd ?? 1.45);
     const safeCost = Number.isFinite(computeCostUsd) && computeCostUsd > 0 ? computeCostUsd : 1.45;
     let persistedToSql = false;
@@ -1639,7 +1971,7 @@ async function createApp() {
       flywheel
     });
   });
-  app.post("/api/analyze-buffer", async (req, res) => {
+  app.post("/api/analyze-buffer", requireEndUser, async (req, res) => {
     const {
       frames = [],
       ingestMode = "webrtc_15fps",
@@ -2034,7 +2366,7 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
       });
     }
   });
-  app.post("/api/generate-pip", async (req, res) => {
+  app.post("/api/generate-pip", requireEndUser, async (req, res) => {
     const { prompt, referenceFrameDataUrl, duration = "6s" } = req.body ?? {};
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "A motion guidance prompt is required." });
@@ -2092,7 +2424,7 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
       });
     }
   });
-  app.post("/api/voice-assist", async (req, res) => {
+  app.post("/api/voice-assist", requireEndUser, async (req, res) => {
     const {
       frames = [],
       audio,
@@ -2465,7 +2797,7 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
     }
   });
   const spokenNoticeCache = /* @__PURE__ */ new Map();
-  app.post("/api/speak-notice", async (req, res) => {
+  app.post("/api/speak-notice", requireEndUser, async (req, res) => {
     const rawText = typeof req.body?.text === "string" && req.body.text.trim().length > 0 ? req.body.text.trim().slice(0, 480) : WHY_SCALE_MATTERS_SPOKEN;
     const lang = normalizeBcp47Language(
       typeof req.body?.language === "string" ? req.body.language : void 0,

@@ -85,8 +85,8 @@ export const BrandMark: React.FC<BrandMarkProps> = ({
       <button
         type="button"
         onClick={onClick}
-        title={title || 'Open Jack of All Trades Admin Platform'}
-        aria-label={title || 'Open Jack of All Trades Admin Platform'}
+        title={title || 'Jack of All Trades'}
+        aria-label={title || 'Jack of All Trades'}
         className="group flex items-center gap-2 sm:gap-2.5 min-w-0 text-left cursor-pointer rounded-lg pr-1.5 py-0.5 transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400"
       >
         {innerContent}

@@ -55,7 +55,7 @@ flowchart LR
 | **Motion Output** | `gemini-omni-1.2-flash` | Picture-in-Picture video loops illustrating hand motions and latch mechanisms. |
 | **Embeddings** | `gemini-embedding-2` | 768-dimensional visual signature vectors for instant ontology correction lift. |
 
-For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Records (ADR 001 – ADR 004), see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Records (ADR 001 – ADR 008), see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ---
 
@@ -65,26 +65,30 @@ For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Re
 .
 ├── server.ts                  # Unified Express + Vite dev/prod backend source (TypeScript)
 ├── server.js                  # Compiled Cloud Run production bundle (generated from server.ts)
-├── schema.sql                 # PostgreSQL 16 + pgvector schema, Recursive CTEs & seed data
+├── schema.sql                 # PostgreSQL 16 + pgvector schema, Recursive CTEs, Auth tables & seed data
 ├── Dockerfile                 # Multi-stage container (compiles server.ts -> server.js, Port 8080)
 ├── App.jsx                    # Standalone AGPL-3.0 reference client deliverable
 ├── docs/
-│   ├── ARCHITECTURE.md        # System topology, sequence diagrams, ER diagram & ADRs 001–007
-│   └── RUNBOOK.md             # Cloud SQL setup, Cloud Run env vars & deploy, QA matrix & playbooks
+│   ├── ARCHITECTURE.md        # System topology, sequence diagrams, ER diagram & ADRs 001–008
+│   └── RUNBOOK.md             # Cloud SQL setup, Cloud Run env vars & deploy, QA matrix & RBAC rollout
 ├── src/
-│   ├── App.tsx                # Root SPA router (DemoMode <-> LiveCameraView <-> AdminPlatform)
+│   ├── App.tsx                # Root SPA router (DemoMode <-> LiveCameraView; isolated /admin route)
 │   ├── components/
 │   │   ├── DemoMode.tsx       # Voice-narrated interactive battery-latch onboarding demo
 │   │   ├── LiveCameraView.tsx # Magic Window camera, Scan Problem, Hold-to-Explain & Stepper
 │   │   ├── SpatialRepairOverlay.tsx # Live AR bounding boxes, directional SVG cues & Mini-PiP
 │   │   ├── InstructionSheet.tsx # Compact multi-step guide, per-step PiP & Cloud SQL feedback
-│   │   ├── AdminPlatform.tsx  # 4-tab Admin & Operations Console (/admin)
+│   │   ├── AdminPlatform.tsx  # 4-tab Admin & Operations Console (/admin, direct URL only)
+│   │   ├── AdminAuthScaffoldCard.tsx # Admin RBAC status panel & enforced-mode AdminLoginGate
 │   │   ├── OntologyExplorer.tsx # Live Cloud SQL Recursive CTE hierarchy, RAG & M4/M6 feedback
 │   │   ├── ArchitectureBlueprint.tsx # Interactive topology + AGPL source copy/downloader
 │   │   ├── RunbookView.tsx    # QA verification launcher & embedded copyable operations runbook
 │   │   └── BrandMark.tsx      # Jack of Spades holding a claw hammer brand lockup
 │   └── lib/
 │       ├── audioUtils.ts      # MIME normalization, BCP-47 resolver & 3-sentence cap (+ tests)
+│       ├── authContext.tsx    # In-memory React Bearer token context (zero localStorage tokens)
+│       ├── authScaffold.ts    # Shared RBAC roles, hierarchy & API route policy matrix (+ tests)
+│       ├── serverAuth.ts      # Node scrypt hashing, HMAC-SHA256 tokens & requireAuth middleware
 │       ├── dbConfig.ts        # Cloud SQL Unix socket / Public IP TLS pool resolver (+ tests)
 │       ├── demoNarration.ts   # Synchronized onboarding script & visual phase mapping (+ tests)
 │       ├── makerLensState.ts  # Pure onboarding, multi-step hotspot & scan reducer (+ tests)
@@ -129,6 +133,7 @@ cp .env.example .env
 | `DB_USER` / `SQL_USER` | Optional | PostgreSQL application role. |
 | `DB_PASS` / `SQL_PASSWORD` | Optional | PostgreSQL password (inject via Secret Manager in production). |
 | `SQL_SSL` | Optional | Enable TLS over TCP (`true` by default; disabled automatically on `/cloudsql/` Unix sockets). |
+| `AUTH_ENFORCEMENT_MODE` | Optional | RBAC enforcement toggle (`scaffold` by default; set to `enforced` once login accounts are enabled). |
 
 ### 3. Run Locally
 
@@ -161,17 +166,17 @@ node --check server.js
 
 ## Accessing the Admin & Operations Platform
 
-To inspect system health, manage the ontology graph, or download corresponding source deliverables:
+For security isolation (**ADR 008**), the Admin & Operations Platform is **never linked or embedded** anywhere in the end-user Demo or Live Camera screens, and `?admin=1` query redirects are disabled.
 
-- Navigate directly to **`/admin`** (or **`/?admin=1`**), or
-- Click/tap the **Jack of Spades logo** in the top-left corner of the **Interactive Demo** or **Live Camera** view.
+- Operators access the console strictly by navigating directly to **`/admin`**.
+- When `AUTH_ENFORCEMENT_MODE=enforced` is activated, `/admin` automatically displays the **Operator Sign-In** gate requiring an `admin` or `super_admin` account.
 
 The console is organized into four tabs:
 
-1. **Overview** — Live Gemini 4 API status, Cloud SQL connection diagnostics, B2B2C return-deflection metrics, guided demo & TTS test controls, and the full backend API directory.
+1. **Overview** — Live Gemini 4 API status, Identity & RBAC scaffold status, Cloud SQL connection diagnostics, B2B2C return-deflection metrics, guided demo & TTS test controls, and the full backend API directory.
 2. **Ontology & RAG** — Interactive **Scale Anchor Guard Tester**, Recursive CTE component tree browser, vector similarity search, and instant M4/M6 correction feedback.
-3. **Architecture** — End-to-end topology visualization plus one-click copy/download for `schema.sql`, `server.js`, `App.jsx`, `Dockerfile`, `docs/ARCHITECTURE.md`, and `LICENSE`.
-4. **Runbook** — QA verification matrix (Test Cases 1–3) and the embedded production operations runbook.
+3. **Architecture** — End-to-end topology visualization plus one-click copy/download for `schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `LICENSE`.
+4. **Runbook** — QA verification matrix (Test Cases 1–4), RBAC rollout instructions, and the embedded copyable operations runbook.
 
 ---
 
@@ -179,19 +184,23 @@ The console is organized into four tabs:
 
 | Method | Endpoint | Description |
 | :--- | :--- | :--- |
-| `GET` | `/api/health` | Cloud Run–safe liveness probe (`/healthz` alias locally), Gemini API key status, and Cloud SQL transport summary. |
-| `GET` | `/api/db/status` | Live PostgreSQL 16 + `pgvector` connectivity probe (`?strict=1` returns HTTP `503` when unreachable). |
-| `POST` | `/api/analyze-buffer` | Runs `gemini-decision-1` gating → `gemini-4-neon` scale-calibrated multi-step diagnosis + live Cloud SQL write-back + WAV voiceover. |
-| `POST` | `/api/voice-assist` | Accepts recorded microphone audio + visual frames, detects spoken language, enforces Scale Anchor + multi-step AR diagnosis, logs to Cloud SQL, and returns same-language 24 kHz WAV speech. |
-| `POST` | `/api/speak-notice` | Synthesizes on-demand WAV voice guidance for single repair steps or scale opt-out explanations. |
+| `GET` | `/api/health` | Cloud Run–safe liveness probe (`/healthz` alias locally), Gemini API key status, auth mode, and Cloud SQL transport summary. |
+| `GET` | `/api/auth/session` | Inspects the active Bearer session principal and current RBAC enforcement mode (`scaffold` vs `enforced`). |
+| `GET` | `/api/auth/config` | Publishes supported auth providers, role hierarchy, and API route access policies (ADR 008). |
+| `POST` | `/api/auth/login` | Authenticates an end user or admin operator against `app_users` (`scrypt`) and issues a signed HMAC-SHA256 Bearer token. |
+| `POST` | `/api/auth/logout` | Revokes the caller's active Bearer session token. |
+| `GET` | `/api/db/status` | Live PostgreSQL 16 + `pgvector` connectivity probe (`?strict=1` returns HTTP `503` when unreachable). *(Admin RBAC)* |
+| `POST` | `/api/analyze-buffer` | Runs `gemini-decision-1` gating → `gemini-4-neon` scale-calibrated multi-step diagnosis + live Cloud SQL write-back + WAV voiceover. *(End-User RBAC)* |
+| `POST` | `/api/voice-assist` | Accepts recorded microphone audio + visual frames, detects spoken language, enforces Scale Anchor + multi-step AR diagnosis, logs to Cloud SQL, and returns same-language 24 kHz WAV speech. *(End-User RBAC)* |
+| `POST` | `/api/speak-notice` | Synthesizes on-demand WAV voice guidance for single repair steps or scale opt-out explanations. *(End-User RBAC)* |
 | `GET` | `/api/demo-narration` | Serves cached neural WAV voiceover clips (`?cue=intro\|step-1\|step-2\|step-3`) for the interactive onboarding demo. |
-| `POST` | `/api/generate-pip` | Generates an on-demand 6-second per-step hand-motion PiP video loop via `gemini-omni-1.2-flash`. |
-| `GET` | `/api/ontology/tree` | Returns the live Cloud SQL Recursive CTE hardware assembly hierarchy, learned components, feedback log, and flywheel metrics. |
-| `POST` | `/api/ontology/search` | Executes `pgvector` cosine RAG search with Break 2 Scale Anchor Guard enforcement. |
-| `POST` | `/api/ontology/feedback` | Records end-user part/size corrections, embeds frames via `gemini-embedding-2`, and updates or creates Cloud SQL ontology nodes immediately. |
-| `POST` | `/api/ontology/confirm-fix` | Marks a live diagnostic session `resolved_deflected`, updates `repair_actions.success_rate`, and logs a `$30` return-deflection bounty. |
-| `POST` | `/api/ontology/deflection` | Logs a verified B2B2C hardware return deflection bounty from the Admin console. |
-| `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source (`schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/*`, `LICENSE`) for the running revision. |
+| `POST` | `/api/generate-pip` | Generates an on-demand 6-second per-step hand-motion PiP video loop via `gemini-omni-1.2-flash`. *(End-User RBAC)* |
+| `GET` | `/api/ontology/tree` | Returns the live Cloud SQL Recursive CTE hardware assembly hierarchy, learned components, feedback log, and flywheel metrics. *(Admin RBAC)* |
+| `POST` | `/api/ontology/search` | Executes `pgvector` cosine RAG search with Break 2 Scale Anchor Guard enforcement. *(Admin RBAC)* |
+| `POST` | `/api/ontology/feedback` | Records end-user part/size corrections, embeds frames via `gemini-embedding-2`, and updates or creates Cloud SQL ontology nodes immediately. *(End-User RBAC)* |
+| `POST` | `/api/ontology/confirm-fix` | Marks a live diagnostic session `resolved_deflected`, updates `repair_actions.success_rate`, and logs a `$30` return-deflection bounty. *(End-User RBAC)* |
+| `POST` | `/api/ontology/deflection` | Logs a verified B2B2C hardware return deflection bounty from the Admin console. *(Admin RBAC)* |
+| `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source (`schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/*`, `LICENSE`) for the running revision. *(Admin RBAC)* |
 
 ---
 
@@ -207,5 +216,6 @@ Step-by-step `gcloud` commands, Cloud SQL Auth Proxy instructions, QA protocols,
 
 ## Security & Open-Source Licensing
 
-- **Server-Side Secret Isolation:** `GEMINI_API_KEY` and database credentials are strictly read on the Node.js server and are never bundled into or exposed to the browser client.
+- **Admin Isolation & RBAC Scaffold (ADR 008):** The end-user PWA contains zero links or redirects to `/admin`. Authentication tokens stay strictly in React memory (`Authorization: Bearer`, never in `localStorage`), password verification uses salted `scrypt` + constant-time comparison, and flipping `AUTH_ENFORCEMENT_MODE=enforced` activates full End-User & Admin RBAC across all protected routes.
+- **Server-Side Secret Isolation:** `GEMINI_API_KEY`, database passwords, and session signing keys are strictly read on the Node.js server and are never bundled into or exposed to the browser client.
 - **License (`AGPL-3.0-only`):** This project is licensed under the **GNU Affero General Public License v3.0**. See [`LICENSE`](./LICENSE) for full terms. Any modified version operated over a network must make its Corresponding Source freely available to users (exposed built-in via `/api/deliverables` and the `/admin` Architecture view).
