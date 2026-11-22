@@ -1,5 +1,17 @@
 import React from 'react';
-import { CheckCircle2, Play, RotateCcw, Volume2, VolumeX, Wrench, X } from 'lucide-react';
+import {
+  CheckCircle2,
+  Info,
+  Play,
+  RotateCcw,
+  Ruler,
+  ShieldCheck,
+  Square,
+  Volume2,
+  VolumeX,
+  Wrench,
+  X,
+} from 'lucide-react';
 import type { HighlightHotspot } from '../lib/makerLensState';
 
 interface InstructionSheetProps {
@@ -13,21 +25,28 @@ interface InstructionSheetProps {
   onRequestMotionVideo?: () => void;
   /** Optional 1-based step currently being narrated aloud so text & voice stay in sync */
   activeStepNumber?: number | null;
-  /** Whether guided voice narration is actively speaking */
+  /** Whether voice guidance is actively speaking */
   isSpeaking?: boolean;
-  /** Whether guided voice narration is muted */
+  /** Whether guided demo voice narration is muted */
   isAudioMuted?: boolean;
-  /** Toggle guided voice narration on/off */
+  /** Toggle guided demo voice narration on/off */
   onToggleAudio?: () => void;
+  /** Live-mode audio playback controls */
+  hasAudio?: boolean;
+  onReplayAudio?: () => void;
+  onStopAudio?: () => void;
   /** Replay or jump narration to a specific step when tapped */
   onSelectStep?: (stepNumber: number) => void;
+  /** Scale Anchor enforcement actions (Live Camera mode) */
+  onRescanWithAnchor?: () => void;
+  onOptOutScale?: () => void;
+  onReenableScale?: () => void;
 }
 
 /**
  * Accessible iOS-style bottom sheet presenting plain-English, step-by-step
- * repair instructions once the user taps a highlighted area.
- * During guided demo narration, highlights the active step in lockstep with
- * spoken audio and allows tapping any step to replay its voice instruction.
+ * repair instructions for BOTH Scan Problem and Hold to Explain flows,
+ * including real-time Scale Anchor calibration confirmation or opt-out guidance.
  */
 export const InstructionSheet: React.FC<InstructionSheetProps> = ({
   hotspot,
@@ -42,8 +61,16 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
   isSpeaking = false,
   isAudioMuted = false,
   onToggleAudio,
+  hasAudio = false,
+  onReplayAudio,
+  onStopAudio,
   onSelectStep,
+  onRescanWithAnchor,
+  onOptOutScale,
+  onReenableScale,
 }) => {
+  const scaleCal = !isDemo ? hotspot.scaleCalibration : null;
+
   return (
     <div
       className="fixed inset-x-0 bottom-0 z-40 flex justify-center px-3 pb-3 sm:px-6 sm:pb-6 pointer-events-none"
@@ -57,7 +84,7 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
           <span className="h-1 w-10 rounded-full bg-white/25" />
         </div>
 
-        <div className="px-5 pt-2 pb-5 sm:px-6 sm:pb-6 max-h-[70dvh] overflow-y-auto">
+        <div className="px-5 pt-2 pb-5 sm:px-6 sm:pb-6 max-h-[75dvh] overflow-y-auto">
           {/* Header Row */}
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
@@ -66,7 +93,9 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
                   ? isSpeaking && activeStepNumber
                     ? `Interactive Demo · Speaking Step ${activeStepNumber} of ${hotspot.steps.length}`
                     : 'Interactive Demo · Step-by-Step Guide'
-                  : 'Repair Guide'}
+                  : hotspot.sourceMode === 'voice'
+                    ? `Voice Repair Guide${hotspot.spokenLanguage ? ` · ${hotspot.spokenLanguage}` : ''}`
+                    : 'AI Repair Guide'}
               </p>
               <h2
                 id="instruction-sheet-title"
@@ -97,6 +126,25 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
                 </button>
               )}
 
+              {!isDemo && hasAudio && (onReplayAudio || onStopAudio) && (
+                <button
+                  type="button"
+                  onClick={() => (isSpeaking ? onStopAudio?.() : onReplayAudio?.())}
+                  aria-label={isSpeaking ? 'Stop spoken repair guidance' : 'Replay spoken repair guidance'}
+                  className={`flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 ${
+                    isSpeaking
+                      ? 'bg-amber-400 text-neutral-950 animate-pulse'
+                      : 'bg-white/10 text-amber-300 border border-amber-400/35 hover:bg-white/20'
+                  }`}
+                >
+                  {isSpeaking ? (
+                    <Square className="h-4 w-4 fill-current" aria-hidden="true" />
+                  ) : (
+                    <Volume2 className="h-4 w-4" aria-hidden="true" />
+                  )}
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={onClose}
@@ -108,7 +156,100 @@ export const InstructionSheet: React.FC<InstructionSheetProps> = ({
             </div>
           </div>
 
-          <p className="mt-2.5 text-sm leading-relaxed text-neutral-200">
+          {hotspot.userTranscript && (
+            <p className="mt-2 rounded-xl bg-white/6 px-3 py-2 text-xs text-neutral-300 italic">
+              You asked: “{hotspot.userTranscript}”
+            </p>
+          )}
+
+          {/* Scale Anchor Calibration Status Banner (Enforced across Scan & Hold-to-Explain) */}
+          {scaleCal && scaleCal.status === 'calibrated' && (
+            <div
+              role="status"
+              className="mt-3 rounded-2xl border border-emerald-400/40 bg-emerald-500/12 px-3.5 py-2.5"
+            >
+              <div className="flex items-start gap-2.5">
+                <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-emerald-400" aria-hidden="true" />
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold text-emerald-300">
+                    {scaleCal.bannerTitle}
+                  </p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-emerald-100/90">
+                    {scaleCal.bannerText}
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {scaleCal && scaleCal.status === 'needs_anchor' && (
+            <div
+              role="status"
+              className="mt-3 rounded-2xl border border-amber-400/45 bg-amber-400/12 px-3.5 py-3"
+            >
+              <div className="flex items-start gap-2.5">
+                <Ruler className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" aria-hidden="true" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-amber-300">
+                    {scaleCal.bannerTitle}
+                  </p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-amber-100/90">
+                    {scaleCal.bannerText}
+                  </p>
+                  <div className="mt-2.5 flex flex-wrap gap-2">
+                    {onRescanWithAnchor && (
+                      <button
+                        type="button"
+                        onClick={onRescanWithAnchor}
+                        className="inline-flex min-h-[38px] items-center justify-center rounded-full bg-amber-400 px-3.5 py-1.5 text-xs font-semibold text-neutral-950 hover:bg-amber-300 transition-colors cursor-pointer"
+                      >
+                        Re-Scan with Object
+                      </button>
+                    )}
+                    {onOptOutScale && (
+                      <button
+                        type="button"
+                        onClick={onOptOutScale}
+                        className="inline-flex min-h-[38px] items-center justify-center rounded-full border border-white/20 bg-white/10 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-white/20 transition-colors cursor-pointer"
+                      >
+                        Continue Without Scaling
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {scaleCal && scaleCal.status === 'opted_out' && (
+            <div
+              role="note"
+              className="mt-3 rounded-2xl border border-white/20 bg-white/8 px-3.5 py-3"
+            >
+              <div className="flex items-start gap-2.5">
+                <Info className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" aria-hidden="true" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-xs font-semibold text-white">
+                    {scaleCal.bannerTitle} — Why Using a Scale Object Matters
+                  </p>
+                  <p className="mt-1 text-xs leading-relaxed text-neutral-200">
+                    {scaleCal.whyScaleMatters}
+                  </p>
+                  {onReenableScale && (
+                    <button
+                      type="button"
+                      onClick={onReenableScale}
+                      className="mt-2 text-xs font-semibold text-amber-300 underline underline-offset-2 hover:text-amber-200 cursor-pointer"
+                    >
+                      Use a quarter, credit card, or thumb instead
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          <p className="mt-3 text-sm leading-relaxed text-neutral-200">
             {hotspot.summary}
           </p>
 

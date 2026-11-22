@@ -3,6 +3,8 @@
  * Decoupled from React/DOM so every state transition can be unit-tested cleanly.
  */
 
+import type { ScaleCalibrationResult } from './scaleCalibration';
+
 export type AppMode = 'demo' | 'live';
 export type ScanPhase = 'idle' | 'scanning' | 'result' | 'error';
 
@@ -34,6 +36,14 @@ export interface HighlightHotspot {
   toolNeeded: string;
   steps: RepairStep[];
   motionPrompt?: string;
+  /** Whether this fix came from Scan Problem or Hold to Explain voice assist */
+  sourceMode?: 'scan' | 'voice';
+  /** Detected spoken language name (e.g., Spanish, English) when from voice assist */
+  spokenLanguage?: string | null;
+  /** What the user said during Hold to Explain */
+  userTranscript?: string | null;
+  /** Authoritative Scale Calibration result (calibrated | needs_anchor | opted_out) */
+  scaleCalibration?: ScaleCalibrationResult | null;
 }
 
 export const DEMO_BATTERY_HOTSPOT: HighlightHotspot = {
@@ -210,8 +220,9 @@ export function makerLensReducer(
 }
 
 /**
- * Converts a backend `/api/analyze-buffer` payload into a non-technical,
- * human-friendly HighlightHotspot for the Magic Window overlay.
+ * Converts a backend `/api/analyze-buffer` or `/api/voice-assist` payload into a
+ * non-technical, human-friendly HighlightHotspot for the Magic Window overlay
+ * and step-by-step InstructionSheet.
  */
 export function buildHotspotFromDiagnosis(payload: {
   diagnosis?: {
@@ -219,45 +230,77 @@ export function buildHotspotFromDiagnosis(payload: {
     diagnosisSummary?: string;
     nextStepInstruction?: string;
     toolRequired?: string;
-    toolSizeSpec?: string;
+    toolSizeSpec?: string | null;
     scaleGuardBlocked?: boolean;
     pipMotionPrompt?: string;
+    steps?: Array<{ number?: number; title?: string; detail?: string }>;
   };
+  scaleCalibration?: ScaleCalibrationResult | null;
   voiceInstruction?: string;
+  spokenText?: string;
+  sourceMode?: 'scan' | 'voice';
+  spokenLanguage?: string | null;
+  userTranscript?: string | null;
 }): HighlightHotspot {
   const diag = payload.diagnosis;
   const label = diag?.componentName?.trim() || 'Highlighted Area';
   const summary =
     diag?.diagnosisSummary?.trim() ||
+    payload.spokenText?.trim() ||
     payload.voiceInstruction?.trim() ||
     'Hold steady while following the step below to adjust this part safely.';
   const primaryStep =
     diag?.nextStepInstruction?.trim() ||
     'Check the alignment gently before applying any force.';
 
+  const isCalibrated = payload.scaleCalibration?.status === 'calibrated';
+  const isSizeBlocked = Boolean(diag?.scaleGuardBlocked) || (payload.scaleCalibration != null && !isCalibrated);
+
   const toolLine =
-    diag?.toolRequired && diag?.toolSizeSpec && !diag.scaleGuardBlocked
+    diag?.toolRequired && diag?.toolSizeSpec && !isSizeBlocked
       ? `${diag.toolRequired} (${diag.toolSizeSpec})`
-      : diag?.toolRequired || 'No special tools needed';
+      : diag?.toolRequired
+        ? isSizeBlocked && !/pending|calibrat|scale/i.test(diag.toolRequired)
+          ? `${diag.toolRequired} (exact size pending scale)`
+          : diag.toolRequired
+        : 'No special tools needed';
 
-  const steps: RepairStep[] = [
-    {
-      number: 1,
-      title: 'Check the highlighted part',
-      detail: summary,
-    },
-    {
-      number: 2,
-      title: 'Follow the next step',
-      detail: primaryStep,
-    },
-  ];
+  let steps: RepairStep[];
+  if (Array.isArray(diag?.steps) && diag.steps.length > 0) {
+    steps = diag.steps
+      .filter((s) => s && (s.title?.trim() || s.detail?.trim()))
+      .slice(0, 4)
+      .map((s, idx) => ({
+        number: idx + 1,
+        title: s.title?.trim() || `Step ${idx + 1}`,
+        detail: s.detail?.trim() || primaryStep,
+      }));
+  } else {
+    steps = [
+      {
+        number: 1,
+        title: 'Check the highlighted part',
+        detail: summary,
+      },
+      {
+        number: 2,
+        title: 'Follow the next step',
+        detail: primaryStep,
+      },
+    ];
+  }
 
-  if (diag?.scaleGuardBlocked) {
+  if (
+    steps.length < 3 &&
+    diag?.scaleGuardBlocked &&
+    payload.scaleCalibration?.status !== 'opted_out' &&
+    payload.scaleCalibration?.status !== 'calibrated'
+  ) {
     steps.push({
-      number: 3,
+      number: steps.length + 1,
       title: 'Hold a coin beside the part for exact sizing',
-      detail: 'Place a standard coin or your thumb next to the fastener and tap Scan Problem again to confirm the exact tool size.',
+      detail:
+        'Place a quarter, credit card, or your thumb next to the part and scan again to confirm the exact tool size.',
     });
   }
 
@@ -272,5 +315,9 @@ export function buildHotspotFromDiagnosis(payload: {
     toolNeeded: toolLine,
     steps,
     motionPrompt: diag?.pipMotionPrompt,
+    sourceMode: payload.sourceMode ?? 'scan',
+    spokenLanguage: payload.spokenLanguage ?? null,
+    userTranscript: payload.userTranscript ?? null,
+    scaleCalibration: payload.scaleCalibration ?? null,
   };
 }

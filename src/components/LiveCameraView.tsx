@@ -17,6 +17,10 @@ import {
   formatRecordingDuration,
   pickBestRecorderMimeType,
 } from '../lib/audioUtils';
+import {
+  resolveScaleCalibration,
+  WHY_SCALE_MATTERS_SPOKEN,
+} from '../lib/scaleCalibration';
 import { ScanningOverlay } from './ScanningOverlay';
 import { InstructionSheet } from './InstructionSheet';
 import { BrandMark } from './BrandMark';
@@ -61,13 +65,22 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
+function base64ToBlobUrl(base64: string, mimeType: string): string {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  const blob = new Blob([bytes], { type: mimeType || 'audio/wav' });
+  return URL.createObjectURL(blob);
+}
+
 /**
- * The "Magic Window" Live Camera Screen with Native Two-Way Audio:
- * Full-screen camera feed with zero technical settings.
- * Controls:
- *   - Top: Flashlight toggle
- *   - Bottom: "Scan Problem" pill + "Hold to Explain" push-to-talk button
- *   - Hidden <audio> player that automatically speaks Gemini's binary WAV response aloud
+ * The "Magic Window" Live Camera Screen with Native Two-Way Audio & Scale Enforcement:
+ * Full-screen camera feed with zero technical clutter.
+ * Both "Scan Problem" AND "Hold to Explain" enforce Scale Anchoring (quarter, credit card,
+ * or thumb), confirm when scale is calibrated, allow opting out with a written + spoken
+ * summary of why scaling matters, and display the complete AI Fix sheet.
  */
 export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
   flashlightOn,
@@ -107,7 +120,10 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
   const [motionVideoUrl, setMotionVideoUrl] = useState<string | null>(null);
   const [loadingMotionVideo, setLoadingMotionVideo] = useState(false);
 
-  // Native two-way voice state
+  // Scale Anchor opt-out preference (user can tap Continue Without Scaling or say it aloud)
+  const [scaleOptOut, setScaleOptOut] = useState(false);
+
+  // Native two-way voice & spoken guidance state
   const [voicePhase, setVoicePhase] = useState<VoicePhase>('idle');
   const [recordingMs, setRecordingMs] = useState(0);
   const [spokenReply, setSpokenReply] = useState<string | null>(null);
@@ -172,6 +188,13 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
       if (responseAudioUrlRef.current) {
         URL.revokeObjectURL(responseAudioUrlRef.current);
         responseAudioUrlRef.current = null;
+      }
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        try {
+          window.speechSynthesis.cancel();
+        } catch {
+          // Ignore browser speech synthesis cleanup quirks
+        }
       }
     };
   }, []);
@@ -316,7 +339,6 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
   }, [cameraReady]);
 
   // Maintain a lightweight rolling buffer of up to 4 recent frames (every 2.5s)
-  // so Push-to-Talk always includes visual motion context before & during the question
   useEffect(() => {
     const sampleFrame = () => {
       if (scanPhase === 'scanning' || voicePhase === 'thinking' || sheetOpen) return;
@@ -330,34 +352,117 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     return () => window.clearInterval(timer);
   }, [captureFrameDataUrl, scanPhase, voicePhase, sheetOpen]);
 
-  // Stop any currently playing AI voice reply
+  // Stop any currently playing AI voice reply (HTMLAudioElement or SpeechSynthesis)
   const stopAudioPlayback = useCallback(() => {
     const player = audioPlayerRef.current;
     if (player) {
       player.pause();
       player.currentTime = 0;
     }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // Ignore browser quirks
+      }
+    }
     setVoicePhase((prev) => (prev === 'speaking' ? 'idle' : prev));
   }, []);
 
-  // Replay the last spoken mechanic response from the cached binary WAV Blob URL
-  const handleReplayAudio = useCallback(async () => {
+  // Play an Object URL WAV via the hidden <audio> element
+  const playAudioObjectUrl = useCallback(async (objectUrl: string) => {
+    if (responseAudioUrlRef.current) {
+      URL.revokeObjectURL(responseAudioUrlRef.current);
+    }
+    responseAudioUrlRef.current = objectUrl;
+    setHasReplyAudio(true);
+
     const player = audioPlayerRef.current;
-    if (!player || !responseAudioUrlRef.current) return;
+    if (!player) {
+      setVoicePhase('idle');
+      return;
+    }
+
+    player.src = objectUrl;
+    setVoicePhase('speaking');
+    await player.play().catch(() => {
+      // If browser autoplay blocks playback, user can tap the Replay button
+      setVoicePhase('idle');
+    });
+  }, []);
+
+  // Fallback browser speech synthesis when neural WAV is unavailable
+  const speakFallbackBrowserVoice = useCallback((text: string, lang?: string) => {
+    if (!text.trim() || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+      return;
+    }
     try {
-      player.currentTime = 0;
-      setVoicePhase('speaking');
-      await player.play();
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = lang || navigator.language || 'en-US';
+      utterance.rate = 0.98;
+      utterance.onstart = () => setVoicePhase('speaking');
+      utterance.onend = () => setVoicePhase('idle');
+      utterance.onerror = () => setVoicePhase('idle');
+      window.speechSynthesis.speak(utterance);
     } catch {
       setVoicePhase('idle');
     }
   }, []);
 
-  // Package recorded audio Blob + rolling visual buffer -> POST /api/voice-assist -> play binary WAV
+  // Speak a short notice (e.g., why scaling matters after opting out) via neural TTS + fallback
+  const speakNoticeText = useCallback(
+    async (text: string, lang?: string) => {
+      stopAudioPlayback();
+      setSpokenReply(text);
+      try {
+        const resp = await fetch('/api/speak-notice', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text,
+            language: lang || (typeof navigator !== 'undefined' ? navigator.language : 'en-US'),
+          }),
+        });
+        if (resp.ok && (resp.headers.get('content-type') || '').includes('audio/')) {
+          const wavBlob = await resp.blob();
+          const url = URL.createObjectURL(wavBlob);
+          await playAudioObjectUrl(url);
+          return;
+        }
+      } catch {
+        // Fall through to browser voice synthesis
+      }
+      speakFallbackBrowserVoice(text, lang);
+    },
+    [playAudioObjectUrl, speakFallbackBrowserVoice, stopAudioPlayback]
+  );
+
+  // Replay the last spoken mechanic response from the cached binary WAV Blob URL
+  const handleReplayAudio = useCallback(async () => {
+    const player = audioPlayerRef.current;
+    if (player && responseAudioUrlRef.current) {
+      try {
+        player.currentTime = 0;
+        setVoicePhase('speaking');
+        await player.play();
+        return;
+      } catch {
+        setVoicePhase('idle');
+      }
+    }
+    if (spokenReply) {
+      speakFallbackBrowserVoice(spokenReply);
+    }
+  }, [speakFallbackBrowserVoice, spokenReply]);
+
+  // Package recorded audio Blob + rolling visual buffer -> POST /api/voice-assist
+  // Shows BOTH the spoken multilingual reply AND the complete structured AI Fix sheet!
   const sendVoiceExplainPayload = useCallback(
     async (audioBlob: Blob) => {
       setVoicePhase('thinking');
       setVoiceNotice(null);
+      setMotionVideoUrl(null);
 
       try {
         // 1. Encode recorded MediaRecorder Blob into a Base64 data URL
@@ -370,16 +475,19 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
           frames.push({ timestampMs: Date.now(), dataUrl: latestFrame });
         }
 
-        // 3. Send both raw audio + visual frames and request a binary WAV stream (`Accept: audio/wav`)
+        // 3. Send audio + visual frames + scaleOptOut and request structured JSON + Base64 WAV
         const resp = await fetch('/api/voice-assist', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            Accept: 'audio/wav',
+            Accept: 'application/json',
           },
           body: JSON.stringify({
             frames: frames.slice(-4),
             preferredLanguage: typeof navigator !== 'undefined' ? navigator.language : 'en-US',
+            scaleAnchor: 'none',
+            hasWebXRDepth: false,
+            scaleOptOut,
             audio: {
               data: audioDataUrl,
               mimeType: audioBlob.type || 'audio/webm',
@@ -387,62 +495,49 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
           }),
         });
 
+        const data = await resp.json().catch(() => ({}));
         if (!resp.ok) {
-          const errJson = await resp.json().catch(() => ({}));
           throw new Error(
-            typeof errJson?.error === 'string'
-              ? errJson.error
+            typeof data?.error === 'string'
+              ? data.error
               : "Couldn't hear that clearly. Hold the button a moment longer and try again."
           );
         }
 
-        // 4. Decode binary WAV response directly into a playable Blob URL
-        const contentType = resp.headers.get('Content-Type') || 'audio/wav';
-        let audioObjectUrl: string;
-        let transcript = '';
-        let detectedLangName = '';
+        const transcriptText = typeof data.spokenText === 'string' ? data.spokenText : '';
+        const detectedLangName =
+          typeof data.detectedLanguageName === 'string' ? data.detectedLanguageName : null;
 
-        if (contentType.includes('audio/')) {
-          const wavBlob = await resp.blob();
-          audioObjectUrl = URL.createObjectURL(wavBlob);
-          const rawHeader = resp.headers.get('X-MakerLens-Transcript');
-          const rawLangHeader = resp.headers.get('X-MakerLens-Language-Name');
-          transcript = rawHeader ? decodeURIComponent(rawHeader) : '';
-          detectedLangName = rawLangHeader ? decodeURIComponent(rawLangHeader) : '';
-        } else {
-          // Fallback if server returned JSON Base64
-          const json = await resp.json();
-          transcript = json.spokenText || '';
-          detectedLangName = json.detectedLanguageName || '';
-          const binary = window.atob(json.audioBase64 || '');
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i += 1) {
-            bytes[i] = binary.charCodeAt(i);
-          }
-          const wavBlob = new Blob([bytes], { type: json.audioMimeType || 'audio/wav' });
-          audioObjectUrl = URL.createObjectURL(wavBlob);
+        if (transcriptText) {
+          setSpokenReply(transcriptText);
+        }
+        setSpokenLanguage(detectedLangName);
+
+        // If user verbally declined scaling (e.g., "I don't want to scale"), persist opt-out for session
+        if (data.scaleCalibration?.optedOut) {
+          setScaleOptOut(true);
         }
 
-        // Revoke previous audio object URL to avoid memory leaks
-        if (responseAudioUrlRef.current) {
-          URL.revokeObjectURL(responseAudioUrlRef.current);
-        }
-        responseAudioUrlRef.current = audioObjectUrl;
-        setHasReplyAudio(true);
-        if (transcript) {
-          setSpokenReply(transcript);
-        }
-        setSpokenLanguage(detectedLangName || null);
-
-        // 5. Automatically play the binary WAV speech via the hidden <audio> element
-        const player = audioPlayerRef.current;
-        if (player) {
-          player.src = audioObjectUrl;
-          setVoicePhase('speaking');
-          await player.play().catch(() => {
-            // If browser autoplay blocks playback, user can tap the Replay button
-            setVoicePhase('idle');
+        // Surface the full AI Fix overlay + InstructionSheet just like Scan Problem!
+        if (data.speechDetected !== false && data.diagnosis) {
+          const hotspot = buildHotspotFromDiagnosis({
+            diagnosis: data.diagnosis,
+            scaleCalibration: data.scaleCalibration ?? null,
+            spokenText: transcriptText,
+            sourceMode: 'voice',
+            spokenLanguage: detectedLangName,
+            userTranscript: typeof data.userTranscript === 'string' ? data.userTranscript : null,
           });
+          onScanSucceeded(hotspot);
+          setSheetOpen(true);
+        }
+
+        // 4. Automatically play the generated WAV speech in the user's detected language
+        if (typeof data.audioBase64 === 'string' && data.audioBase64.length > 32) {
+          const audioUrl = base64ToBlobUrl(data.audioBase64, data.audioMimeType || 'audio/wav');
+          await playAudioObjectUrl(audioUrl);
+        } else if (transcriptText) {
+          speakFallbackBrowserVoice(transcriptText, data.detectedLanguageCode);
         } else {
           setVoicePhase('idle');
         }
@@ -455,7 +550,13 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         );
       }
     },
-    [captureFrameDataUrl]
+    [
+      captureFrameDataUrl,
+      onScanSucceeded,
+      playAudioObjectUrl,
+      scaleOptOut,
+      speakFallbackBrowserVoice,
+    ]
   );
 
   // Push-to-Talk PRESS: start capturing microphone via MediaRecorder API
@@ -472,7 +573,6 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     }
 
     try {
-      // Request or reuse active microphone MediaStream
       let micStream = micStreamRef.current;
       const hasLiveTrack = micStream?.getAudioTracks().some((t) => t.readyState === 'live');
       if (!micStream || !hasLiveTrack) {
@@ -487,7 +587,6 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         micStreamRef.current = micStream;
       }
 
-      // If user already released while permission dialog was open, abort cleanly
       if (!isHoldingRef.current) return;
 
       const mimeType = pickBestRecorderMimeType((m) => MediaRecorder.isTypeSupported(m));
@@ -542,7 +641,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     }
   }, [scanPhase, sendVoiceExplainPayload, stopAudioPlayback, voicePhase]);
 
-  // Push-to-Talk RELEASE: stop MediaRecorder (triggers onstop -> upload -> spoken reply)
+  // Push-to-Talk RELEASE: stop MediaRecorder (triggers onstop -> upload -> AI Fix + spoken reply)
   const handleStopTalking = useCallback(() => {
     if (!isHoldingRef.current) return;
     isHoldingRef.current = false;
@@ -555,49 +654,125 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
     }
   }, []);
 
-  // Primary "Scan Problem" handler: blurs camera with human-readable spinner and calls backend
-  const handleScanProblem = async () => {
-    stopAudioPlayback();
-    setVoiceNotice(null);
-    setMotionVideoUrl(null);
-    setSheetOpen(false);
-    onStartScan();
+  // Primary "Scan Problem" handler: blurs camera, runs Decisions -> Neon + Scale Anchor Guard + TTS
+  const handleScanProblem = useCallback(
+    async (overrideOptOut?: boolean) => {
+      const effectiveOptOut = overrideOptOut ?? scaleOptOut;
+      stopAudioPlayback();
+      setVoiceNotice(null);
+      setMotionVideoUrl(null);
+      setSheetOpen(false);
+      onStartScan();
 
-    const frame = captureFrameDataUrl();
-    if (!frame) {
-      onScanFailed("We couldn't capture a clear image. Hold steady and try again.");
-      return;
-    }
-
-    try {
-      const resp = await fetch('/api/analyze-buffer', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          frames: [{ timestampMs: Date.now(), dataUrl: frame }],
-          ingestMode: 'webrtc_15fps',
-          scaleAnchor: 'none',
-          hasWebXRDepth: false,
-          stillDurationMs: 3200,
-          userQuestion:
-            'Identify the main part and explain the safest next step in simple everyday terms.',
-        }),
-      });
-
-      const data = await resp.json();
-      if (!resp.ok) {
-        throw new Error('Could not complete the scan right now.');
+      const frame = captureFrameDataUrl();
+      if (!frame) {
+        onScanFailed("We couldn't capture a clear image. Hold steady and try again.");
+        return;
       }
 
-      const hotspot = buildHotspotFromDiagnosis(data);
-      onScanSucceeded(hotspot);
-      setSheetOpen(true);
-    } catch {
-      onScanFailed(
-        "We couldn't get a clear look just now. Add a little more light, hold steady, and tap Scan Problem again."
-      );
+      try {
+        const resp = await fetch('/api/analyze-buffer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            frames: [{ timestampMs: Date.now(), dataUrl: frame }],
+            ingestMode: 'webrtc_15fps',
+            scaleAnchor: 'none',
+            hasWebXRDepth: false,
+            scaleOptOut: effectiveOptOut,
+            preferredLanguage: typeof navigator !== 'undefined' ? navigator.language : 'en-US',
+            stillDurationMs: 3200,
+            userQuestion:
+              'Identify the main part, check for any scale object (quarter, credit card, thumb), and explain the safest next step in simple everyday terms.',
+          }),
+        });
+
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error('Could not complete the scan right now.');
+        }
+
+        const spoken = typeof data.spokenText === 'string' ? data.spokenText : '';
+        if (spoken) {
+          setSpokenReply(spoken);
+          setSpokenLanguage(null);
+        }
+
+        const hotspot = buildHotspotFromDiagnosis({
+          diagnosis: data.diagnosis,
+          scaleCalibration: data.scaleCalibration ?? null,
+          spokenText: spoken,
+          voiceInstruction: data.voiceInstruction,
+          sourceMode: 'scan',
+        });
+        onScanSucceeded(hotspot);
+        setSheetOpen(true);
+
+        // Speak the scale calibration confirmation / anchor request / opt-out notice aloud!
+        if (typeof data.audioBase64 === 'string' && data.audioBase64.length > 32) {
+          const audioUrl = base64ToBlobUrl(data.audioBase64, data.audioMimeType || 'audio/wav');
+          await playAudioObjectUrl(audioUrl);
+        } else if (spoken) {
+          speakFallbackBrowserVoice(spoken);
+        }
+      } catch {
+        onScanFailed(
+          "We couldn't get a clear look just now. Add a little more light, hold steady, and tap Scan Problem again."
+        );
+      }
+    },
+    [
+      captureFrameDataUrl,
+      onScanFailed,
+      onScanSucceeded,
+      onStartScan,
+      playAudioObjectUrl,
+      scaleOptOut,
+      speakFallbackBrowserVoice,
+      stopAudioPlayback,
+    ]
+  );
+
+  // User clicks "Continue Without Scaling" inside the AI Fix sheet:
+  // Updates text card immediately AND speaks aloud why using a scale object matters.
+  const handleOptOutScale = useCallback(() => {
+    setScaleOptOut(true);
+    if (activeHotspot) {
+      const optedOutCalibration = resolveScaleCalibration({
+        detectedObject: 'none',
+        scaleCalibrated: false,
+        explicitOptOut: true,
+        localizedWhyScaleMatters: activeHotspot.scaleCalibration?.whyScaleMatters,
+      });
+      onScanSucceeded({
+        ...activeHotspot,
+        scaleCalibration: optedOutCalibration,
+      });
     }
-  };
+    void speakNoticeText(WHY_SCALE_MATTERS_SPOKEN);
+  }, [activeHotspot, onScanSucceeded, speakNoticeText]);
+
+  // User clicks "Re-Scan with Object" after placing a quarter, card, or thumb beside the part
+  const handleRescanWithAnchor = useCallback(() => {
+    setScaleOptOut(false);
+    void handleScanProblem(false);
+  }, [handleScanProblem]);
+
+  // User changes their mind after opting out and wants to calibrate with an object
+  const handleReenableScale = useCallback(() => {
+    setScaleOptOut(false);
+    if (activeHotspot) {
+      const needsAnchorCalibration = resolveScaleCalibration({
+        detectedObject: 'none',
+        scaleCalibrated: false,
+        explicitOptOut: false,
+      });
+      onScanSucceeded({
+        ...activeHotspot,
+        scaleCalibration: needsAnchorCalibration,
+      });
+    }
+  }, [activeHotspot, onScanSucceeded]);
 
   // Optional "Show Me How" motion clip from backend
   const handleRequestMotionVideo = async () => {
@@ -718,7 +893,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         </button>
       </header>
 
-      {/* Highlighted Part Overlay after a successful visual scan */}
+      {/* Highlighted Part Overlay after EITHER Scan Problem or Hold to Explain */}
       {scanPhase === 'result' && activeHotspot && (
         <div
           className="absolute z-20"
@@ -733,7 +908,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
             type="button"
             onClick={() => setSheetOpen(true)}
             aria-label={`View repair instructions for ${activeHotspot.label}`}
-            className="relative h-full w-full min-h-[56px] rounded-2xl border-2 border-amber-400 bg-amber-400/15 hover:bg-amber-400/25 transition-colors focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"
+            className="relative h-full w-full min-h-[56px] rounded-2xl border-2 border-amber-400 bg-amber-400/15 hover:bg-amber-400/25 transition-colors cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"
           >
             <span className="absolute -top-8 left-1/2 -translate-x-1/2 rounded-lg bg-black/80 px-3 py-1 text-xs font-semibold text-amber-300 whitespace-nowrap shadow-md">
               {activeHotspot.label}
@@ -759,7 +934,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         </div>
       )}
 
-      {/* Spoken AI Mechanic Caption Card + Audio Replay / Stop Control */}
+      {/* Spoken AI Mechanic Caption Card (shown when sheet is closed) */}
       {!sheetOpen && !isRecording && !isBusy && spokenReply && (
         <div
           role="status"
@@ -770,7 +945,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
             <button
               type="button"
               onClick={() => (isSpeaking ? stopAudioPlayback() : void handleReplayAudio())}
-              disabled={!hasReplyAudio}
+              disabled={!hasReplyAudio && !spokenReply}
               aria-label={isSpeaking ? 'Stop spoken response' : 'Replay spoken response'}
               className={`mt-0.5 flex h-10 w-10 shrink-0 items-center justify-center rounded-full transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-400 ${
                 isSpeaking
@@ -791,6 +966,15 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
                 {spokenLanguage ? ` · ${spokenLanguage}` : ''}
               </p>
               <p className="mt-0.5 text-sm leading-snug text-white">{spokenReply}</p>
+              {activeHotspot && (
+                <button
+                  type="button"
+                  onClick={() => setSheetOpen(true)}
+                  className="mt-1.5 text-xs font-semibold text-amber-300 underline underline-offset-2 hover:text-amber-200 cursor-pointer"
+                >
+                  Open Step-by-Step AI Fix
+                </button>
+              )}
             </div>
 
             <button
@@ -883,7 +1067,7 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
         </div>
       )}
 
-      {/* Step-by-Step Repair Instruction Sheet */}
+      {/* Step-by-Step Repair Instruction Sheet (Unified for Scan Problem & Hold to Explain) */}
       {scanPhase === 'result' && activeHotspot && sheetOpen && (
         <InstructionSheet
           hotspot={activeHotspot}
@@ -899,6 +1083,13 @@ export const LiveCameraView: React.FC<LiveCameraViewProps> = ({
           onRequestMotionVideo={
             activeHotspot.motionPrompt ? () => void handleRequestMotionVideo() : undefined
           }
+          isSpeaking={isSpeaking}
+          hasAudio={hasReplyAudio || Boolean(spokenReply)}
+          onReplayAudio={() => void handleReplayAudio()}
+          onStopAudio={stopAudioPlayback}
+          onRescanWithAnchor={handleRescanWithAnchor}
+          onOptOutScale={handleOptOutScale}
+          onReenableScale={handleReenableScale}
         />
       )}
     </div>

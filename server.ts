@@ -41,6 +41,12 @@ import {
   DEMO_NARRATION_CUES,
   isValidDemoCueId,
 } from './src/lib/demoNarration.ts';
+import {
+  mapDetectedObjectToScaleAnchor,
+  resolveScaleCalibration,
+  WHY_SCALE_MATTERS_SPOKEN,
+  type ScaleCalibrationResult,
+} from './src/lib/scaleCalibration.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -287,13 +293,33 @@ async function createApp() {
     });
   });
 
-  app.post('/api/ontology/search', (req: Request, res: Response) => {
+  app.post('/api/ontology/search', async (req: Request, res: Response) => {
     const {
       queryVector,
       scaleAnchor = 'none',
       hasWebXRDepth = false,
       limit = 4,
     } = req.body ?? {};
+
+    const hasScaleAnchor = Boolean(hasWebXRDepth) || scaleAnchor !== 'none';
+    const maxRows = Number(limit) || 4;
+
+    if (pgPool && Array.isArray(queryVector) && queryVector.length === 768) {
+      try {
+        const vectorLiteral = `[${queryVector.map(Number).join(',')}]`;
+        const { rows } = await pgPool.query(
+          'SELECT * FROM rag_search_ontology_subgraph($1::vector, $2, $3)',
+          [vectorLiteral, hasScaleAnchor, maxRows]
+        );
+        return res.json({
+          source: 'postgresql_pgvector',
+          hasScaleAnchor,
+          matches: rows,
+        });
+      } catch (err) {
+        console.error('[PostgreSQL rag_search_ontology_subgraph fallback]', (err as Error).message);
+      }
+    }
 
     const vector = Array.isArray(queryVector) && queryVector.length > 0
       ? buildFeatureVector(queryVector.map(Number))
@@ -303,11 +329,12 @@ async function createApp() {
       vector,
       scaleAnchor as ScaleAnchorType,
       Boolean(hasWebXRDepth),
-      Number(limit) || 4
+      maxRows
     );
 
     return res.json({
-      hasScaleAnchor: Boolean(hasWebXRDepth) || scaleAnchor !== 'none',
+      source: 'in_memory_cte_parity',
+      hasScaleAnchor,
       matches,
     });
   });
@@ -403,12 +430,30 @@ async function createApp() {
     }
   });
 
-  app.post('/api/ontology/deflection', (req: Request, res: Response) => {
+  app.post('/api/ontology/deflection', async (req: Request, res: Response) => {
     const computeCostUsd = Number(req.body?.computeCostUsd ?? 1.45);
-    const flywheel = localOntology.recordDeflection(
-      Number.isFinite(computeCostUsd) && computeCostUsd > 0 ? computeCostUsd : 1.45
-    );
-    return res.json({ status: 'recorded', flywheel });
+    const safeCost = Number.isFinite(computeCostUsd) && computeCostUsd > 0 ? computeCostUsd : 1.45;
+    let persistedToSql = false;
+
+    if (pgPool) {
+      try {
+        await pgPool.query(
+          `INSERT INTO deflection_bounties (brand_id, bounty_usd, compute_cost_usd)
+           VALUES (1, 30.00, $1)`,
+          [safeCost]
+        );
+        persistedToSql = true;
+      } catch (err) {
+        console.error('[PostgreSQL deflection_bounties fallback]', (err as Error).message);
+      }
+    }
+
+    const flywheel = localOntology.recordDeflection(safeCost);
+    return res.json({
+      status: 'recorded',
+      source: persistedToSql ? 'postgresql_pgvector' : 'in_memory_cte_parity',
+      flywheel,
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -422,6 +467,8 @@ async function createApp() {
       ingestMode = 'webrtc_15fps',
       scaleAnchor = 'none',
       hasWebXRDepth = false,
+      scaleOptOut = false,
+      preferredLanguage = 'en-US',
       stillDurationMs = 0,
       scenarioHint = '',
       userQuestion = '',
@@ -612,8 +659,14 @@ async function createApp() {
 
     // -------------------------------------------------------------------------
     // STEP 2: Wake `gemini-4-neon` (The Brain) ONLY on High-Confidence Anomaly
+    // Actively inspects the frame for a physical scale anchor (quarter/coin,
+    // credit card, thumb, or ruler) so exact sizing is confirmed before unlock.
     // -------------------------------------------------------------------------
-    const hasScaleReference = Boolean(hasWebXRDepth) || scaleAnchor !== 'none';
+    const clientHasScale = Boolean(hasWebXRDepth) || scaleAnchor !== 'none';
+    const responseLang = normalizeBcp47Language(
+      typeof preferredLanguage === 'string' ? preferredLanguage : undefined,
+      'en-US'
+    );
     const ragContextText = ragMatches
       .map(
         (m, i) =>
@@ -629,21 +682,28 @@ async function createApp() {
       const neonInteraction = await clients.interactionsAi.interactions.create({
         model: 'gemini-4-neon',
         system_instruction:
-          'You are JackOfAllTrades, a precision physical repair and assembly diagnostic engine. ' +
-          'Analyze the 15-second frame buffer alongside the PostgreSQL Ontology RAG matches. ' +
-          'CRITICAL SAFETY RULE (Break 2 — Scale Hallucination Guard): ' +
-          (hasScaleReference
-            ? `A calibrated scale reference is ACTIVE (${hasWebXRDepth ? 'WebXR depth map' : scaleAnchor}). You may recommend exact metric/imperial tool sizes.`
-            : 'NO WebXR depth data and NO physical scale anchor (coin, credit card, thumb) is present. You are STRICTLY BARRED from recommending a specific numeric tool size (e.g., 10mm, M4, 3/8"). Set requiresScaleAnchor=true, toolSizeSpec=null, and instruct the user to place a coin, credit card, or thumb beside the part first.') +
-          ' Return concise, actionable JSON only.',
+          'You are Jack of All Trades, a precision physical repair and assembly diagnostic engine. ' +
+          'Analyze the visual frames alongside the Ontology RAG matches and produce plain-English, actionable steps.\n' +
+          'CRITICAL SCALE CALIBRATION RULE (Break 2 — Scale Hallucination Guard):\n' +
+          '1. Inspect the image(s) carefully for any known-size physical reference object placed beside the part: a US quarter / coin ("us_quarter" or "coin"), a credit/debit/ID card ("credit_card"), a human thumb/finger ("human_thumb"), or a ruler/tape measure ("ruler"). If none is clearly visible beside the part, set detectedScaleObject="none" and scaleCalibrated=false.\n' +
+          '2. ONLY set scaleCalibrated=true if a reference object is clearly visible right next to the part (or WebXR depth is active: ' +
+          String(clientHasScale) +
+          ').\n' +
+          '3. If scaleCalibrated=true, explicitly confirm in voiceCoachingLine which reference object calibrated scale and recommend exact metric/imperial tool sizes.\n' +
+          '4. If scaleCalibrated=false, you are STRICTLY BARRED from recommending a specific numeric tool size (e.g., 10mm, M4, 3/8"). Set requiresScaleAnchor=true and toolSizeSpec="". ' +
+          (scaleOptOut
+            ? 'The user chose to continue without scaling: briefly note why a reference object helps avoid wrong tool sizes, and still give safe actionable repair steps.'
+            : 'Ask the user in voiceCoachingLine to place a quarter, credit card, or their thumb next to the part so we can calibrate exact tool size—or let them know they can continue without scaling.') +
+          ' Return concise JSON only.',
         input: [
           ...multimodalInput,
           {
             type: 'text',
             text:
               `\nDecisions API trigger: ${route.dominantTrigger} (confidence=${route.maxAnomalyConfidence}).\n` +
+              `scaleOptOut=${Boolean(scaleOptOut)}, clientScaleAnchor=${scaleAnchor}, webXRDepth=${Boolean(hasWebXRDepth)}.\n` +
               `Ontology RAG Subgraph:\n${ragContextText}\n` +
-              'Diagnose the visible component, failure precursor, next physical action, and PiP hand-motion prompt.',
+              'Return the detected scale object (if any), calibration confidence, component diagnosis, 2-3 clear plain-English repair steps, tool required, PiP hand-motion prompt, and a concise spoken voiceCoachingLine (under 3 sentences).',
           },
         ],
         response_format: {
@@ -657,6 +717,31 @@ async function createApp() {
             toolRequired: { type: Type.STRING },
             toolSizeSpec: { type: Type.STRING },
             requiresScaleAnchor: { type: Type.BOOLEAN },
+            detectedScaleObject: {
+              type: Type.STRING,
+              description:
+                'One of: us_quarter, coin, credit_card, human_thumb, ruler, webxr_depth, or none.',
+            },
+            scaleCalibrated: {
+              type: Type.BOOLEAN,
+              description:
+                'True ONLY if a known-size reference object is clearly visible beside the target part and scale was properly calibrated.',
+            },
+            scaleConfidence: {
+              type: Type.NUMBER,
+              description: 'Confidence from 0.0 to 1.0 in the detected scale reference object.',
+            },
+            steps: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  detail: { type: Type.STRING },
+                },
+                required: ['title', 'detail'],
+              },
+            },
             rotationDirection: { type: Type.STRING },
             pipMotionPrompt: { type: Type.STRING },
             voiceCoachingLine: { type: Type.STRING },
@@ -667,6 +752,9 @@ async function createApp() {
             'nextStepInstruction',
             'toolRequired',
             'requiresScaleAnchor',
+            'detectedScaleObject',
+            'scaleCalibrated',
+            'steps',
             'pipMotionPrompt',
             'voiceCoachingLine',
           ],
@@ -685,17 +773,90 @@ async function createApp() {
         parsedDiagnosis = match ? JSON.parse(match[0]) : { diagnosisSummary: rawText };
       }
 
+      const scaleCalibration = resolveScaleCalibration({
+        detectedObject:
+          typeof parsedDiagnosis.detectedScaleObject === 'string'
+            ? parsedDiagnosis.detectedScaleObject
+            : 'none',
+        scaleCalibrated: Boolean(parsedDiagnosis.scaleCalibrated),
+        scaleConfidence:
+          typeof parsedDiagnosis.scaleConfidence === 'number'
+            ? parsedDiagnosis.scaleConfidence
+            : undefined,
+        explicitOptOut: Boolean(scaleOptOut),
+        hasWebXRDepth: Boolean(hasWebXRDepth),
+        clientScaleAnchor: scaleAnchor as ScaleAnchorType,
+      });
+
+      const effectiveAnchor = mapDetectedObjectToScaleAnchor(scaleCalibration.detectedObject);
+
       // Hard programmatic enforcement of Break 2 Scale Anchor Invariant
       const scaleGated = enforceScaleAnchorInvariant(
         {
           toolRequired: String(parsedDiagnosis.toolRequired || 'Hand Inspection'),
-          toolSizeSpec: parsedDiagnosis.toolSizeSpec ? String(parsedDiagnosis.toolSizeSpec) : null,
-          requiresScaleAnchor: Boolean(parsedDiagnosis.requiresScaleAnchor ?? true),
+          toolSizeSpec:
+            scaleCalibration.confirmed && parsedDiagnosis.toolSizeSpec
+              ? String(parsedDiagnosis.toolSizeSpec)
+              : null,
+          requiresScaleAnchor: !scaleCalibration.confirmed,
           instructionText: String(parsedDiagnosis.nextStepInstruction || ''),
         },
-        scaleAnchor as ScaleAnchorType,
+        effectiveAnchor,
         Boolean(hasWebXRDepth)
       );
+
+      // Build concise spoken guidance guaranteeing scale confirmation / prompt / opt-out summary is heard
+      const baseCoaching = String(
+        parsedDiagnosis.voiceCoachingLine || parsedDiagnosis.nextStepInstruction || ''
+      ).trim();
+      let spokenText = baseCoaching;
+      if (scaleCalibration.status === 'calibrated') {
+        const alreadyMentionsScale = /scale|calibrat|quarter|coin|card|thumb|ruler/i.test(baseCoaching);
+        spokenText = alreadyMentionsScale
+          ? baseCoaching
+          : `${scaleCalibration.spokenScaleNotice} ${baseCoaching}`.trim();
+      } else if (scaleCalibration.status === 'opted_out') {
+        spokenText = `${scaleCalibration.spokenScaleNotice} ${baseCoaching}`.trim();
+      } else {
+        const alreadyAsksAnchor = /quarter|credit card|thumb|scale/i.test(baseCoaching);
+        spokenText = alreadyAsksAnchor
+          ? baseCoaching
+          : `${baseCoaching} ${scaleCalibration.spokenScaleNotice}`.trim();
+      }
+
+      // Best-effort Gemini neural TTS so Scan Problem speaks its scale guidance & fix aloud
+      let audioBase64: string | null = null;
+      let audioMimeType: string | null = null;
+      if (spokenText.length > 0) {
+        try {
+          const ttsRes = await clients.interactionsAi.interactions.create({
+            model: 'gemini-3.8-flash-lite-tts',
+            input: [
+              {
+                type: 'text',
+                text: spokenText,
+                annotations: [
+                  {
+                    type: 'speech_metadata',
+                    style: 'Calm, clear, helpful expert mechanic speaking concisely',
+                  },
+                ],
+              },
+            ],
+            store: false,
+            response_format: { type: 'audio' },
+            generation_config: {
+              speech_config: [{ language: responseLang, voice: 'Kore' }],
+            },
+          });
+          if (ttsRes.output_audio?.data) {
+            audioBase64 = ttsRes.output_audio.data;
+            audioMimeType = ttsRes.output_audio.mime_type || 'audio/wav';
+          }
+        } catch (ttsErr) {
+          console.warn('[Scan TTS fallback]', (ttsErr as Error).message);
+        }
+      }
 
       return res.json({
         escalatedToNeon: true,
@@ -706,6 +867,10 @@ async function createApp() {
         decisionUsage,
         route,
         ragMatches,
+        scaleCalibration,
+        spokenText,
+        audioBase64,
+        audioMimeType,
         diagnosis: {
           ...parsedDiagnosis,
           toolRequired: scaleGated.toolRequired,
@@ -823,6 +988,9 @@ async function createApp() {
       audioBase64,
       audioMimeType = 'audio/webm',
       preferredLanguage,
+      scaleAnchor = 'none',
+      hasWebXRDepth = false,
+      scaleOptOut = false,
       format,
     } = req.body ?? {};
 
@@ -905,13 +1073,27 @@ async function createApp() {
         '", do NOT invent a repair problem, and write a brief polite prompt in "' +
         fallbackLanguage +
         '" asking the user to hold the button and speak closer to the microphone.\n' +
-        '4. Write spokenResponse STRICTLY in detectedLanguageCode — never switch languages. Keep spokenResponse under 3 short, direct, actionable sentences with no markdown.',
+        '4. SCALE ANCHOR CHECK (MANDATORY): Inspect the attached camera frame(s) for a known-size reference object placed beside the part: a US quarter / coin ("us_quarter" or "coin"), a credit/debit/ID card ("credit_card"), a human thumb ("human_thumb"), or a ruler ("ruler"). Set detectedScaleObject and set scaleCalibrated=true ONLY if clearly visible right beside the target part.\n' +
+        '5. SCALE OPT-OUT CHECK: Set userDeclinedScale=true if the user says they do not want to scale, want to skip scaling, or do not have a scale object (client scaleOptOut=' +
+        String(Boolean(scaleOptOut)) +
+        ').\n' +
+        '6. Write ALL user-facing text (spokenResponse, componentName, diagnosisSummary, nextStepInstruction, steps, and whyScaleMattersLocalized) STRICTLY in detectedLanguageCode — never switch languages.\n' +
+        '7. In spokenResponse (3 short sentences max, no markdown):\n' +
+        '   - If scaleCalibrated=true: explicitly confirm you calibrated scale using the detected object, then give the direct mechanic fix (exact tool size allowed).\n' +
+        '   - If scaleCalibrated=false AND (userDeclinedScale=true OR scaleOptOut=true): acknowledge continuing without scaling, include a 1-sentence summary of why a reference object matters (camera lenses distort close-up size so tool sizes are approximate), and give the safe repair step without claiming exact numeric tool sizes.\n' +
+        '   - If scaleCalibrated=false AND NOT opted out: give safe preliminary guidance (NO specific numeric tool sizes) AND ask the user to hold a quarter, credit card, or their thumb next to the part so you can confirm exact scale—or say if they prefer to continue without scaling.\n' +
+        '8. Always populate componentName, diagnosisSummary, nextStepInstruction, toolRequired, 2-3 clear steps[], and pipMotionPrompt so the on-screen AI Fix sheet renders completely alongside your spoken reply.',
     });
 
-    // STAGE 1: Multimodal Visual + Audio Reasoning + Language Detection via `gemini-4-neon`
-    let spokenText: string;
+    // STAGE 1: Multimodal Visual + Audio Reasoning + Language + Scale Calibration via `gemini-4-neon`
+    let spokenText = '';
     let detectedLanguageCode = fallbackLanguage;
     let detectedLanguageName = 'Auto';
+    let speechDetected = true;
+    let userTranscript = '';
+    let scaleCalibration: ScaleCalibrationResult | null = null;
+    let structuredDiagnosis: Record<string, unknown> | null = null;
+
     try {
       const reasoning = await clients.interactionsAi.interactions.create({
         model: 'gemini-4-neon',
@@ -943,10 +1125,69 @@ async function createApp() {
               type: Type.STRING,
               description: 'Human-readable name of the detected language (e.g., Spanish, French, Japanese, English).',
             },
+            detectedScaleObject: {
+              type: Type.STRING,
+              description:
+                'Detected scale object beside the part: us_quarter, coin, credit_card, human_thumb, ruler, webxr_depth, or none.',
+            },
+            scaleCalibrated: {
+              type: Type.BOOLEAN,
+              description:
+                'True ONLY if a known-size reference object is clearly visible right next to the part and scale was properly calibrated.',
+            },
+            scaleConfidence: {
+              type: Type.NUMBER,
+              description: 'Confidence 0.0 to 1.0 in the detected scale reference object.',
+            },
+            userDeclinedScale: {
+              type: Type.BOOLEAN,
+              description:
+                'True if the user explicitly asked to skip scaling or continue without using a reference object.',
+            },
+            whyScaleMattersLocalized: {
+              type: Type.STRING,
+              description:
+                'A short 1-2 sentence explanation in detectedLanguageCode explaining why placing a quarter, credit card, or thumb beside the part matters for accurate tool sizing.',
+            },
             spokenResponse: {
               type: Type.STRING,
               description:
-                'Direct, actionable mechanic guidance written strictly in detectedLanguageCode, under 3 sentences.',
+                'Direct, actionable mechanic guidance written strictly in detectedLanguageCode, under 3 sentences, including scale confirmation, anchor prompt, or opt-out explanation as appropriate.',
+            },
+            componentName: {
+              type: Type.STRING,
+              description: 'Short plain-language name of the visible part/assembly in detectedLanguageCode.',
+            },
+            diagnosisSummary: {
+              type: Type.STRING,
+              description: 'Concise 1-2 sentence summary of the visual issue and fix in detectedLanguageCode.',
+            },
+            nextStepInstruction: {
+              type: Type.STRING,
+              description: 'Primary actionable repair step in detectedLanguageCode.',
+            },
+            toolRequired: {
+              type: Type.STRING,
+              description: 'Tool category needed (e.g., Phillips screwdriver, Hex key, No tools needed).',
+            },
+            toolSizeSpec: {
+              type: Type.STRING,
+              description: 'Exact numeric size ONLY if scaleCalibrated=true; otherwise empty string.',
+            },
+            steps: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  detail: { type: Type.STRING },
+                },
+                required: ['title', 'detail'],
+              },
+            },
+            pipMotionPrompt: {
+              type: Type.STRING,
+              description: 'Short visual hand-motion prompt for optional PiP demonstration.',
             },
           },
           required: [
@@ -954,7 +1195,16 @@ async function createApp() {
             'userTranscript',
             'detectedLanguageCode',
             'detectedLanguageName',
+            'detectedScaleObject',
+            'scaleCalibrated',
+            'userDeclinedScale',
+            'whyScaleMattersLocalized',
             'spokenResponse',
+            'componentName',
+            'diagnosisSummary',
+            'nextStepInstruction',
+            'toolRequired',
+            'steps',
           ],
         },
       });
@@ -966,13 +1216,69 @@ async function createApp() {
           userTranscript?: string;
           detectedLanguageCode?: string;
           detectedLanguageName?: string;
+          detectedScaleObject?: string;
+          scaleCalibrated?: boolean;
+          scaleConfidence?: number;
+          userDeclinedScale?: boolean;
+          whyScaleMattersLocalized?: string;
           spokenResponse?: string;
+          componentName?: string;
+          diagnosisSummary?: string;
+          nextStepInstruction?: string;
+          toolRequired?: string;
+          toolSizeSpec?: string;
+          steps?: Array<{ title?: string; detail?: string }>;
+          pipMotionPrompt?: string;
         };
-        const rawCode =
-          parsed.speechDetected === false ? fallbackLanguage : parsed.detectedLanguageCode;
+
+        speechDetected = parsed.speechDetected !== false;
+        userTranscript = parsed.userTranscript?.trim() || '';
+        const rawCode = speechDetected ? parsed.detectedLanguageCode : fallbackLanguage;
         detectedLanguageCode = normalizeBcp47Language(rawCode, fallbackLanguage);
         detectedLanguageName = parsed.detectedLanguageName?.trim() || detectedLanguageCode;
         spokenText = enforceThreeSentenceCap(parsed.spokenResponse || rawOutput);
+
+        scaleCalibration = resolveScaleCalibration({
+          detectedObject: parsed.detectedScaleObject,
+          scaleCalibrated: Boolean(parsed.scaleCalibrated),
+          scaleConfidence: parsed.scaleConfidence,
+          explicitOptOut: Boolean(scaleOptOut),
+          userDeclinedInSpeech: Boolean(parsed.userDeclinedScale),
+          userTranscript,
+          hasWebXRDepth: Boolean(hasWebXRDepth),
+          clientScaleAnchor: scaleAnchor as ScaleAnchorType,
+          localizedWhyScaleMatters: parsed.whyScaleMattersLocalized,
+        });
+
+        const effectiveAnchor = mapDetectedObjectToScaleAnchor(scaleCalibration.detectedObject);
+
+        const scaleGated = enforceScaleAnchorInvariant(
+          {
+            toolRequired: parsed.toolRequired?.trim() || 'Hand Inspection',
+            toolSizeSpec:
+              scaleCalibration.confirmed && parsed.toolSizeSpec?.trim()
+                ? parsed.toolSizeSpec.trim()
+                : null,
+            requiresScaleAnchor: !scaleCalibration.confirmed,
+            instructionText: parsed.nextStepInstruction?.trim() || spokenText,
+          },
+          effectiveAnchor,
+          Boolean(hasWebXRDepth)
+        );
+
+        if (speechDetected) {
+          structuredDiagnosis = {
+            componentName: parsed.componentName?.trim() || 'Visual Repair Guidance',
+            diagnosisSummary: parsed.diagnosisSummary?.trim() || spokenText,
+            nextStepInstruction: scaleGated.instructionText,
+            toolRequired: scaleGated.toolRequired,
+            toolSizeSpec: scaleGated.toolSizeSpec,
+            scaleGuardBlocked: scaleGated.scaleGuardBlocked,
+            anchorPrompt: scaleGated.anchorPrompt,
+            pipMotionPrompt: parsed.pipMotionPrompt?.trim() || undefined,
+            steps: Array.isArray(parsed.steps) ? parsed.steps : [],
+          };
+        }
       } catch {
         spokenText = enforceThreeSentenceCap(rawOutput);
       }
@@ -1021,6 +1327,8 @@ async function createApp() {
           spokenText,
           detectedLanguageCode,
           detectedLanguageName,
+          diagnosis: structuredDiagnosis,
+          scaleCalibration,
         });
       }
 
@@ -1038,17 +1346,25 @@ async function createApp() {
         res.setHeader('X-MakerLens-Transcript', encodeURIComponent(spokenText));
         res.setHeader('X-MakerLens-Language', detectedLanguageCode);
         res.setHeader('X-MakerLens-Language-Name', encodeURIComponent(detectedLanguageName));
+        if (scaleCalibration) {
+          res.setHeader('X-MakerLens-Scale-Status', scaleCalibration.status);
+          res.setHeader('X-MakerLens-Scale-Object', scaleCalibration.detectedObject);
+        }
         res.setHeader('X-MakerLens-Vision-Model', 'gemini-4-neon');
         res.setHeader('X-MakerLens-Speech-Model', 'gemini-3.8-flash-lite-tts');
         return res.status(200).send(wavBuffer);
       }
 
       return res.json({
+        speechDetected,
+        userTranscript,
         spokenText,
         detectedLanguageCode,
         detectedLanguageName,
         audioBase64: outputAudio.data,
         audioMimeType: wavMime,
+        diagnosis: structuredDiagnosis,
+        scaleCalibration,
         visionModel: 'gemini-4-neon',
         speechModel: 'gemini-3.8-flash-lite-tts',
       });
@@ -1059,8 +1375,83 @@ async function createApp() {
         spokenText,
         detectedLanguageCode,
         detectedLanguageName,
+        diagnosis: structuredDiagnosis,
+        scaleCalibration,
         stage: 'gemini-3.8-flash-lite-tts',
       });
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // SPOKEN SCALE NOTICE TTS: Cached neural speech for opt-out / scale prompts
+  // ---------------------------------------------------------------------------
+  const spokenNoticeCache = new Map<string, { wavBuffer: Buffer; mimeType: string }>();
+
+  app.post('/api/speak-notice', async (req: Request, res: Response) => {
+    const rawText =
+      typeof req.body?.text === 'string' && req.body.text.trim().length > 0
+        ? req.body.text.trim().slice(0, 480)
+        : WHY_SCALE_MATTERS_SPOKEN;
+    const lang = normalizeBcp47Language(
+      typeof req.body?.language === 'string' ? req.body.language : undefined,
+      'en-US'
+    );
+    const cacheKey = `${lang}:${rawText}`;
+
+    const cached = spokenNoticeCache.get(cacheKey);
+    if (cached) {
+      res.setHeader('Content-Type', cached.mimeType);
+      res.setHeader('Content-Length', String(cached.wavBuffer.length));
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      return res.status(200).send(cached.wavBuffer);
+    }
+
+    const clients = getGeminiClients();
+    if (!clients) {
+      return res.status(503).json({
+        error: 'GEMINI_API_KEY is not configured.',
+        fallbackText: rawText,
+      });
+    }
+
+    try {
+      const ttsInteraction = await clients.interactionsAi.interactions.create({
+        model: 'gemini-3.8-flash-lite-tts',
+        input: [
+          {
+            type: 'text',
+            text: rawText,
+            annotations: [
+              {
+                type: 'speech_metadata',
+                style: 'Warm, clear, reassuring repair assistant speaking concisely',
+              },
+            ],
+          },
+        ],
+        store: false,
+        response_format: { type: 'audio' },
+        generation_config: {
+          speech_config: [{ language: lang, voice: 'Kore' }],
+        },
+      });
+
+      const outputAudio = ttsInteraction.output_audio;
+      if (!outputAudio?.data) {
+        return res.status(502).json({ error: 'No audio payload returned.', fallbackText: rawText });
+      }
+
+      const wavBuffer = Buffer.from(outputAudio.data, 'base64');
+      const mimeType = outputAudio.mime_type || 'audio/wav';
+      if (spokenNoticeCache.size < 32) {
+        spokenNoticeCache.set(cacheKey, { wavBuffer, mimeType });
+      }
+      res.setHeader('Content-Type', mimeType);
+      res.setHeader('Content-Length', String(wavBuffer.length));
+      return res.status(200).send(wavBuffer);
+    } catch (err) {
+      const { status, message } = extractErrorDetails(err);
+      return res.status(status).json({ error: message, fallbackText: rawText });
     }
   });
 
