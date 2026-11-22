@@ -58,34 +58,59 @@ spec:
         - name: http1
           containerPort: 3000
         env:
-        - name: SQL_DB_NAME
-          value: stuff
-        - name: DB_PORT
-          value: stuff
-        - name: SQL_PUBLIC_IP
-          value: stuff
-        - name: AUTH_ENFORCEMENT_MODE
-          value: No_Value
-        - name: DB_HOST
-          value: stuff
-        - name: SQL_PORT
-          value: stuff
+        - name: NODE_ENV
+          value: production
+        - name: APP_URL
+          value: https://jackofalltrades-575313344781.us-east1.run.app
         - name: SQL_CONNECTION_NAME
-          value: stuff
+          value: gemini4nyc26nyc-2273:us-east1:free-trial-first-project
+        - name: DB_HOST
+          value: /cloudsql/gemini4nyc26nyc-2273:us-east1:free-trial-first-project
+        - name: DB_PORT
+          value: '5432'
+        - name: SQL_PORT
+          value: '5432'
         - name: DB_NAME
-          value: stuff
+          value: postgres
+        - name: SQL_DB_NAME
+          value: postgres
         - name: DB_USER
-          value: stuff
+          value: postgres
+        - name: SQL_PUBLIC_IP
+          value: 34.74.102.222
         - name: SQL_OUTGOING_IP
-          value: stuff
-        - name: DB_PASS
-          value: stuff
+          value: 34.73.184.213
         - name: SQL_SSL
           value: 'false'
+        - name: AUTH_ENFORCEMENT_MODE
+          value: scaffold
+        - name: BILLING_ENFORCEMENT_MODE
+          value: scaffold
         - name: GEMINI_API_KEY
-          value: stuff
-        - name: APP_URL
-          value: stuff
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: joat-gemini-api-key
+        - name: DB_PASS
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: joat-db-pass
+        - name: AUTH_SESSION_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: joat-auth-session-secret
+        - name: STRIPE_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: joat-stripe-secret-key
+        - name: STRIPE_WEBHOOK_SECRET
+          valueFrom:
+            secretKeyRef:
+              key: latest
+              name: joat-stripe-webhook-secret
         resources:
           limits:
             cpu: 1

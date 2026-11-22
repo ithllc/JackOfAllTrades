@@ -160,7 +160,7 @@ const API_ENDPOINTS = [
     method: 'GET',
     path: '/api/deliverables',
     service: 'AGPL-3.0 Disclosure',
-    purpose: 'Serves schema.sql, server.ts, server.js, App.jsx, Dockerfile, docs, and LICENSE',
+    purpose: 'Serves database/migrations/*.sql, database/seeds/*.sql, server.ts, server.js, Dockerfile, docs, and LICENSE',
   },
   {
     method: 'GET',
@@ -659,7 +659,7 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
                     Inspect Architecture &amp; Code
                   </span>
                   <span className="text-xs text-slate-600 leading-relaxed">
-                    Browse topology diagrams and download schema.sql, server.js, and Dockerfile.
+                    Browse topology diagrams and download PostgreSQL migrations, server.js, and Dockerfile.
                   </span>
                 </button>
               </div>

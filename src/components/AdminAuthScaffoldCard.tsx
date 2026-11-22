@@ -83,7 +83,7 @@ export const AdminAuthScaffoldCard: React.FC<AdminAuthScaffoldCardProps> = ({
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
           <p className="text-xs font-semibold text-slate-900">Dual-Audience Account Schema</p>
           <p className="mt-1.5 text-xs text-slate-600 leading-relaxed">
-            PostgreSQL <code className="font-mono text-[11px]">app_users</code> &amp; <code className="font-mono text-[11px]">auth_sessions</code> tables in <code className="font-mono text-[11px]">schema.sql</code> support <code className="font-mono text-[11px]">end_user</code>, <code className="font-mono text-[11px]">technician</code>, <code className="font-mono text-[11px]">admin</code>, and <code className="font-mono text-[11px]">super_admin</code> roles with salted <code className="font-mono text-[11px]">scrypt</code> hashes or OIDC / Firebase Auth.
+            PostgreSQL <code className="font-mono text-[11px]">app_users</code> &amp; <code className="font-mono text-[11px]">auth_sessions</code> tables in <code className="font-mono text-[11px]">database/migrations/002_auth_and_rbac.sql</code> support <code className="font-mono text-[11px]">end_user</code>, <code className="font-mono text-[11px]">technician</code>, <code className="font-mono text-[11px]">admin</code>, and <code className="font-mono text-[11px]">super_admin</code> roles with salted <code className="font-mono text-[11px]">scrypt</code> hashes or OIDC / Firebase Auth.
           </p>
         </div>
 

@@ -11,6 +11,7 @@ import {
   createRequireAuthMiddleware,
   extractBearerToken,
   hashPasswordScrypt,
+  hashSessionTokenSha256,
   isTokenRevoked,
   revokeSessionToken,
   signSessionToken,
@@ -65,6 +66,7 @@ test('HMAC-SHA256 session tokens verify cleanly and reject tampering, expiry, or
 
   assert.equal(extractBearerToken(`Bearer ${token}`), token);
   assert.equal(extractBearerToken('Basic abc123'), null);
+  assert.equal(hashSessionTokenSha256(token).length, 64);
 
   const verified = verifySessionToken(token, testSecret, principal.issuedAt + 10);
   assert.equal(verified?.userId, 'usr-001');
@@ -85,7 +87,7 @@ test('HMAC-SHA256 session tokens verify cleanly and reject tampering, expiry, or
   assert.equal(isTokenRevoked(token), true);
 });
 
-test('requireAuth middleware allows requests in scaffold mode and enforces 401/403 in enforced mode', () => {
+test('requireAuth middleware allows requests in scaffold mode and enforces 401/403 and DB revocation in enforced mode', async () => {
   const testSecret = 'middleware-unit-test-secret-key-12345';
 
   const mockResponse = () => {
@@ -110,7 +112,7 @@ test('requireAuth middleware allows requests in scaffold mode and enforces 401/4
     enforcementMode: 'scaffold',
     secret: testSecret,
   });
-  scaffoldMw({ headers: {} } as AuthenticatedRequest, mockResponse().res as never, () => {
+  await scaffoldMw({ headers: {} } as AuthenticatedRequest, mockResponse().res as never, () => {
     nextCalled = true;
   });
   assert.equal(nextCalled, true);
@@ -122,7 +124,7 @@ test('requireAuth middleware allows requests in scaffold mode and enforces 401/4
   });
   const unauthResp = mockResponse();
   let unauthNext = false;
-  enforcedAdminMw({ headers: {} } as AuthenticatedRequest, unauthResp.res as never, () => {
+  await enforcedAdminMw({ headers: {} } as AuthenticatedRequest, unauthResp.res as never, () => {
     unauthNext = true;
   });
   assert.equal(unauthNext, false);
@@ -141,7 +143,7 @@ test('requireAuth middleware allows requests in scaffold mode and enforces 401/4
   );
   const forbiddenResp = mockResponse();
   let forbiddenNext = false;
-  enforcedAdminMw(
+  await enforcedAdminMw(
     { headers: { authorization: `Bearer ${endUserToken}` } } as AuthenticatedRequest,
     forbiddenResp.res as never,
     () => {
@@ -164,9 +166,27 @@ test('requireAuth middleware allows requests in scaffold mode and enforces 401/4
   );
   const adminReq = { headers: { authorization: `Bearer ${adminToken}` } } as AuthenticatedRequest;
   let adminNext = false;
-  enforcedAdminMw(adminReq, mockResponse().res as never, () => {
+  await enforcedAdminMw(adminReq, mockResponse().res as never, () => {
     adminNext = true;
   });
   assert.equal(adminNext, true);
   assert.equal(adminReq.authPrincipal?.role, 'admin');
+
+  // 5. Cross-instance Cloud SQL revocation callback blocks token with 401
+  const dbRevokedMw = createRequireAuthMiddleware('admin', {
+    enforcementMode: 'enforced',
+    secret: testSecret,
+    isTokenRevokedInDb: async (sha) => sha === hashSessionTokenSha256(adminToken),
+  });
+  const revokedResp = mockResponse();
+  let revokedNext = false;
+  await dbRevokedMw(
+    { headers: { authorization: `Bearer ${adminToken}` } } as AuthenticatedRequest,
+    revokedResp.res as never,
+    () => {
+      revokedNext = true;
+    }
+  );
+  assert.equal(revokedNext, false);
+  assert.equal(revokedResp.getStatus(), 401);
 });

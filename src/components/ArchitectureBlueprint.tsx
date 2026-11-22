@@ -4,7 +4,7 @@
  *
  * Displays the visual system architecture diagram (matching docs/ARCHITECTURE.md MermaidJS)
  * and lets engineers inspect, copy, or download the exact generated foundational files:
- * schema.sql, server.ts, server.js, App.jsx, Dockerfile, docs/ARCHITECTURE.md, docs/RUNBOOK.md, and LICENSE.
+ * database/migrations/001–004, database/seeds/001, server.ts, server.js, App.jsx, Dockerfile, docs/*, and LICENSE.
  */
 
 import React, { useState } from 'react';
@@ -17,7 +17,11 @@ interface ArchitectureBlueprintProps {
 }
 
 const FILE_TABS = [
-  { key: 'schema.sql', label: 'schema.sql' },
+  { key: 'database/migrations/001_initial_ontology_schema.sql', label: '001_ontology.sql' },
+  { key: 'database/migrations/002_auth_and_rbac.sql', label: '002_auth_rbac.sql' },
+  { key: 'database/migrations/003_stripe_billing_and_deflection_proofs.sql', label: '003_billing_proofs.sql' },
+  { key: 'database/migrations/004_brand_sponsored_pools_and_session_attribution.sql', label: '004_attribution.sql' },
+  { key: 'database/seeds/001_seed_reference_ontology.sql', label: 'seed_001_ontology.sql' },
   { key: 'server.ts', label: 'server.ts (Source)' },
   { key: 'server.js', label: 'server.js (Bundle)' },
   { key: 'App.jsx', label: 'App.jsx' },
@@ -57,7 +61,9 @@ export const ArchitectureBlueprint: React.FC<ArchitectureBlueprintProps> = ({
   loading,
   onRetry,
 }) => {
-  const [activeFile, setActiveFile] = useState<string>('schema.sql');
+  const [activeFile, setActiveFile] = useState<string>(
+    'database/migrations/001_initial_ontology_schema.sql'
+  );
   const [copied, setCopied] = useState(false);
 
   const rawContent = deliverables[activeFile] || '';

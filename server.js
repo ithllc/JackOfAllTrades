@@ -1250,22 +1250,33 @@ function extractBearerToken(authHeader) {
   return match ? match[1] : null;
 }
 var revokedTokenHashes = /* @__PURE__ */ new Set();
+function hashSessionTokenSha256(token) {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
 function revokeSessionToken(token) {
   if (!token) return;
-  const digest = crypto.createHash("sha256").update(token).digest("hex");
-  revokedTokenHashes.add(digest);
+  revokedTokenHashes.add(hashSessionTokenSha256(token));
 }
 function isTokenRevoked(token) {
   if (!token) return false;
-  const digest = crypto.createHash("sha256").update(token).digest("hex");
-  return revokedTokenHashes.has(digest);
+  return revokedTokenHashes.has(hashSessionTokenSha256(token));
 }
 function createRequireAuthMiddleware(minimumRole, options) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     const mode = options?.enforcementMode ?? resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
     const secret = options?.secret ?? resolveSessionSigningSecret();
     const bearer = extractBearerToken(req.headers.authorization);
-    const principal = bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer, secret) : null;
+    let principal = bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer, secret) : null;
+    if (principal && bearer && options?.isTokenRevokedInDb) {
+      try {
+        const revokedInDb = await options.isTokenRevokedInDb(hashSessionTokenSha256(bearer));
+        if (revokedInDb) {
+          revokeSessionToken(bearer);
+          principal = null;
+        }
+      } catch {
+      }
+    }
     req.authPrincipal = principal;
     if (mode === "scaffold" || minimumRole === "anonymous") {
       return next();
@@ -1375,6 +1386,10 @@ function getBillingPackById(packId) {
   if (!packId || typeof packId !== "string") return void 0;
   const cleaned = packId.trim();
   return BILLING_CREDIT_PACKS.find((pack) => pack.id === cleaned);
+}
+function getActionCreditCost(action) {
+  const rule = ACTION_CREDIT_RULES.find((item) => item.action === action);
+  return rule ? rule.creditsRequired : 1;
 }
 
 // src/lib/serverStripe.ts
@@ -1563,6 +1578,18 @@ async function createStripeCheckoutSessionViaApi(input) {
     };
   }
 }
+function buildDeflectionProofHash(input) {
+  const canonical = JSON.stringify({
+    sessionId: input.sessionId.trim(),
+    brandId: input.brandId,
+    productSku: input.productSku.trim().toUpperCase(),
+    attributionChannel: input.attributionChannel,
+    beforeIssueSummary: input.beforeIssueSummary.trim(),
+    afterVerifiedState: input.afterVerifiedState.trim(),
+    completedAtIso: input.completedAtIso.trim()
+  });
+  return crypto2.createHash("sha256").update(canonical, "utf8").digest("hex");
+}
 
 // server.ts
 var __filename = fileURLToPath(import.meta.url);
@@ -1570,10 +1597,7 @@ var __dirname = path.dirname(__filename);
 var PORT = Number(process.env.PORT || 3e3);
 var kService = process.env.K_SERVICE || "";
 var isProduction = process.env.NODE_ENV === "production" || Boolean(kService) && !kService.startsWith("ais-dev-");
-var cloudSqlConfig = resolveCloudSqlPoolConfig({
-  ...process.env,
-  SQL_SSL: "true"
-});
+var cloudSqlConfig = resolveCloudSqlPoolConfig(process.env);
 var pgPool = null;
 if (cloudSqlConfig.poolConfig) {
   pgPool = new Pool(cloudSqlConfig.poolConfig);
@@ -1633,8 +1657,137 @@ async function createApp() {
       }
     })
   );
-  const requireEndUser = createRequireAuthMiddleware("end_user");
-  const requireAdmin = createRequireAuthMiddleware("admin");
+  async function isSessionRevokedInCloudSql(tokenSha256) {
+    if (!pgPool) return false;
+    try {
+      const { rows } = await pgPool.query(
+        `SELECT revoked_at IS NOT NULL OR expires_at <= NOW() AS is_revoked
+           FROM auth_sessions
+          WHERE token_sha256 = $1
+          LIMIT 1`,
+        [tokenSha256]
+      );
+      if (rows.length === 0) return false;
+      return Boolean(rows[0].is_revoked);
+    } catch {
+      return false;
+    }
+  }
+  async function enforceAndDeductCredits(params) {
+    const cost = getActionCreditCost(params.action);
+    const enforcementMode = resolveBillingEnforcementMode(process.env.BILLING_ENFORCEMENT_MODE);
+    if (cost <= 0) {
+      return { allowed: true, httpStatus: 200, creditsCharged: 0 };
+    }
+    if (params.brandSponsored && params.attributionBrandId && pgPool) {
+      try {
+        const poolRes = await pgPool.query(
+          `UPDATE brands
+              SET sponsored_credit_pool = sponsored_credit_pool - $2
+            WHERE id = $1
+              AND sponsored_credit_pool >= $2
+            RETURNING sponsored_credit_pool`,
+          [params.attributionBrandId, cost]
+        );
+        if (poolRes.rows.length > 0) {
+          return { allowed: true, httpStatus: 200, creditsCharged: 0 };
+        }
+      } catch {
+      }
+    }
+    if (enforcementMode !== "enforced") {
+      return { allowed: true, httpStatus: 200, creditsCharged: 0 };
+    }
+    if (!params.userId) {
+      return {
+        allowed: false,
+        httpStatus: 401,
+        code: "AUTH_REQUIRED_FOR_BILLING",
+        error: "Sign in to use repair credits.",
+        creditsCharged: 0
+      };
+    }
+    if (!pgPool) {
+      return { allowed: true, httpStatus: 200, creditsCharged: 0 };
+    }
+    const reasonMap = {
+      scan_problem: "scan_problem_charge",
+      voice_assist: "voice_assist_charge",
+      generate_pip: "generate_pip_charge"
+    };
+    const ledgerReason = params.action === "demo_narration" ? "scan_problem_charge" : reasonMap[params.action];
+    const client = await pgPool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO user_credit_wallets (user_id, credit_balance, starter_credits_granted)
+         VALUES ($1, $2, $2)
+         ON CONFLICT (user_id) DO NOTHING`,
+        [params.userId, DEFAULT_STARTER_CREDITS]
+      );
+      const debitRes = await client.query(
+        `UPDATE user_credit_wallets
+            SET credit_balance = credit_balance - $2,
+                updated_at = NOW()
+          WHERE user_id = $1
+            AND credit_balance >= $2
+          RETURNING credit_balance`,
+        [params.userId, cost]
+      );
+      if (debitRes.rows.length === 0) {
+        const balRes = await client.query(
+          "SELECT credit_balance FROM user_credit_wallets WHERE user_id = $1 LIMIT 1",
+          [params.userId]
+        );
+        const currentBalance = Number(balRes.rows[0]?.credit_balance ?? 0);
+        await client.query("ROLLBACK");
+        return {
+          allowed: false,
+          httpStatus: 402,
+          code: "INSUFFICIENT_CREDITS",
+          error: `This action requires ${cost} repair credit${cost === 1 ? "" : "s"}, but your balance is ${currentBalance}. Purchase a credit pack to continue.`,
+          creditsCharged: 0,
+          remainingBalance: currentBalance
+        };
+      }
+      const remainingBalance = Number(debitRes.rows[0].credit_balance);
+      await client.query(
+        `INSERT INTO credit_ledger_entries (user_id, delta_credits, reason, diagnostic_session_id)
+         VALUES ($1, $2, $3, $4)`,
+        [params.userId, -cost, ledgerReason, params.diagnosticSessionId ?? null]
+      );
+      await client.query("COMMIT");
+      return {
+        allowed: true,
+        httpStatus: 200,
+        creditsCharged: cost,
+        remainingBalance
+      };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => void 0);
+      const pgCode = err?.code;
+      if (pgCode === "42P01") {
+        console.warn("[Billing Metering] Credit tables not migrated yet; run migrations 003.");
+        return { allowed: true, httpStatus: 200, creditsCharged: 0 };
+      }
+      console.error("[Billing Metering Error]", err.message);
+      return {
+        allowed: false,
+        httpStatus: 503,
+        code: "BILLING_LEDGER_UNAVAILABLE",
+        error: "Unable to verify credit balance right now. Please retry.",
+        creditsCharged: 0
+      };
+    } finally {
+      client.release();
+    }
+  }
+  const requireEndUser = createRequireAuthMiddleware("end_user", {
+    isTokenRevokedInDb: isSessionRevokedInCloudSql
+  });
+  const requireAdmin = createRequireAuthMiddleware("admin", {
+    isTokenRevokedInDb: isSessionRevokedInCloudSql
+  });
   app.get(["/api/health", "/healthz"], (_req, res) => {
     const stripeStatus = getStripeConfigStatus();
     res.json({
@@ -1664,10 +1817,17 @@ async function createApp() {
       routePolicies: ROUTE_ACCESS_POLICIES
     });
   });
-  app.get("/api/auth/session", (req, res) => {
+  app.get("/api/auth/session", async (req, res) => {
     const enforcementMode = resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
     const bearer = extractBearerToken(req.headers.authorization);
-    const principal = bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer) : null;
+    let principal = bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer) : null;
+    if (principal && bearer && pgPool) {
+      const revokedInDb = await isSessionRevokedInCloudSql(hashSessionTokenSha256(bearer));
+      if (revokedInDb) {
+        revokeSessionToken(bearer);
+        principal = null;
+      }
+    }
     res.json({
       authenticated: Boolean(principal),
       enforcementMode,
@@ -1715,9 +1875,25 @@ async function createApp() {
         role,
         provider: user.auth_provider === "oidc_google" || user.auth_provider === "firebase_auth" ? user.auth_provider : "email_password_scrypt"
       });
-      await pgPool.query("UPDATE app_users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1", [
-        user.id
-      ]).catch(() => void 0);
+      const tokenSha256 = hashSessionTokenSha256(token);
+      const expiresAtIso = new Date(principal.expiresAt * 1e3).toISOString();
+      await Promise.all([
+        pgPool.query("UPDATE app_users SET last_login_at = NOW(), updated_at = NOW() WHERE id = $1", [
+          user.id
+        ]).catch(() => void 0),
+        pgPool.query(
+          `INSERT INTO auth_sessions (user_id, token_sha256, role_snapshot, expires_at)
+             VALUES ($1, $2, $3, $4::timestamptz)
+             ON CONFLICT (token_sha256) DO NOTHING`,
+          [user.id, tokenSha256, role, expiresAtIso]
+        ).catch(() => void 0),
+        pgPool.query(
+          `INSERT INTO user_credit_wallets (user_id, credit_balance, starter_credits_granted)
+             VALUES ($1, $2, $2)
+             ON CONFLICT (user_id) DO NOTHING`,
+          [user.id, DEFAULT_STARTER_CREDITS]
+        ).catch(() => void 0)
+      ]);
       return res.json({
         token,
         principal,
@@ -1727,7 +1903,7 @@ async function createApp() {
       const pgCode = err?.code;
       if (pgCode === "42P01") {
         return res.status(501).json({
-          error: "Auth tables are not yet applied in Cloud SQL. Run schema.sql (Section 8) to enable account sign-in.",
+          error: "Auth tables are not yet applied in Cloud SQL. Run database/migrations/002_auth_and_rbac.sql to enable account sign-in.",
           code: "AUTH_SCHEMA_PENDING",
           enforcementMode
         });
@@ -1738,10 +1914,20 @@ async function createApp() {
       });
     }
   });
-  app.post("/api/auth/logout", (req, res) => {
+  app.post("/api/auth/logout", async (req, res) => {
     const bearer = extractBearerToken(req.headers.authorization);
     if (bearer) {
       revokeSessionToken(bearer);
+      if (pgPool) {
+        const tokenSha256 = hashSessionTokenSha256(bearer);
+        await pgPool.query(
+          `UPDATE auth_sessions
+                SET revoked_at = NOW()
+              WHERE token_sha256 = $1
+                AND revoked_at IS NULL`,
+          [tokenSha256]
+        ).catch(() => void 0);
+      }
     }
     res.json({ status: "signed_out" });
   });
@@ -1764,10 +1950,52 @@ async function createApp() {
       starterCreditsGranted: DEFAULT_STARTER_CREDITS
     });
   });
-  app.get("/api/billing/overview", requireAdmin, (_req, res) => {
+  app.get("/api/billing/overview", requireAdmin, async (_req, res) => {
     const stripe = getStripeConfigStatus();
+    let liveMetrics = {
+      source: "scaffold_fallback",
+      activeWallets: 0,
+      totalCreditsPurchased: 0,
+      totalCreditsSpent: 0,
+      verifiedDeflectionProofs: 0,
+      brandSponsoredPoolCredits: 0
+    };
+    if (pgPool) {
+      try {
+        const { rows } = await pgPool.query(
+          `SELECT
+             (SELECT COUNT(*)::int FROM user_credit_wallets) AS active_wallets,
+             (SELECT COALESCE(SUM(delta_credits), 0)::int
+                FROM credit_ledger_entries
+               WHERE delta_credits > 0 AND reason IN ('stripe_pack_purchase', 'stripe_subscription_cycle')) AS credits_purchased,
+             (SELECT COALESCE(SUM(ABS(delta_credits)), 0)::int
+                FROM credit_ledger_entries
+               WHERE delta_credits < 0) AS credits_spent,
+             (SELECT COUNT(*)::int FROM brand_deflection_proofs) AS verified_proofs`
+        );
+        let poolCredits = 0;
+        try {
+          const poolRes = await pgPool.query(
+            "SELECT COALESCE(SUM(sponsored_credit_pool), 0)::int AS total_pool FROM brands"
+          );
+          poolCredits = Number(poolRes.rows[0]?.total_pool || 0);
+        } catch {
+        }
+        const agg = rows[0] ?? {};
+        liveMetrics = {
+          source: "postgresql_live",
+          activeWallets: Number(agg.active_wallets || 0),
+          totalCreditsPurchased: Number(agg.credits_purchased || 0),
+          totalCreditsSpent: Number(agg.credits_spent || 0),
+          verifiedDeflectionProofs: Number(agg.verified_proofs || 0),
+          brandSponsoredPoolCredits: poolCredits
+        };
+      } catch {
+      }
+    }
     res.json({
       stripe,
+      liveMetrics,
       starterCreditsGranted: DEFAULT_STARTER_CREDITS,
       packs: BILLING_CREDIT_PACKS,
       actionCosts: ACTION_CREDIT_RULES,
@@ -1982,6 +2210,91 @@ async function createApp() {
           client.release();
         }
       }
+    } else if (eventType === "invoice.paid" && pgPool) {
+      const invoiceObj = event.data?.object;
+      if (invoiceObj?.customer && invoiceObj?.billing_reason === "subscription_cycle") {
+        const proPack = getBillingPackById("pro_unlimited_monthly");
+        if (proPack) {
+          const client = await pgPool.connect();
+          try {
+            await client.query("BEGIN");
+            const inserted = await client.query(
+              `INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload_summary)
+               VALUES ($1, $2, $3::jsonb)
+               ON CONFLICT (stripe_event_id) DO NOTHING
+               RETURNING stripe_event_id`,
+              [eventId, eventType, JSON.stringify({ customer: invoiceObj.customer, credits: proPack.creditsGranted })]
+            );
+            if (inserted.rows.length > 0) {
+              const walletUpdate = await client.query(
+                `UPDATE user_credit_wallets
+                    SET credit_balance = credit_balance + $2,
+                        subscription_status = 'active',
+                        updated_at = NOW()
+                  WHERE stripe_customer_id = $1
+                  RETURNING user_id`,
+                [invoiceObj.customer, proPack.creditsGranted]
+              );
+              const walletUserId = walletUpdate.rows[0]?.user_id;
+              if (walletUserId) {
+                await client.query(
+                  `INSERT INTO credit_ledger_entries (
+                     user_id, delta_credits, reason, amount_cents, stripe_event_id
+                   ) VALUES ($1, $2, 'stripe_subscription_cycle', $3, $4)
+                   ON CONFLICT (stripe_event_id) DO NOTHING`,
+                  [
+                    walletUserId,
+                    proPack.creditsGranted,
+                    typeof invoiceObj.amount_paid === "number" ? invoiceObj.amount_paid : proPack.priceCents,
+                    eventId
+                  ]
+                );
+              }
+            }
+            await client.query("COMMIT");
+          } catch (err) {
+            await client.query("ROLLBACK").catch(() => void 0);
+            console.error("[Stripe invoice.paid DB Error]", err.message);
+            return res.status(500).json({ error: "Failed to process subscription renewal." });
+          } finally {
+            client.release();
+          }
+        }
+      }
+    } else if (eventType === "customer.subscription.deleted" && pgPool) {
+      const subObj = event.data?.object;
+      const customerId = typeof subObj?.customer === "string" ? subObj.customer : null;
+      const subscriptionId = typeof subObj?.id === "string" ? subObj.id : null;
+      if (customerId || subscriptionId) {
+        const client = await pgPool.connect();
+        try {
+          await client.query("BEGIN");
+          const inserted = await client.query(
+            `INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload_summary)
+             VALUES ($1, $2, $3::jsonb)
+             ON CONFLICT (stripe_event_id) DO NOTHING
+             RETURNING stripe_event_id`,
+            [eventId, eventType, JSON.stringify({ customerId, subscriptionId })]
+          );
+          if (inserted.rows.length > 0) {
+            await client.query(
+              `UPDATE user_credit_wallets
+                  SET subscription_status = 'canceled',
+                      updated_at = NOW()
+                WHERE ($1::text IS NOT NULL AND stripe_subscription_id = $1)
+                   OR ($2::text IS NOT NULL AND stripe_customer_id = $2)`,
+              [subscriptionId, customerId]
+            );
+          }
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => void 0);
+          console.error("[Stripe subscription.deleted DB Error]", err.message);
+          return res.status(500).json({ error: "Failed to cancel subscription status." });
+        } finally {
+          client.release();
+        }
+      }
     }
     return res.json({ received: true, eventId, eventType });
   });
@@ -2027,7 +2340,36 @@ async function createApp() {
   });
   app.get("/api/deliverables", requireAdmin, async (_req, res) => {
     const deliverablePaths = {
-      "schema.sql": path.join(__dirname, "schema.sql"),
+      "database/migrations/001_initial_ontology_schema.sql": path.join(
+        __dirname,
+        "database",
+        "migrations",
+        "001_initial_ontology_schema.sql"
+      ),
+      "database/migrations/002_auth_and_rbac.sql": path.join(
+        __dirname,
+        "database",
+        "migrations",
+        "002_auth_and_rbac.sql"
+      ),
+      "database/migrations/003_stripe_billing_and_deflection_proofs.sql": path.join(
+        __dirname,
+        "database",
+        "migrations",
+        "003_stripe_billing_and_deflection_proofs.sql"
+      ),
+      "database/migrations/004_brand_sponsored_pools_and_session_attribution.sql": path.join(
+        __dirname,
+        "database",
+        "migrations",
+        "004_brand_sponsored_pools_and_session_attribution.sql"
+      ),
+      "database/seeds/001_seed_reference_ontology.sql": path.join(
+        __dirname,
+        "database",
+        "seeds",
+        "001_seed_reference_ontology.sql"
+      ),
       "server.ts": path.join(__dirname, "server.ts"),
       "server.js": path.join(__dirname, "server.js"),
       "App.jsx": path.join(__dirname, "App.jsx"),
@@ -2135,19 +2477,49 @@ async function createApp() {
   }
   async function recordLiveDiagnosisToCloudSql(params) {
     if (!pgPool) return { sessionId: null, componentId: null };
-    const safeAnchor = params.scaleAnchor === "us_quarter" || params.scaleAnchor === "credit_card" || params.scaleAnchor === "human_thumb" || params.scaleAnchor === "webxr_depth" ? params.scaleAnchor : "none";
+    const safeAnchor = params.scaleAnchor === "us_quarter" || params.scaleAnchor === "credit_card" || params.scaleAnchor === "human_thumb" || params.scaleAnchor === "webxr_depth" || params.scaleAnchor === "ruler" ? params.scaleAnchor : "none";
     const safeIngest = params.ingestMode === "burst_photo_3x" ? "burst_photo_3x" : "webrtc_video";
+    const safeChannel = params.attributionChannel === "brand_qr_box" || params.attributionChannel === "support_portal_redirect" || params.attributionChannel === "barcode_sku_scan" ? params.attributionChannel : "organic_camera";
     let sessionId = null;
     let componentId = null;
     try {
-      const sessionRes = await pgPool.query(
-        `INSERT INTO diagnostic_sessions
-           (ingest_mode, has_webxr_depth, scale_anchor_type, decision_calls_count, neon_calls_count, estimated_compute_usd, outcome)
-         VALUES ($1, $2, $3, 1, 1, 0.0450, 'active')
-         RETURNING id`,
-        [safeIngest, Boolean(params.hasWebXRDepth), safeAnchor]
-      );
-      sessionId = sessionRes.rows[0]?.id ?? null;
+      try {
+        const sessionRes = await pgPool.query(
+          `INSERT INTO diagnostic_sessions
+             (ingest_mode, has_webxr_depth, scale_anchor_type, decision_calls_count, neon_calls_count,
+              estimated_compute_usd, outcome, user_id, attribution_channel, attribution_brand_id,
+              attribution_sku, attribution_ref, credits_charged)
+           VALUES ($1, $2, $3, 1, 1, 0.0450, 'active', $4, $5, $6, $7, $8, $9)
+           RETURNING id`,
+          [
+            safeIngest,
+            Boolean(params.hasWebXRDepth),
+            safeAnchor,
+            params.userId ?? null,
+            safeChannel,
+            params.attributionBrandId ?? null,
+            params.attributionSku ? params.attributionSku.slice(0, 120) : null,
+            params.attributionRef ? params.attributionRef.slice(0, 240) : null,
+            Math.max(0, Number(params.creditsCharged || 0))
+          ]
+        );
+        sessionId = sessionRes.rows[0]?.id ?? null;
+      } catch (insertErr) {
+        const pgCode = insertErr?.code;
+        if (pgCode === "42703" || pgCode === "23514") {
+          const legacyAnchor = safeAnchor === "ruler" ? "none" : safeAnchor;
+          const fallbackRes = await pgPool.query(
+            `INSERT INTO diagnostic_sessions
+               (ingest_mode, has_webxr_depth, scale_anchor_type, decision_calls_count, neon_calls_count, estimated_compute_usd, outcome)
+             VALUES ($1, $2, $3, 1, 1, 0.0450, 'active')
+             RETURNING id`,
+            [safeIngest, Boolean(params.hasWebXRDepth), legacyAnchor]
+          );
+          sessionId = fallbackRes.rows[0]?.id ?? null;
+        } else {
+          throw insertErr;
+        }
+      }
       let vectorLiteral = null;
       if (params.clients && params.frameDataUrl && params.frameDataUrl.length > 32) {
         try {
@@ -2440,12 +2812,28 @@ async function createApp() {
     }
   });
   app.post("/api/ontology/confirm-fix", requireEndUser, async (req, res) => {
-    const { sessionId = null, componentId = null, computeCostUsd = 0.08 } = req.body ?? {};
+    const {
+      sessionId = null,
+      componentId = null,
+      computeCostUsd = 0.08,
+      brandId = 1,
+      productSku = "GENERIC-REPAIR",
+      attributionChannel = "organic_camera",
+      attributionRef = null,
+      beforeIssueSummary = "Hardware issue diagnosed via live camera",
+      afterVerifiedState = "User confirmed physical repair completed safely",
+      verifiedByVision = false,
+      sponsoredCreditsUsed = 0
+    } = req.body ?? {};
     const safeCost = Number.isFinite(Number(computeCostUsd)) && Number(computeCostUsd) > 0 ? Number(computeCostUsd) : 0.08;
+    const safeBrandId = Number.isInteger(Number(brandId)) && Number(brandId) > 0 ? Number(brandId) : 1;
+    const safeChannel = attributionChannel === "brand_qr_box" || attributionChannel === "support_portal_redirect" || attributionChannel === "barcode_sku_scan" ? attributionChannel : "organic_camera";
+    const safeSku = String(productSku || "GENERIC-REPAIR").trim().slice(0, 120);
     let persistedToSql = false;
+    let resolvedSessionId = typeof sessionId === "string" && sessionId.length > 10 ? sessionId : null;
+    let proofSha256 = null;
     if (pgPool) {
       try {
-        let resolvedSessionId = typeof sessionId === "string" && sessionId.length > 10 ? sessionId : null;
         if (resolvedSessionId) {
           await pgPool.query(
             `UPDATE diagnostic_sessions
@@ -2466,10 +2854,42 @@ async function createApp() {
         if (resolvedSessionId) {
           await pgPool.query(
             `INSERT INTO deflection_bounties (session_id, brand_id, bounty_usd, compute_cost_usd)
-             VALUES ($1, 1, 30.00, $2)
+             VALUES ($1, $2, 30.00, $3)
              ON CONFLICT (session_id) DO NOTHING`,
-            [resolvedSessionId, safeCost]
+            [resolvedSessionId, safeBrandId, safeCost]
           );
+          const completedAtIso = (/* @__PURE__ */ new Date()).toISOString();
+          const beforeText = String(beforeIssueSummary || "").trim().slice(0, 500) || "Visual repair diagnosed";
+          const afterText = String(afterVerifiedState || "").trim().slice(0, 500) || "User confirmed repair complete";
+          proofSha256 = buildDeflectionProofHash({
+            sessionId: resolvedSessionId,
+            brandId: safeBrandId,
+            productSku: safeSku,
+            attributionChannel: safeChannel,
+            beforeIssueSummary: beforeText,
+            afterVerifiedState: afterText,
+            completedAtIso
+          });
+          await pgPool.query(
+            `INSERT INTO brand_deflection_proofs (
+                 session_id, brand_id, product_sku, attribution_channel, attribution_ref,
+                 before_issue_summary, after_verified_state, verified_by_vision,
+                 proof_sha256, sponsored_credits_used, bounty_usd
+               ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 30.00)
+               ON CONFLICT (proof_sha256) DO NOTHING`,
+            [
+              resolvedSessionId,
+              safeBrandId,
+              safeSku,
+              safeChannel,
+              typeof attributionRef === "string" ? attributionRef.slice(0, 240) : null,
+              beforeText,
+              afterText,
+              Boolean(verifiedByVision),
+              proofSha256,
+              Math.max(0, Number(sponsoredCreditsUsed || 0))
+            ]
+          ).catch(() => void 0);
         }
         if (componentId && Number.isFinite(Number(componentId))) {
           await pgPool.query(
@@ -2490,6 +2910,8 @@ async function createApp() {
     return res.json({
       status: "confirmed",
       source: persistedToSql ? "postgresql_pgvector" : "in_memory_cte_parity",
+      sessionId: resolvedSessionId,
+      proofSha256,
       flywheel
     });
   });
@@ -2544,7 +2966,12 @@ async function createApp() {
       stillDurationMs = 0,
       scenarioHint = "",
       userQuestion = "",
-      queryVector
+      queryVector,
+      brandSponsored = false,
+      attributionChannel = "organic_camera",
+      attributionBrandId = null,
+      attributionSku = null,
+      attributionRef = null
     } = req.body ?? {};
     if (!Array.isArray(frames) || frames.length === 0) {
       return res.status(400).json({
@@ -2556,6 +2983,19 @@ async function createApp() {
       return res.status(503).json({
         error: "GEMINI_API_KEY is not configured on the server. Configure a valid Gemini 4 API key in Secrets to invoke gemini-decision-1 and gemini-4-neon.",
         code: "API_KEY_MISSING"
+      });
+    }
+    const creditGate = await enforceAndDeductCredits({
+      action: "scan_problem",
+      userId: req.authPrincipal?.userId ?? null,
+      brandSponsored: Boolean(brandSponsored),
+      attributionBrandId: Number.isInteger(Number(attributionBrandId)) ? Number(attributionBrandId) : null
+    });
+    if (!creditGate.allowed) {
+      return res.status(creditGate.httpStatus).json({
+        error: creditGate.error,
+        code: creditGate.code,
+        remainingBalance: creditGate.remainingBalance
       });
     }
     const incomingFrames = frames;
@@ -2843,10 +3283,16 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
         pipMotionPrompt: typeof parsedDiagnosis.pipMotionPrompt === "string" ? parsedDiagnosis.pipMotionPrompt : void 0,
         motionCue: normalizeMotionCue(parsedDiagnosis.motionCue || parsedDiagnosis.rotationDirection),
         estimatedPartSizeMm: scaleCalibration.estimatedPartSizeMm,
-        scaleAnchor: effectiveAnchor,
+        scaleAnchor: scaleCalibration.detectedObject === "ruler" ? "ruler" : effectiveAnchor,
         hasWebXRDepth: Boolean(hasWebXRDepth),
         ingestMode: ingestMode === "burst_photo_3x" ? "burst_photo_3x" : "webrtc_video",
         frameDataUrl: primaryFrameDataUrl,
+        userId: req.authPrincipal?.userId ?? null,
+        attributionChannel,
+        attributionBrandId: Number.isInteger(Number(attributionBrandId)) ? Number(attributionBrandId) : null,
+        attributionSku: typeof attributionSku === "string" ? attributionSku : null,
+        attributionRef: typeof attributionRef === "string" ? attributionRef : null,
+        creditsCharged: creditGate.creditsCharged,
         clients
       });
       const baseCoaching = String(
@@ -2929,7 +3375,14 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
     }
   });
   app.post("/api/generate-pip", requireEndUser, async (req, res) => {
-    const { prompt, referenceFrameDataUrl, duration = "6s" } = req.body ?? {};
+    const {
+      prompt,
+      referenceFrameDataUrl,
+      duration = "6s",
+      sessionId = null,
+      brandSponsored = false,
+      attributionBrandId = null
+    } = req.body ?? {};
     if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "A motion guidance prompt is required." });
     }
@@ -2938,6 +3391,20 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
       return res.status(503).json({
         error: "GEMINI_API_KEY is not configured on the server. Configure a billing-enabled Gemini 4 API key to generate PiP video loops via gemini-omni-1.2-flash.",
         code: "API_KEY_MISSING"
+      });
+    }
+    const creditGate = await enforceAndDeductCredits({
+      action: "generate_pip",
+      userId: req.authPrincipal?.userId ?? null,
+      diagnosticSessionId: typeof sessionId === "string" && sessionId.length > 10 ? sessionId : null,
+      brandSponsored: Boolean(brandSponsored),
+      attributionBrandId: Number.isInteger(Number(attributionBrandId)) ? Number(attributionBrandId) : null
+    });
+    if (!creditGate.allowed) {
+      return res.status(creditGate.httpStatus).json({
+        error: creditGate.error,
+        code: creditGate.code,
+        remainingBalance: creditGate.remainingBalance
       });
     }
     try {
@@ -2997,7 +3464,12 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
       scaleAnchor = "none",
       hasWebXRDepth = false,
       scaleOptOut = false,
-      format
+      format,
+      brandSponsored = false,
+      attributionChannel = "organic_camera",
+      attributionBrandId = null,
+      attributionSku = null,
+      attributionRef = null
     } = req.body ?? {};
     const rawAudioInput = typeof audio === "string" ? audio : typeof audio?.data === "string" ? audio.data : typeof audioDataUrl === "string" ? audioDataUrl : typeof audioBase64 === "string" ? audioBase64 : "";
     const rawMime = typeof audio === "object" && audio?.mimeType || (typeof audioMimeType === "string" ? audioMimeType : "audio/webm");
@@ -3018,6 +3490,19 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
       return res.status(503).json({
         error: "GEMINI_API_KEY is not configured on the server. Configure a valid Gemini 4 API key in Secrets.",
         code: "API_KEY_MISSING"
+      });
+    }
+    const creditGate = await enforceAndDeductCredits({
+      action: "voice_assist",
+      userId: req.authPrincipal?.userId ?? null,
+      brandSponsored: Boolean(brandSponsored),
+      attributionBrandId: Number.isInteger(Number(attributionBrandId)) ? Number(attributionBrandId) : null
+    });
+    if (!creditGate.allowed) {
+      return res.status(creditGate.httpStatus).json({
+        error: creditGate.error,
+        code: creditGate.code,
+        remainingBalance: creditGate.remainingBalance
       });
     }
     const incomingFrames = Array.isArray(frames) ? frames : [];
@@ -3254,10 +3739,16 @@ Return the detected scale object, millimeter comparison (if calibrated), targetB
             pipMotionPrompt: parsed.pipMotionPrompt?.trim() || void 0,
             motionCue: primaryMotion,
             estimatedPartSizeMm: scaleCalibration.estimatedPartSizeMm,
-            scaleAnchor: effectiveAnchor,
+            scaleAnchor: scaleCalibration.detectedObject === "ruler" ? "ruler" : effectiveAnchor,
             hasWebXRDepth: Boolean(hasWebXRDepth),
             ingestMode: "webrtc_video",
             frameDataUrl: primaryFrame,
+            userId: req.authPrincipal?.userId ?? null,
+            attributionChannel,
+            attributionBrandId: Number.isInteger(Number(attributionBrandId)) ? Number(attributionBrandId) : null,
+            attributionSku: typeof attributionSku === "string" ? attributionSku : null,
+            attributionRef: typeof attributionRef === "string" ? attributionRef : null,
+            creditsCharged: creditGate.creditsCharged,
             clients
           });
           learnedSessionId = learned.sessionId;

@@ -295,8 +295,8 @@ Exposing the Admin & Operations Platform through a clickable logo or query param
 4. **In-Memory Client Token Boundary (`src/lib/authContext.tsx` + `src/components/AdminAuthScaffoldCard.tsx`):**
    - `AuthProvider` stores any active `Authorization: Bearer` token strictly in React memory (`useRef`)—never in `localStorage` or `sessionStorage`.
    - When `AUTH_ENFORCEMENT_MODE=enforced` is enabled, `/admin` automatically renders `<AdminLoginGate />` until an operator authenticates with `admin` or `super_admin` privileges.
-5. **Cloud SQL Identity Schema (`schema.sql` Section 8):**
-   - Idempotent `app_users` (`email`, `role`, `auth_provider` supporting `email_password_scrypt`, `oidc_google`, `firebase_auth`, `external_sub`, `password_hash`, `is_active`), `auth_sessions` (`token_sha256`, `role_snapshot`, `expires_at`, `revoked_at`), and `diagnostic_sessions.user_id` foreign key linking repairs to end-user accounts.
+5. **Cloud SQL Identity Schema (`database/migrations/002_auth_and_rbac.sql`):**
+   - Idempotent PostgreSQL 16 `app_users` (`email`, `role`, `auth_provider` supporting `email_password_scrypt`, `oidc_google`, `firebase_auth`, `external_sub`, `password_hash`, `is_active`), `auth_sessions` (`token_sha256`, `role_snapshot`, `expires_at`, `revoked_at` — persisted and checked across Cloud Run instances), and `diagnostic_sessions.user_id` foreign key linking repairs to end-user accounts.
 
 ```mermaid
 flowchart TB
@@ -318,7 +318,7 @@ flowchart TB
         ADMIN_ROUTES["Operations & Ontology APIs\n/api/db/status · /ontology/tree · /search\n/ontology/deflection · /deliverables"]
     end
 
-    subgraph IdentityStore["Cloud SQL PostgreSQL 16 (schema.sql §8) / OIDC / Firebase Auth"]
+    subgraph IdentityStore["Cloud SQL PostgreSQL 16 (database/migrations/002) / OIDC / Firebase Auth"]
         USERS["app_users\nrole: end_user | technician | admin | super_admin"]
         SESSIONS["auth_sessions\ntoken_sha256 · expires_at · revoked_at"]
     end
@@ -380,7 +380,7 @@ sequenceDiagram
 
 | ID | Architectural Problem | Adopted Design | Verification Standard |
 | :--- | :--- | :--- | :--- |
-| **ADR 001** | Graph traversal + multimodal RAG without Neo4j or stateful SQLite volumes | PostgreSQL 16 with Recursive CTEs (`WITH RECURSIVE`) and `pgvector` HNSW cosine indexes; dual-transport Cloud SQL resolver (`SQL_*` and `DB_*` aliases, `/cloudsql/` socket presence check + Public IP TLS fallback) | `schema.sql` functions `get_component_hierarchy` & `rag_search_ontology_subgraph`; unit tests (`dbConfig.test.ts`, `ontologyMapper.test.ts`) |
+| **ADR 001** | Graph traversal + multimodal RAG without Neo4j or stateful SQLite volumes | PostgreSQL 16 with Recursive CTEs (`WITH RECURSIVE`) and `pgvector` HNSW cosine indexes; dual-transport Cloud SQL resolver (`SQL_*` and `DB_*` aliases, `/cloudsql/` socket presence check + Public IP TLS fallback) | `database/migrations/001_initial_ontology_schema.sql` functions `get_component_hierarchy` & `rag_search_ontology_subgraph`; unit tests (`dbConfig.test.ts`, `ontologyMapper.test.ts`) |
 | **ADR 002** | Scale-to-zero serverless hosting & drift between dev `server.ts` and Cloud Run `server.js` | Single source of truth in `server.ts`, compiled by `esbuild` directly into `server.js` (ESM) in `Dockerfile` and repo so dev, Cloud Run, and `node server.js` expose identical routes (`/api/health`, `/api/ontology/*`, `/api/deliverables`) | `Dockerfile` multi-stage build + production `node server.js` smoke test |
 | **ADR 003 / Break 1** | Continuous 1080p streaming caused iPhone Safari thermal dimming & API bloat | Client-side Wasm motion gate (3s stillness) → zero-token `gemini-decision-1` → conditional `gemini-4-neon` | QA Test Case 3 + unit tests (`routingLogic.test.ts`) |
 | **ADR 004** | Hands-free voice queries from global users require same-language spoken mechanic guidance without forcing English | Two-stage pipeline at `POST /api/voice-assist`: `gemini-4-neon` structured JSON language detection + Scale Calibration + multi-step diagnosis → `normalizeBcp47Language` → `gemini-3.8-flash-lite-tts` returning binary 24 kHz RIFF WAV + structured repair guide | QA Test Case 4 + unit tests (`audioUtils.test.ts`, `scaleCalibration.test.ts`) |

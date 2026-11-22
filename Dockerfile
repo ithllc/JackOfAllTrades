@@ -56,7 +56,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.js ./server.js
 COPY server.ts ./server.ts
 COPY App.jsx ./App.jsx
-COPY schema.sql ./schema.sql
+COPY database ./database
 COPY Dockerfile ./Dockerfile
 COPY LICENSE ./LICENSE
 COPY docs ./docs

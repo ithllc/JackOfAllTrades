@@ -12,7 +12,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx --test src/lib/*.test.ts"
+    "test": "tsx --test src/lib/*.test.ts",
+    "db:migrations": "ls -1 database/migrations/*.sql database/seeds/*.sql"
   },
   "dependencies": {
     "@google/genai": "^3.6.1",

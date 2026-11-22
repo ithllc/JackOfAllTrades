@@ -252,7 +252,7 @@ export function enforceScaleAnchorInvariant(
 }
 
 // =============================================================================
-// Recursive CTE & Vector Similarity Ontology Graph (In-Memory Parity with schema.sql)
+// Recursive CTE & Vector Similarity Ontology Graph (In-Memory Parity with database/migrations/001_initial_ontology_schema.sql)
 // =============================================================================
 
 export interface OntologyComponentNode {
@@ -563,7 +563,7 @@ export function createSeedOntologyNodes(): OntologyComponentNode[] {
 }
 
 /**
- * In-memory relational ontology engine mirroring schema.sql Recursive CTEs & pgvector search.
+ * In-memory relational ontology engine mirroring database/migrations/001_initial_ontology_schema.sql Recursive CTEs & pgvector search.
  * Used as a deterministic fallback when Cloud SQL / local Postgres is not mounted, and in unit tests.
  */
 export class InMemoryOntologyGraph {

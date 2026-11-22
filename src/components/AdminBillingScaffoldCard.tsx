@@ -21,6 +21,14 @@ export interface BillingOverviewPayload {
     keyMode: 'live' | 'test' | 'unconfigured';
     enforcementMode: BillingEnforcementMode;
   };
+  liveMetrics?: {
+    source: 'postgresql_live' | 'scaffold_fallback';
+    activeWallets: number;
+    totalCreditsPurchased: number;
+    totalCreditsSpent: number;
+    verifiedDeflectionProofs: number;
+    brandSponsoredPoolCredits: number;
+  };
   starterCreditsGranted: number;
   webhookPath: string;
   b2b2cAttributionChannels: Array<{
@@ -42,6 +50,8 @@ export const AdminBillingScaffoldCard: React.FC<AdminBillingScaffoldCardProps> =
   const webhookReady = Boolean(overview?.stripe?.webhookSecretConfigured);
   const enforcementMode = overview?.stripe?.enforcementMode ?? 'scaffold';
   const isEnforced = enforcementMode === 'enforced';
+  const metrics = overview?.liveMetrics;
+  const isLivePg = metrics?.source === 'postgresql_live';
 
   return (
     <section
@@ -85,6 +95,40 @@ export const AdminBillingScaffoldCard: React.FC<AdminBillingScaffoldCardProps> =
         </div>
       </div>
 
+      {/* Live Cloud SQL Billing & Deflection Proof Counters */}
+      <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <p className="text-[11px] font-medium text-slate-500">Active Wallets</p>
+          <p className="mt-1 font-mono text-lg font-bold text-slate-900 tabular-nums">
+            {metrics ? metrics.activeWallets : '—'}
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500">
+            {isLivePg ? 'Live Cloud SQL' : 'Run migration 003'}
+          </p>
+        </div>
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <p className="text-[11px] font-medium text-slate-500">Credits Purchased / Spent</p>
+          <p className="mt-1 font-mono text-lg font-bold text-slate-900 tabular-nums">
+            {metrics ? `${metrics.totalCreditsPurchased} / ${metrics.totalCreditsSpent}` : '—'}
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500">credit_ledger_entries</p>
+        </div>
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <p className="text-[11px] font-medium text-slate-500">Verified Deflection Proofs</p>
+          <p className="mt-1 font-mono text-lg font-bold text-slate-900 tabular-nums">
+            {metrics ? metrics.verifiedDeflectionProofs : '—'}
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500">SHA-256 certificates</p>
+        </div>
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3">
+          <p className="text-[11px] font-medium text-slate-500">Brand Sponsored Pool</p>
+          <p className="mt-1 font-mono text-lg font-bold text-slate-900 tabular-nums">
+            {metrics ? metrics.brandSponsoredPoolCredits : '—'}
+          </p>
+          <p className="mt-0.5 text-[11px] text-slate-500">OEM prepaid credits</p>
+        </div>
+      </div>
+
       {/* 3-Column Readiness Summary */}
       <div className="mt-5 grid grid-cols-1 gap-4 md:grid-cols-3">
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
@@ -97,7 +141,7 @@ export const AdminBillingScaffoldCard: React.FC<AdminBillingScaffoldCardProps> =
         <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
           <p className="text-xs font-semibold text-slate-900">Idempotent Webhook Fulfillment</p>
           <p className="mt-1.5 text-xs text-slate-600 leading-relaxed">
-            <code className="font-mono text-[11px]">POST /api/billing/webhook</code> verifies raw-body <code className="font-mono text-[11px]">Stripe-Signature</code> HMACs ({webhookReady ? 'secret active' : 'awaiting STRIPE_WEBHOOK_SECRET'}) and deduplicates via <code className="font-mono text-[11px]">stripe_webhook_events</code>.
+            <code className="font-mono text-[11px]">POST /api/billing/webhook</code> verifies raw-body <code className="font-mono text-[11px]">Stripe-Signature</code> HMACs ({webhookReady ? 'secret active' : 'awaiting STRIPE_WEBHOOK_SECRET'}) and handles checkout, renewals, and cancellations via <code className="font-mono text-[11px]">stripe_webhook_events</code>.
           </p>
         </div>
 

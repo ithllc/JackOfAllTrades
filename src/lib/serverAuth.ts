@@ -167,19 +167,24 @@ export function extractBearerToken(authHeader?: string | null): string | null {
   return match ? match[1] : null;
 }
 
-// Process-level token revocation store (backed by Cloud SQL `auth_sessions` in full rollout)
+// Process-level token revocation cache (paired with Cloud SQL `auth_sessions` persistence)
 const revokedTokenHashes = new Set<string>();
+
+/**
+ * Computes the hex SHA-256 digest of a Bearer session token for storage in `auth_sessions.token_sha256`.
+ */
+export function hashSessionTokenSha256(token: string): string {
+  return crypto.createHash('sha256').update(token, 'utf8').digest('hex');
+}
 
 export function revokeSessionToken(token: string): void {
   if (!token) return;
-  const digest = crypto.createHash('sha256').update(token).digest('hex');
-  revokedTokenHashes.add(digest);
+  revokedTokenHashes.add(hashSessionTokenSha256(token));
 }
 
 export function isTokenRevoked(token: string): boolean {
   if (!token) return false;
-  const digest = crypto.createHash('sha256').update(token).digest('hex');
-  return revokedTokenHashes.has(digest);
+  return revokedTokenHashes.has(hashSessionTokenSha256(token));
 }
 
 /**
@@ -194,16 +199,29 @@ export function createRequireAuthMiddleware(
   options?: {
     enforcementMode?: AuthEnforcementMode;
     secret?: string;
+    isTokenRevokedInDb?: (tokenSha256: string) => Promise<boolean>;
   }
 ) {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  return async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     const mode =
       options?.enforcementMode ?? resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE);
     const secret = options?.secret ?? resolveSessionSigningSecret();
 
     const bearer = extractBearerToken(req.headers.authorization);
-    const principal =
+    let principal =
       bearer && !isTokenRevoked(bearer) ? verifySessionToken(bearer, secret) : null;
+
+    if (principal && bearer && options?.isTokenRevokedInDb) {
+      try {
+        const revokedInDb = await options.isTokenRevokedInDb(hashSessionTokenSha256(bearer));
+        if (revokedInDb) {
+          revokeSessionToken(bearer);
+          principal = null;
+        }
+      } catch {
+        // Non-fatal fallback if DB is temporarily unreachable; HMAC signature & expiry still apply
+      }
+    }
 
     req.authPrincipal = principal;
 

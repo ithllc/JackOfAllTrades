@@ -50,24 +50,39 @@ Required environment variables (inject credentials via Google Secret Manager on 
      --password="$SQL_PASSWORD"
    ```
 
-2. **Apply `schema.sql` (enables `pgvector`, creates Recursive CTE views/functions, seeds ontology):**
+2. **Apply PostgreSQL 16 Migrations & Reference Seed (in exact order):**
+   All scripts under `database/migrations/` and `database/seeds/` are 100% PostgreSQL 16 native and idempotent.
 
    **Option A — Via Cloud SQL Auth Proxy (recommended, no public IP allowlist required):**
    ```bash
    cloud-sql-proxy gemini4nyc26nyc-2273:us-east1:free-trial-first-project --port 5432 &
-   psql "host=127.0.0.1 port=5432 dbname=jackofalltrades user=postgres" -f schema.sql
+   psql "host=127.0.0.1 port=5432 dbname=postgres user=postgres" -v ON_ERROR_STOP=1 \
+     -f database/migrations/001_initial_ontology_schema.sql \
+     -f database/migrations/002_auth_and_rbac.sql \
+     -f database/migrations/003_stripe_billing_and_deflection_proofs.sql \
+     -f database/migrations/004_brand_sponsored_pools_and_session_attribution.sql \
+     -f database/seeds/001_seed_reference_ontology.sql
    ```
 
    **Option B — Direct over Public IP (`34.74.102.222:5432`) with TLS:**
    *(Ensure your workstation IP is listed under Cloud SQL → Connections → Authorized Networks.)*
    ```bash
-   psql "host=34.74.102.222 port=5432 dbname=jackofalltrades user=postgres sslmode=require" -f schema.sql
+   psql "host=34.74.102.222 port=5432 dbname=postgres user=postgres sslmode=require" -v ON_ERROR_STOP=1 \
+     -f database/migrations/001_initial_ontology_schema.sql \
+     -f database/migrations/002_auth_and_rbac.sql \
+     -f database/migrations/003_stripe_billing_and_deflection_proofs.sql \
+     -f database/migrations/004_brand_sponsored_pools_and_session_attribution.sql \
+     -f database/seeds/001_seed_reference_ontology.sql
    ```
 
-3. **Verify `pgvector` HNSW index and Recursive CTE traversal:**
+   **Option C — Google Cloud SQL Studio (Browser SQL Editor):**
+   Run each file's contents in exact order: `001` → `002` → `003` → `004` → `database/seeds/001_seed_reference_ontology.sql`.
+
+3. **Verify `pgvector` HNSW index, Recursive CTE traversal, and all tables:**
    ```sql
-   SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';
+   SELECT extname, extversion FROM pg_extension WHERE extname IN ('vector', 'pgcrypto');
    SELECT * FROM get_component_hierarchy(1);
+   SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name;
    ```
 
    > **Network Reference:** Cloud SQL Public IP is `34.74.102.222:5432`; instance Outgoing IP is `34.73.184.213` (use this if federating external replicas or outbound firewall allowlists).
@@ -191,8 +206,8 @@ Because Jack of All Trades is licensed under **GNU AGPL-3.0**, any organization 
 
 The Admin Platform (`/admin`) is already isolated from the end-user camera and demo screens (zero clickable links in the main PWA, and `?admin=1` is disabled). When you are ready to turn on mandatory accounts and role-based sign-in for both end users and admin operators:
 
-1. **Apply Auth Schema Tables in Cloud SQL (`schema.sql` Section 8):**
-   Run the idempotent `schema.sql` script against your PostgreSQL 16 database to create `app_users`, `auth_sessions`, and `diagnostic_sessions.user_id`.
+1. **Apply Auth Schema Migration in Cloud SQL (`database/migrations/002_auth_and_rbac.sql`):**
+   Run `database/migrations/002_auth_and_rbac.sql` against your PostgreSQL 16 database to create `app_users`, `auth_sessions`, and `diagnostic_sessions.user_id`.
 2. **Generate a Signing Secret & Store in Google Secret Manager:**
    Generate a high-entropy 32-byte hex signing secret (`openssl rand -hex 32`) and mount it in Cloud Run via Secret Manager as `AUTH_SESSION_SECRET` (never commit signing secrets to `.env.example` or source control).
 3. **Seed Your First Admin Operator Account (`role = 'admin'` or `'super_admin'`):**
@@ -202,6 +217,7 @@ The Admin Platform (`/admin`) is already isolated from the end-user camera and d
    - `/admin` automatically displays `<AdminLoginGate />` until an operator signs in with an `admin` or `super_admin` account.
    - All admin APIs (`/api/db/status`, `/api/ontology/tree`, `/api/ontology/search`, `/api/ontology/deflection`, `/api/deliverables`) return `401` without a valid Bearer token and `403` for `end_user` tokens.
    - All end-user repair APIs (`/api/analyze-buffer`, `/api/voice-assist`, `/api/generate-pip`, `/api/ontology/confirm-fix`, `/api/ontology/feedback`) require a verified `end_user` (or higher) Bearer token.
+   - Sessions are persisted and revoked across Cloud Run instances via `auth_sessions`.
 5. **Verify Enforcement Before Go-Live:**
    ```bash
    # Should return HTTP 401 once AUTH_ENFORCEMENT_MODE=enforced
@@ -214,13 +230,13 @@ The Admin Platform (`/admin`) is already isolated from the end-user camera and d
 
 ## 8. Stripe Payments & Pay-As-You-Go Credit Rollout Guide (ADR 009)
 
-1. **Apply Billing & Proof Tables in Cloud SQL (`schema.sql` Section 9):**
-   Run the idempotent `schema.sql` script to create `user_credit_wallets`, `stripe_webhook_events`, `credit_ledger_entries`, and `brand_deflection_proofs`.
+1. **Apply Billing, Proof & Attribution Migrations in Cloud SQL (`003` & `004`):**
+   Run `database/migrations/003_stripe_billing_and_deflection_proofs.sql` and `database/migrations/004_brand_sponsored_pools_and_session_attribution.sql` to create `user_credit_wallets`, `stripe_webhook_events`, `credit_ledger_entries`, `brand_deflection_proofs`, brand sponsored credit pools, and session attribution columns.
 2. **Store Stripe Secrets in Google Secret Manager (Never in Git or `VITE_*`):**
    - Create secrets for `STRIPE_SECRET_KEY` (start with `sk_test_...` in staging) and `STRIPE_WEBHOOK_SECRET` (`whsec_...`).
    - Optionally create Stripe Product/Price IDs for `starter_10`, `homeowner_30`, `pro_pack_100`, and `pro_unlimited_monthly` (`STRIPE_PRICE_*`), or allow the server to send server-authoritative `price_data` automatically.
 3. **Register the Stripe Webhook Endpoint:**
-   - In the Stripe Dashboard → Developers → Webhooks, point `https://<CLOUD_RUN_URL>/api/billing/webhook` to listen for `checkout.session.completed` (and `invoice.paid` / `customer.subscription.deleted` when enabling Pro Monthly).
+   - In the Stripe Dashboard → Developers → Webhooks, point `https://<CLOUD_RUN_URL>/api/billing/webhook` to listen for `checkout.session.completed`, `invoice.paid`, and `customer.subscription.deleted`.
    - For local testing, run `stripe listen --forward-to localhost:3000/api/billing/webhook`.
 4. **Activate Credit Enforcement:**
    - Once end-user authentication (`AUTH_ENFORCEMENT_MODE=enforced`) and Stripe secrets are verified, set `BILLING_ENFORCEMENT_MODE=enforced`.

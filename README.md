@@ -5,7 +5,7 @@
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-22%2B-339933.svg)](https://nodejs.org/)
 [![React](https://img.shields.io/badge/React-19-61DAFB.svg)](https://react.dev/)
-[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-336791.svg)](./schema.sql)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-336791.svg)](./database/migrations/001_initial_ontology_schema.sql)
 
 **Jack of All Trades** is an AGPL-3.0 Progressive Web App that turns any smartphone or tablet camera into a real-time, voice-enabled visual mechanic and assembly guide. Designed with a distraction-free **Magic Window** camera interface for non-technical users and backed by a zero-token decision routing pipeline, multilingual two-way audio, and a PostgreSQL `pgvector` physical ontology graph, it helps users identify hardware parts, follow step-by-step repair instructions, and avoid costly mistakes or unnecessary product returns.
 
@@ -20,7 +20,7 @@
 - **Pixel-Ratio Scale Anchor Guard (ADR 006 / Break 2)** — Compares target hardware against known reference dimensions (`24.26 mm` US quarter, `85.6 mm` credit card, `20 mm` thumb, or ruler), reports `estimatedPartSizeMm`, and redacts exact metric/imperial tool specs unless calibrated (or explicitly opted out with written + spoken explanation).
 - **Self-Learning PostgreSQL Recursive CTE + `pgvector` Ontology RAG (ADR 001 & ADR 007)** — Every live Scan and Hold-to-Explain session automatically logs to Cloud SQL (`diagnostic_sessions`), embeds frames with `gemini-embedding-2`, learns new parts/actions, and updates live `success_rate` & `$30` return-deflection bounties when users tap **Done — This Fixed It!** or **Wrong Part or Size?**.
 - **Multi-Step Repairs with On-Demand Per-Step PiP Clips (ADR 005)** — Supports multi-step guided repairs (up to 6 steps) where each step carries its own AR reticle, directional cue, and repair-only hand-motion prompt. Tapping **Show Step N Motion** generates and caches a 6-second `gemini-omni-1.2-flash` loop on demand (playable inline or in a floating corner Mini-PiP over the live camera).
-- **Built-In Admin & Operations Platform (`/admin`)** — Live system health monitoring (`/api/health`), Cloud SQL diagnostics, Scale Anchor Guard tester, live Cloud SQL Ontology RAG explorer, architecture diagrams, one-click copy/download AGPL-3.0 corresponding source (`server.ts`, `server.js`, `schema.sql`, `Dockerfile`, `docs/*`), and embedded QA runbook.
+- **Built-In Admin & Operations Platform (`/admin`)** — Live system health monitoring (`/api/health`), Cloud SQL diagnostics, Scale Anchor Guard tester, live Cloud SQL Ontology RAG explorer, architecture diagrams, one-click copy/download AGPL-3.0 corresponding source (`database/migrations/*.sql`, `database/seeds/*.sql`, `server.ts`, `server.js`, `Dockerfile`, `docs/*`), and embedded QA runbook.
 
 ---
 
@@ -65,7 +65,17 @@ For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Re
 .
 ├── server.ts                  # Unified Express + Vite dev/prod backend source (TypeScript)
 ├── server.js                  # Compiled Cloud Run production bundle (generated from server.ts)
-├── schema.sql                 # PostgreSQL 16 + pgvector schema, Recursive CTEs, Auth & Stripe tables
+├── database/
+│   ├── migrations/
+│   │   ├── 001_initial_ontology_schema.sql   # PostgreSQL 16 + pgvector schema & Recursive CTEs
+│   │   ├── 002_auth_and_rbac.sql             # app_users, auth_sessions & diagnostic_sessions.user_id
+│   │   ├── 003_stripe_billing_and_deflection_proofs.sql # Wallets, webhooks, ledger & SHA-256 proofs
+│   │   └── 004_brand_sponsored_pools_and_session_attribution.sql # OEM credit pools, attribution & ruler anchor
+│   └── seeds/
+│       └── 001_seed_reference_ontology.sql   # Idempotent PostgreSQL 16 reference ontology seed
+├── secret-manager-setup/
+│   └── README.md              # Step-by-step beginner guide to Google Cloud Secret Manager
+├── cloudbuild.yaml            # Cloud Run service manifest with Secret Manager key mappings
 ├── Dockerfile                 # Multi-stage container (compiles server.ts -> server.js, Port 8080)
 ├── App.jsx                    # Standalone AGPL-3.0 reference client deliverable
 ├── docs/
@@ -181,7 +191,7 @@ The console is organized into four tabs:
 
 1. **Overview** — Live Gemini 4 API status, Identity & RBAC scaffold status, Cloud SQL connection diagnostics, B2B2C return-deflection metrics, guided demo & TTS test controls, and the full backend API directory.
 2. **Ontology & RAG** — Interactive **Scale Anchor Guard Tester**, Recursive CTE component tree browser, vector similarity search, and instant M4/M6 correction feedback.
-3. **Architecture** — End-to-end topology visualization plus one-click copy/download for `schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `LICENSE`.
+3. **Architecture** — End-to-end topology visualization plus one-click copy/download for `database/migrations/*.sql`, `database/seeds/*.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/ARCHITECTURE.md`, `docs/RUNBOOK.md`, and `LICENSE`.
 4. **Runbook** — QA verification matrix (Test Cases 1–4), RBAC rollout instructions, and the embedded copyable operations runbook.
 
 ---
@@ -206,18 +216,18 @@ The console is organized into four tabs:
 | `POST` | `/api/ontology/feedback` | Records end-user part/size corrections, embeds frames via `gemini-embedding-2`, and updates or creates Cloud SQL ontology nodes immediately. *(End-User RBAC)* |
 | `POST` | `/api/ontology/confirm-fix` | Marks a live diagnostic session `resolved_deflected`, updates `repair_actions.success_rate`, and logs a `$30` return-deflection bounty. *(End-User RBAC)* |
 | `POST` | `/api/ontology/deflection` | Logs a verified B2B2C hardware return deflection bounty from the Admin console. *(Admin RBAC)* |
-| `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source (`schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/*`, `LICENSE`) for the running revision. *(Admin RBAC)* |
+| `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source (`database/migrations/*.sql`, `database/seeds/*.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/*`, `LICENSE`) for the running revision. *(Admin RBAC)* |
 | `GET` | `/api/billing/catalog` | Returns server-authoritative pay-as-you-go credit packs, Pro Monthly option, and per-action credit weights (ADR 009). |
 | `GET` | `/api/billing/wallet` | Returns the caller's credit wallet balance and recent credit ledger entries. *(End-User RBAC)* |
 | `POST` | `/api/billing/checkout-session` | Creates a server-priced Stripe Hosted Checkout session by `packId`. *(End-User RBAC)* |
 | `POST` | `/api/billing/webhook` | Raw-body HMAC-verified Stripe webhook fulfilling purchased credits idempotently into Cloud SQL. |
-| `GET` | `/api/billing/overview` | Returns Stripe readiness, unit economics, and B2B2C proof-of-deflection attribution channels. *(Admin RBAC)* |
+| `GET` | `/api/billing/overview` | Returns Stripe readiness, live Cloud SQL billing/proof totals, unit economics, and B2B2C proof-of-deflection attribution channels. *(Admin RBAC)* |
 
 ---
 
 ## Deployment (Google Cloud SQL + Cloud Run)
 
-1. **Provision Database Schema:** Apply [`schema.sql`](./schema.sql) to your PostgreSQL 16 instance (enables `pgvector`, creates Recursive CTE views/functions, and seeds the initial hardware ontology).
+1. **Provision Database Schema:** Apply PostgreSQL 16 migrations [`database/migrations/001`](./database/migrations/001_initial_ontology_schema.sql) through `004` followed by [`database/seeds/001_seed_reference_ontology.sql`](./database/seeds/001_seed_reference_ontology.sql) in order (enables `pgvector`, creates Recursive CTE views/functions, RBAC, Stripe credit ledger, B2B2C proofs, and seeds the initial hardware ontology).
 2. **Build Container:** Build the multi-stage image using [`Dockerfile`](./Dockerfile) (exposes port `8080`).
 3. **Deploy to Cloud Run:** Attach your Cloud SQL instance via `--add-cloudsql-instances` and inject `GEMINI_API_KEY` and `SQL_PASSWORD` from **Google Secret Manager**.
 
