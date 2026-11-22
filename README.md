@@ -55,7 +55,7 @@ flowchart LR
 | **Motion Output** | `gemini-omni-1.2-flash` | Picture-in-Picture video loops illustrating hand motions and latch mechanisms. |
 | **Embeddings** | `gemini-embedding-2` | 768-dimensional visual signature vectors for instant ontology correction lift. |
 
-For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Records (ADR 001 – ADR 008), see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
+For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Records (ADR 001 – ADR 009), see [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md).
 
 ---
 
@@ -65,12 +65,12 @@ For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Re
 .
 ├── server.ts                  # Unified Express + Vite dev/prod backend source (TypeScript)
 ├── server.js                  # Compiled Cloud Run production bundle (generated from server.ts)
-├── schema.sql                 # PostgreSQL 16 + pgvector schema, Recursive CTEs, Auth tables & seed data
+├── schema.sql                 # PostgreSQL 16 + pgvector schema, Recursive CTEs, Auth & Stripe tables
 ├── Dockerfile                 # Multi-stage container (compiles server.ts -> server.js, Port 8080)
 ├── App.jsx                    # Standalone AGPL-3.0 reference client deliverable
 ├── docs/
-│   ├── ARCHITECTURE.md        # System topology, sequence diagrams, ER diagram & ADRs 001–008
-│   └── RUNBOOK.md             # Cloud SQL setup, Cloud Run env vars & deploy, QA matrix & RBAC rollout
+│   ├── ARCHITECTURE.md        # System topology, sequence diagrams, ER diagram & ADRs 001–009
+│   └── RUNBOOK.md             # Cloud SQL setup, Cloud Run deploy, RBAC & Stripe rollout guides
 ├── src/
 │   ├── App.tsx                # Root SPA router (DemoMode <-> LiveCameraView; isolated /admin route)
 │   ├── components/
@@ -80,6 +80,7 @@ For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Re
 │   │   ├── InstructionSheet.tsx # Compact multi-step guide, per-step PiP & Cloud SQL feedback
 │   │   ├── AdminPlatform.tsx  # 4-tab Admin & Operations Console (/admin, direct URL only)
 │   │   ├── AdminAuthScaffoldCard.tsx # Admin RBAC status panel & enforced-mode AdminLoginGate
+│   │   ├── AdminBillingScaffoldCard.tsx # Stripe packs, credit weights & B2B2C proof panel
 │   │   ├── OntologyExplorer.tsx # Live Cloud SQL Recursive CTE hierarchy, RAG & M4/M6 feedback
 │   │   ├── ArchitectureBlueprint.tsx # Interactive topology + AGPL source copy/downloader
 │   │   ├── RunbookView.tsx    # QA verification launcher & embedded copyable operations runbook
@@ -89,6 +90,8 @@ For complete Mermaid sequence diagrams, ER schemas, and Architecture Decision Re
 │       ├── authContext.tsx    # In-memory React Bearer token context (zero localStorage tokens)
 │       ├── authScaffold.ts    # Shared RBAC roles, hierarchy & API route policy matrix (+ tests)
 │       ├── serverAuth.ts      # Node scrypt hashing, HMAC-SHA256 tokens & requireAuth middleware
+│       ├── billingScaffold.ts # Server-authoritative Stripe packs, credit gate & B2B2C proof types
+│       ├── serverStripe.ts    # Stripe Checkout API, raw-body HMAC webhook verifier & proof hashing
 │       ├── dbConfig.ts        # Cloud SQL Unix socket / Public IP TLS pool resolver (+ tests)
 │       ├── demoNarration.ts   # Synchronized onboarding script & visual phase mapping (+ tests)
 │       ├── makerLensState.ts  # Pure onboarding, multi-step hotspot & scan reducer (+ tests)
@@ -134,6 +137,9 @@ cp .env.example .env
 | `DB_PASS` / `SQL_PASSWORD` | Optional | PostgreSQL password (inject via Secret Manager in production). |
 | `SQL_SSL` | Optional | Enable TLS over TCP (`true` by default; disabled automatically on `/cloudsql/` Unix sockets). |
 | `AUTH_ENFORCEMENT_MODE` | Optional | RBAC enforcement toggle (`scaffold` by default; set to `enforced` once login accounts are enabled). |
+| `BILLING_ENFORCEMENT_MODE` | Optional | Credit gate toggle (`scaffold` by default; set to `enforced` once Stripe billing is live). |
+| `STRIPE_SECRET_KEY` | Optional | Server-side Stripe API key (`sk_test_...` / `sk_live_...`, Secret Manager only). |
+| `STRIPE_WEBHOOK_SECRET` | Optional | Stripe webhook HMAC signing secret (`whsec_...`) for `/api/billing/webhook`. |
 
 ### 3. Run Locally
 
@@ -201,6 +207,11 @@ The console is organized into four tabs:
 | `POST` | `/api/ontology/confirm-fix` | Marks a live diagnostic session `resolved_deflected`, updates `repair_actions.success_rate`, and logs a `$30` return-deflection bounty. *(End-User RBAC)* |
 | `POST` | `/api/ontology/deflection` | Logs a verified B2B2C hardware return deflection bounty from the Admin console. *(Admin RBAC)* |
 | `GET` | `/api/deliverables` | Serves AGPL-3.0 Corresponding Source (`schema.sql`, `server.ts`, `server.js`, `App.jsx`, `Dockerfile`, `docs/*`, `LICENSE`) for the running revision. *(Admin RBAC)* |
+| `GET` | `/api/billing/catalog` | Returns server-authoritative pay-as-you-go credit packs, Pro Monthly option, and per-action credit weights (ADR 009). |
+| `GET` | `/api/billing/wallet` | Returns the caller's credit wallet balance and recent credit ledger entries. *(End-User RBAC)* |
+| `POST` | `/api/billing/checkout-session` | Creates a server-priced Stripe Hosted Checkout session by `packId`. *(End-User RBAC)* |
+| `POST` | `/api/billing/webhook` | Raw-body HMAC-verified Stripe webhook fulfilling purchased credits idempotently into Cloud SQL. |
+| `GET` | `/api/billing/overview` | Returns Stripe readiness, unit economics, and B2B2C proof-of-deflection attribution channels. *(Admin RBAC)* |
 
 ---
 

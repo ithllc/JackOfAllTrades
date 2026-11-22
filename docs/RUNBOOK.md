@@ -25,6 +25,9 @@ Required environment variables (inject credentials via Google Secret Manager on 
 | `SQL_OUTGOING_IP` | Cloud SQL instance Outgoing IPv4 address (for firewall allowlists) | `34.73.184.213` |
 | `SQL_SSL` | Enable TLS for Public IP TCP (`true`); automatically disabled on `/cloudsql/` Unix sockets | `true` |
 | `AUTH_ENFORCEMENT_MODE` | RBAC enforcement toggle (`scaffold` pre-rollout, `enforced` once login is enabled) | `scaffold` (switch to `enforced` at rollout) |
+| `BILLING_ENFORCEMENT_MODE` | Credit gate toggle (`scaffold` pre-rollout, `enforced` returns HTTP `402` when balance is 0) | `scaffold` (switch to `enforced` after Stripe setup) |
+| `STRIPE_SECRET_KEY` | Server-side Stripe API secret key (`sk_test_...` / `sk_live_...`) — never exposed to browser | Google Secret Manager |
+| `STRIPE_WEBHOOK_SECRET` | Stripe webhook signing secret (`whsec_...`) for `/api/billing/webhook` HMAC verification | Google Secret Manager |
 
 **Unified Backend & Transport Auto-Detection (`server.ts` → `server.js` & `src/lib/dbConfig.ts`):**
 - **Single Source of Truth:** `Dockerfile` compiles `server.ts` directly into `server.js` (ESM) via `esbuild` and launches `CMD ["node", "server.js"]`. Keep `/server.js` synced whenever updating `/server.ts` (`npx esbuild server.ts --bundle --platform=node --format=esm --packages=external --outfile=server.js`).
@@ -206,5 +209,22 @@ The Admin Platform (`/admin`) is already isolated from the end-user camera and d
    # Should return enforcementMode: "enforced"
    curl -fsS https://<CLOUD_RUN_URL>/api/auth/config
    ```
+
+---
+
+## 8. Stripe Payments & Pay-As-You-Go Credit Rollout Guide (ADR 009)
+
+1. **Apply Billing & Proof Tables in Cloud SQL (`schema.sql` Section 9):**
+   Run the idempotent `schema.sql` script to create `user_credit_wallets`, `stripe_webhook_events`, `credit_ledger_entries`, and `brand_deflection_proofs`.
+2. **Store Stripe Secrets in Google Secret Manager (Never in Git or `VITE_*`):**
+   - Create secrets for `STRIPE_SECRET_KEY` (start with `sk_test_...` in staging) and `STRIPE_WEBHOOK_SECRET` (`whsec_...`).
+   - Optionally create Stripe Product/Price IDs for `starter_10`, `homeowner_30`, `pro_pack_100`, and `pro_unlimited_monthly` (`STRIPE_PRICE_*`), or allow the server to send server-authoritative `price_data` automatically.
+3. **Register the Stripe Webhook Endpoint:**
+   - In the Stripe Dashboard → Developers → Webhooks, point `https://<CLOUD_RUN_URL>/api/billing/webhook` to listen for `checkout.session.completed` (and `invoice.paid` / `customer.subscription.deleted` when enabling Pro Monthly).
+   - For local testing, run `stripe listen --forward-to localhost:3000/api/billing/webhook`.
+4. **Activate Credit Enforcement:**
+   - Once end-user authentication (`AUTH_ENFORCEMENT_MODE=enforced`) and Stripe secrets are verified, set `BILLING_ENFORCEMENT_MODE=enforced`.
+   - Verify `/api/billing/config` reports `configured: true`, `webhookSecretConfigured: true`, and `enforcementMode: "enforced"`.
+
 
 

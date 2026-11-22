@@ -27,6 +27,10 @@ import { ArchitectureBlueprint } from './ArchitectureBlueprint';
 import { OntologyExplorer, type FlywheelMetrics } from './OntologyExplorer';
 import { RunbookView } from './RunbookView';
 import { AdminAuthScaffoldCard, AdminLoginGate } from './AdminAuthScaffoldCard';
+import {
+  AdminBillingScaffoldCard,
+  type BillingOverviewPayload,
+} from './AdminBillingScaffoldCard';
 import { useAuth } from '../lib/authContext';
 import { hasRequiredRole } from '../lib/authScaffold';
 import type {
@@ -182,6 +186,36 @@ const API_ENDPOINTS = [
     service: 'Token Revocation Scaffold',
     purpose: 'Revokes the caller’s active Bearer session token',
   },
+  {
+    method: 'GET',
+    path: '/api/billing/catalog',
+    service: 'Stripe Billing Scaffold (ADR 009)',
+    purpose: 'Returns server-authoritative credit packs, pro plan, and per-action credit costs',
+  },
+  {
+    method: 'GET',
+    path: '/api/billing/wallet',
+    service: 'Cloud SQL Credit Ledger',
+    purpose: 'Returns the signed-in user credit balance and ledger audit history',
+  },
+  {
+    method: 'POST',
+    path: '/api/billing/checkout-session',
+    service: 'Stripe Hosted Checkout API',
+    purpose: 'Creates a server-priced Stripe Checkout session for credit packs or Pro Monthly',
+  },
+  {
+    method: 'POST',
+    path: '/api/billing/webhook',
+    service: 'Stripe HMAC Webhook Verifier',
+    purpose: 'Verifies Stripe-Signature raw bytes and fulfills credits idempotently',
+  },
+  {
+    method: 'GET',
+    path: '/api/billing/overview',
+    service: 'Admin Billing & B2B2C Attribution',
+    purpose: 'Exposes Stripe readiness, unit economics, and B2B2C proof channels to /admin',
+  },
 ];
 
 export const AdminPlatform: React.FC<AdminPlatformProps> = ({
@@ -192,6 +226,7 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
   const [activeTab, setActiveTab] = useState<AdminTab>('overview');
   const [health, setHealth] = useState<HealthPayload | null>(null);
   const [dbStatus, setDbStatus] = useState<DbStatusPayload | null>(null);
+  const [billingOverview, setBillingOverview] = useState<BillingOverviewPayload | null>(null);
   const [refreshing, setRefreshing] = useState(false);
 
   // Ontology state
@@ -253,7 +288,13 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
         }
       });
 
-      await Promise.allSettled([healthPromise, dbPromise, treePromise]);
+      const billingPromise = fetchJsonSafe<BillingOverviewPayload>('/api/billing/overview').then(
+        (billingRes) => {
+          if (billingRes) setBillingOverview(billingRes);
+        }
+      );
+
+      await Promise.allSettled([healthPromise, dbPromise, treePromise, billingPromise]);
     } finally {
       setRefreshing(false);
     }
@@ -626,6 +667,9 @@ export const AdminPlatform: React.FC<AdminPlatformProps> = ({
 
             {/* Identity, RBAC & Admin Isolation Scaffold (ADR 008) */}
             <AdminAuthScaffoldCard session={session} onLogout={logout} />
+
+            {/* Stripe Payments, Credit Ledger & B2B2C Proof Scaffold (ADR 009) */}
+            <AdminBillingScaffoldCard overview={billingOverview} />
 
             {/* Cloud SQL Connection Details & Diagnostics */}
             <section

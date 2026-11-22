@@ -1133,6 +1133,41 @@ var ROUTE_ACCESS_POLICIES = [
     audience: "admin",
     minimumRole: "admin",
     description: "Admin source & runbook inspector (AGPL-3.0 Corresponding Source)"
+  },
+  {
+    method: "GET",
+    path: "/api/billing/catalog",
+    audience: "public",
+    minimumRole: "anonymous",
+    description: "Server-authoritative pay-as-you-go credit packs and action credit weights"
+  },
+  {
+    method: "GET",
+    path: "/api/billing/wallet",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "Inspect caller credit balance and recent credit ledger entries"
+  },
+  {
+    method: "POST",
+    path: "/api/billing/checkout-session",
+    audience: "end_user",
+    minimumRole: "end_user",
+    description: "Create a server-priced Stripe Hosted Checkout session for a credit pack or plan"
+  },
+  {
+    method: "POST",
+    path: "/api/billing/webhook",
+    audience: "public",
+    minimumRole: "anonymous",
+    description: "Stripe-Signature HMAC-verified webhook for idempotent credit fulfillment"
+  },
+  {
+    method: "GET",
+    path: "/api/billing/overview",
+    audience: "admin",
+    minimumRole: "admin",
+    description: "Admin Stripe integration status, unit-economics table & B2B2C proof readiness"
   }
 ];
 
@@ -1254,6 +1289,281 @@ function createRequireAuthMiddleware(minimumRole, options) {
   };
 }
 
+// src/lib/billingScaffold.ts
+var DEFAULT_STARTER_CREDITS = 2;
+var BILLING_CREDIT_PACKS = [
+  {
+    id: "starter_10",
+    name: "Starter Repair Pack",
+    billingType: "one_time_credits",
+    priceCents: 499,
+    currency: "usd",
+    creditsGranted: 10,
+    estimatedCogsCents: 65,
+    description: "Pay-as-you-go pack for 1\u20132 weekend repairs (up to 10 scans/voice checks or 5 PiP motion clips). Credits never expire.",
+    stripePriceEnvVar: "STRIPE_PRICE_STARTER_10"
+  },
+  {
+    id: "homeowner_30",
+    name: "Homeowner Toolkit Pack",
+    billingType: "one_time_credits",
+    priceCents: 1299,
+    currency: "usd",
+    creditsGranted: 30,
+    estimatedCogsCents: 195,
+    badge: "Best Value",
+    description: "Ideal for multi-room projects, appliances, and furniture assembly. No recurring subscription.",
+    stripePriceEnvVar: "STRIPE_PRICE_HOMEOWNER_30"
+  },
+  {
+    id: "pro_pack_100",
+    name: "Handyman 100-Credit Pack",
+    billingType: "one_time_credits",
+    priceCents: 2999,
+    currency: "usd",
+    creditsGranted: 100,
+    estimatedCogsCents: 650,
+    description: "High-volume prepaid pack for frequent DIYers, landlords, and field technicians.",
+    stripePriceEnvVar: "STRIPE_PRICE_PRO_100"
+  },
+  {
+    id: "pro_unlimited_monthly",
+    name: "Pro Technician Monthly",
+    billingType: "subscription_monthly",
+    priceCents: 1999,
+    currency: "usd",
+    creditsGranted: 120,
+    estimatedCogsCents: 780,
+    description: "Optional monthly allowance (120 fair-use credits/mo) tailored for daily service pros.",
+    stripePriceEnvVar: "STRIPE_PRICE_PRO_MONTHLY"
+  }
+];
+var ACTION_CREDIT_RULES = [
+  {
+    action: "demo_narration",
+    label: "Interactive Onboarding Demo",
+    creditsRequired: 0,
+    estimatedCogsUsd: 0,
+    rationale: "Cached WAV narration + local canvas \u2014 zero inference burn."
+  },
+  {
+    action: "scan_problem",
+    label: "Scan Problem (Vision + AR + TTS)",
+    creditsRequired: 1,
+    estimatedCogsUsd: 0.06,
+    rationale: "Zero-token gemini-decision-1 gate -> gemini-4-neon + RAG + 3.8 TTS."
+  },
+  {
+    action: "voice_assist",
+    label: "Hold to Explain (Voice + Vision + TTS)",
+    creditsRequired: 1,
+    estimatedCogsUsd: 0.07,
+    rationale: "Multimodal audio + frame reasoning in user language + RIFF WAV reply."
+  },
+  {
+    action: "generate_pip",
+    label: "Show Step Motion (6s PiP Video Clip)",
+    creditsRequired: 2,
+    estimatedCogsUsd: 0.18,
+    rationale: "On-demand gemini-omni-1.2-flash 720p video clip, cached per step."
+  }
+];
+function resolveBillingEnforcementMode(raw) {
+  return (raw || "").trim().toLowerCase() === "enforced" ? "enforced" : "scaffold";
+}
+function getBillingPackById(packId) {
+  if (!packId || typeof packId !== "string") return void 0;
+  const cleaned = packId.trim();
+  return BILLING_CREDIT_PACKS.find((pack) => pack.id === cleaned);
+}
+
+// src/lib/serverStripe.ts
+import crypto2 from "node:crypto";
+var PLACEHOLDER_TOKENS = [
+  "CHANGE_ME",
+  "YOUR_STRIPE",
+  "MY_STRIPE",
+  "sk_test_placeholder",
+  "whsec_placeholder"
+];
+function isRealConfiguredSecret(value) {
+  const trimmed = (value || "").trim();
+  if (trimmed.length < 16) return false;
+  return !PLACEHOLDER_TOKENS.some(
+    (token) => trimmed.toUpperCase().includes(token.toUpperCase())
+  );
+}
+function getStripeConfigStatus(env = process.env) {
+  const secretKey = (env.STRIPE_SECRET_KEY || "").trim();
+  const configured = isRealConfiguredSecret(secretKey) && secretKey.startsWith("sk_");
+  const webhookSecretConfigured = isRealConfiguredSecret(env.STRIPE_WEBHOOK_SECRET);
+  const publishableKey = (env.STRIPE_PUBLISHABLE_KEY || "").trim();
+  const publishableKeyConfigured = isRealConfiguredSecret(publishableKey) && publishableKey.startsWith("pk_");
+  let keyMode = "unconfigured";
+  if (configured) {
+    keyMode = secretKey.startsWith("sk_live_") ? "live" : "test";
+  }
+  return {
+    configured,
+    webhookSecretConfigured,
+    publishableKeyConfigured,
+    keyMode,
+    enforcementMode: resolveBillingEnforcementMode(env.BILLING_ENFORCEMENT_MODE)
+  };
+}
+function resolveSafeCheckoutOrigin(options) {
+  const candidates = [options.appUrl];
+  for (const raw of candidates) {
+    if (!raw || typeof raw !== "string") continue;
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed.includes("MY_APP_URL")) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+        return parsed.origin;
+      }
+    } catch {
+    }
+  }
+  const host = (options.requestHost || "").trim();
+  if (host && /^[a-zA-Z0-9.-]+(:\d{1,5})?$/.test(host)) {
+    const safeProto = options.protocol === "https" ? "https" : "http";
+    return `${safeProto}://${host}`;
+  }
+  return "http://localhost:3000";
+}
+function verifyStripeWebhookSignature(rawBody, signatureHeader, webhookSecret, options) {
+  if (!webhookSecret || !isRealConfiguredSecret(webhookSecret)) {
+    return { valid: false, reason: "webhook_secret_not_configured" };
+  }
+  if (!signatureHeader || typeof signatureHeader !== "string") {
+    return { valid: false, reason: "missing_signature_header" };
+  }
+  const parts = signatureHeader.split(",").map((part) => part.trim());
+  let timestampSec = null;
+  const v1Signatures = [];
+  for (const part of parts) {
+    const eqIdx = part.indexOf("=");
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    if (key === "t") {
+      const parsed = Number(val);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        timestampSec = parsed;
+      }
+    } else if (key === "v1" && /^[a-fA-F0-9]{64}$/.test(val)) {
+      v1Signatures.push(val.toLowerCase());
+    }
+  }
+  if (timestampSec === null || v1Signatures.length === 0) {
+    return { valid: false, reason: "malformed_signature_header" };
+  }
+  const nowSec = options?.nowSec ?? Math.floor(Date.now() / 1e3);
+  const toleranceSec = options?.toleranceSec ?? 300;
+  if (Math.abs(nowSec - timestampSec) > toleranceSec) {
+    return { valid: false, reason: "timestamp_outside_tolerance", timestampSec };
+  }
+  const payloadStr = Buffer.isBuffer(rawBody) ? rawBody.toString("utf8") : rawBody;
+  const expectedHex = crypto2.createHmac("sha256", webhookSecret).update(`${timestampSec}.${payloadStr}`, "utf8").digest("hex");
+  const expectedBuf = Buffer.from(expectedHex, "hex");
+  const matched = v1Signatures.some((sigHex) => {
+    const sigBuf = Buffer.from(sigHex, "hex");
+    if (sigBuf.length !== expectedBuf.length) return false;
+    return crypto2.timingSafeEqual(sigBuf, expectedBuf);
+  });
+  if (!matched) {
+    return { valid: false, reason: "signature_mismatch", timestampSec };
+  }
+  return { valid: true, timestampSec };
+}
+async function createStripeCheckoutSessionViaApi(input) {
+  const pack = getBillingPackById(input.packId);
+  if (!pack) {
+    return {
+      ok: false,
+      code: "INVALID_PACK",
+      error: "Unknown billing pack requested."
+    };
+  }
+  const env = input.env ?? process.env;
+  const status = getStripeConfigStatus(env);
+  if (!status.configured) {
+    return {
+      ok: false,
+      code: "STRIPE_SCAFFOLD_PENDING",
+      pack,
+      error: "Stripe checkout is scaffolded and ready. Set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET in server environment secrets to launch live payments."
+    };
+  }
+  const secretKey = (env.STRIPE_SECRET_KEY || "").trim();
+  const configuredPriceId = (env[pack.stripePriceEnvVar] || "").trim();
+  const params = new URLSearchParams();
+  params.set(
+    "mode",
+    pack.billingType === "subscription_monthly" ? "subscription" : "payment"
+  );
+  params.set(
+    "success_url",
+    `${input.origin}/?billing=success&session_id={CHECKOUT_SESSION_ID}`
+  );
+  params.set("cancel_url", `${input.origin}/?billing=canceled`);
+  params.set("client_reference_id", input.userId);
+  params.set("metadata[user_id]", input.userId);
+  params.set("metadata[pack_id]", pack.id);
+  params.set("metadata[credits_granted]", String(pack.creditsGranted));
+  params.set("metadata[billing_type]", pack.billingType);
+  if (input.userEmail) {
+    params.set("customer_email", input.userEmail);
+  }
+  if (configuredPriceId.startsWith("price_")) {
+    params.set("line_items[0][price]", configuredPriceId);
+    params.set("line_items[0][quantity]", "1");
+  } else {
+    params.set("line_items[0][quantity]", "1");
+    params.set("line_items[0][price_data][currency]", pack.currency);
+    params.set("line_items[0][price_data][unit_amount]", String(pack.priceCents));
+    params.set("line_items[0][price_data][product_data][name]", pack.name);
+    params.set("line_items[0][price_data][product_data][description]", pack.description);
+    if (pack.billingType === "subscription_monthly") {
+      params.set("line_items[0][price_data][recurring][interval]", "month");
+    }
+  }
+  try {
+    const response = await fetch("https://api.stripe.com/v1/checkout/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${secretKey}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: params.toString()
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.id || !data.url) {
+      return {
+        ok: false,
+        code: "STRIPE_API_ERROR",
+        pack,
+        error: data.error?.message || `Stripe Checkout API returned HTTP ${response.status}.`
+      };
+    }
+    return {
+      ok: true,
+      code: "CHECKOUT_CREATED",
+      sessionId: data.id,
+      checkoutUrl: data.url,
+      pack
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      code: "STRIPE_API_ERROR",
+      pack,
+      error: err.message || "Could not reach Stripe API."
+    };
+  }
+}
+
 // server.ts
 var __filename = fileURLToPath(import.meta.url);
 var __dirname = path.dirname(__filename);
@@ -1313,15 +1623,27 @@ function extractErrorDetails(err) {
 }
 async function createApp() {
   const app = express();
-  app.use(express.json({ limit: "25mb" }));
+  app.use(
+    express.json({
+      limit: "25mb",
+      verify: (req, _res, buf) => {
+        if (req.originalUrl?.startsWith("/api/billing/webhook")) {
+          req.rawBody = Buffer.from(buf);
+        }
+      }
+    })
+  );
   const requireEndUser = createRequireAuthMiddleware("end_user");
   const requireAdmin = createRequireAuthMiddleware("admin");
   app.get(["/api/health", "/healthz"], (_req, res) => {
+    const stripeStatus = getStripeConfigStatus();
     res.json({
       status: "ok",
       service: "jackofalltrades",
       license: "AGPL-3.0-only",
       authEnforcementMode: resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE),
+      billingEnforcementMode: stripeStatus.enforcementMode,
+      stripeConfigured: stripeStatus.configured,
       postgresConfigured: Boolean(pgPool),
       databaseTransport: cloudSqlConfig.transport,
       sqlConnectionName: cloudSqlConfig.connectionName,
@@ -1422,6 +1744,246 @@ async function createApp() {
       revokeSessionToken(bearer);
     }
     res.json({ status: "signed_out" });
+  });
+  app.get("/api/billing/catalog", (_req, res) => {
+    const stripe = getStripeConfigStatus();
+    res.json({
+      enforcementMode: stripe.enforcementMode,
+      stripeConfigured: stripe.configured,
+      starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+      packs: BILLING_CREDIT_PACKS,
+      actionCosts: ACTION_CREDIT_RULES
+    });
+  });
+  app.get("/api/billing/config", (_req, res) => {
+    const stripe = getStripeConfigStatus();
+    res.json({
+      ...stripe,
+      webhookPath: "/api/billing/webhook",
+      checkoutPath: "/api/billing/checkout-session",
+      starterCreditsGranted: DEFAULT_STARTER_CREDITS
+    });
+  });
+  app.get("/api/billing/overview", requireAdmin, (_req, res) => {
+    const stripe = getStripeConfigStatus();
+    res.json({
+      stripe,
+      starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+      packs: BILLING_CREDIT_PACKS,
+      actionCosts: ACTION_CREDIT_RULES,
+      webhookPath: "/api/billing/webhook",
+      b2b2cAttributionChannels: [
+        {
+          channel: "brand_qr_box",
+          label: "Signed QR on Box / Assembly Manual",
+          proofStrength: "Direct 1:1 SKU Attribution",
+          description: "Customer scans brand-signed QR code; unlocks brand-sponsored free repair pass and logs verified completion."
+        },
+        {
+          channel: "support_portal_redirect",
+          label: "Support / Return Portal Deflection Link",
+          proofStrength: "Auditable Ticket & Return Aversion",
+          description: 'Embedded above "Start a Return" or IVR support; tracks sessions resolved without a subsequent ticket or RMA.'
+        },
+        {
+          channel: "barcode_sku_scan",
+          label: "Rating-Plate / UPC Barcode Identification",
+          proofStrength: "Aggregated Brand ROI Proof",
+          description: "Links organic repairs to exact OEM model numbers to generate anonymized deflection reports for brand sales."
+        },
+        {
+          channel: "organic_camera",
+          label: "Before/After Visual Proof Certificate",
+          proofStrength: "Tamper-Evident SHA-256 Receipt",
+          description: "Optional post-fix confirmation snapshot verified by Gemini and hashed into brand_deflection_proofs."
+        }
+      ]
+    });
+  });
+  app.get("/api/billing/wallet", requireEndUser, async (req, res) => {
+    const enforcementMode = resolveBillingEnforcementMode(process.env.BILLING_ENFORCEMENT_MODE);
+    const userId = req.authPrincipal?.userId;
+    if (!userId || !pgPool) {
+      return res.json({
+        userId: userId ?? "guest_scaffold",
+        creditBalance: DEFAULT_STARTER_CREDITS,
+        starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+        subscriptionStatus: "none",
+        enforcementMode,
+        sponsoredBrandPassActive: false,
+        ledger: []
+      });
+    }
+    try {
+      const walletRes = await pgPool.query(
+        `SELECT user_id, credit_balance, starter_credits_granted, subscription_status
+           FROM user_credit_wallets
+          WHERE user_id = $1
+          LIMIT 1`,
+        [userId]
+      );
+      const ledgerRes = await pgPool.query(
+        `SELECT id, delta_credits, reason, amount_cents, created_at
+           FROM credit_ledger_entries
+          WHERE user_id = $1
+          ORDER BY created_at DESC
+          LIMIT 20`,
+        [userId]
+      );
+      const row = walletRes.rows[0];
+      return res.json({
+        userId,
+        creditBalance: row ? Number(row.credit_balance) : DEFAULT_STARTER_CREDITS,
+        starterCreditsGranted: row ? Number(row.starter_credits_granted) : DEFAULT_STARTER_CREDITS,
+        subscriptionStatus: row?.subscription_status ?? "none",
+        enforcementMode,
+        sponsoredBrandPassActive: false,
+        ledger: ledgerRes.rows
+      });
+    } catch {
+      return res.json({
+        userId,
+        creditBalance: DEFAULT_STARTER_CREDITS,
+        starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+        subscriptionStatus: "none",
+        enforcementMode,
+        sponsoredBrandPassActive: false,
+        ledger: []
+      });
+    }
+  });
+  app.post("/api/billing/checkout-session", requireEndUser, async (req, res) => {
+    const packId = typeof req.body?.packId === "string" ? req.body.packId.trim() : "";
+    const pack = getBillingPackById(packId);
+    if (!pack) {
+      return res.status(400).json({
+        error: "Invalid or unknown credit pack selected.",
+        code: "INVALID_PACK",
+        availablePacks: BILLING_CREDIT_PACKS.map((p) => p.id)
+      });
+    }
+    const origin = resolveSafeCheckoutOrigin({
+      appUrl: process.env.APP_URL,
+      requestHost: req.get("host"),
+      protocol: req.protocol
+    });
+    const result = await createStripeCheckoutSessionViaApi({
+      packId: pack.id,
+      userId: req.authPrincipal?.userId ?? "scaffold_preview_user",
+      userEmail: req.authPrincipal?.email ?? null,
+      origin
+    });
+    if (result.code === "STRIPE_SCAFFOLD_PENDING") {
+      return res.status(501).json({
+        error: result.error,
+        code: result.code,
+        pack: result.pack
+      });
+    }
+    if (!result.ok) {
+      return res.status(502).json({
+        error: result.error || "Could not create Stripe Checkout session.",
+        code: result.code
+      });
+    }
+    return res.json({
+      sessionId: result.sessionId,
+      checkoutUrl: result.checkoutUrl,
+      pack: result.pack
+    });
+  });
+  app.post("/api/billing/webhook", async (req, res) => {
+    const rawBody = req.rawBody;
+    const signatureHeader = req.get("stripe-signature");
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+    if (!rawBody || rawBody.length === 0) {
+      return res.status(400).json({
+        error: "Raw webhook request body is required for Stripe signature verification.",
+        code: "MISSING_RAW_BODY"
+      });
+    }
+    const verification = verifyStripeWebhookSignature(rawBody, signatureHeader, webhookSecret);
+    if (!verification.valid) {
+      return res.status(400).json({
+        error: "Invalid Stripe webhook signature.",
+        code: "INVALID_WEBHOOK_SIGNATURE",
+        reason: verification.reason
+      });
+    }
+    let event;
+    try {
+      event = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      return res.status(400).json({ error: "Malformed Stripe webhook JSON payload." });
+    }
+    const eventId = typeof event.id === "string" ? event.id : "";
+    const eventType = typeof event.type === "string" ? event.type : "";
+    if (!eventId || !eventType) {
+      return res.status(400).json({ error: "Stripe event id and type are required." });
+    }
+    if (eventType === "checkout.session.completed" && pgPool) {
+      const sessionObj = event.data?.object;
+      const meta = sessionObj?.metadata ?? {};
+      const userId = typeof meta.user_id === "string" ? meta.user_id : "";
+      const pack = getBillingPackById(meta.pack_id);
+      if (userId && pack) {
+        const client = await pgPool.connect();
+        try {
+          await client.query("BEGIN");
+          const inserted = await client.query(
+            `INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload_summary)
+             VALUES ($1, $2, $3::jsonb)
+             ON CONFLICT (stripe_event_id) DO NOTHING
+             RETURNING stripe_event_id`,
+            [eventId, eventType, JSON.stringify({ packId: pack.id, credits: pack.creditsGranted })]
+          );
+          if (inserted.rows.length > 0) {
+            await client.query(
+              `INSERT INTO user_credit_wallets (user_id, stripe_customer_id, credit_balance, subscription_status, stripe_subscription_id)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (user_id) DO UPDATE
+                 SET credit_balance = user_credit_wallets.credit_balance + EXCLUDED.credit_balance,
+                     stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, user_credit_wallets.stripe_customer_id),
+                     subscription_status = CASE
+                       WHEN EXCLUDED.subscription_status = 'active' THEN 'active'
+                       ELSE user_credit_wallets.subscription_status
+                     END,
+                     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, user_credit_wallets.stripe_subscription_id),
+                     updated_at = NOW()`,
+              [
+                userId,
+                sessionObj?.customer ?? null,
+                pack.creditsGranted,
+                pack.billingType === "subscription_monthly" ? "active" : "none",
+                sessionObj?.subscription ?? null
+              ]
+            );
+            await client.query(
+              `INSERT INTO credit_ledger_entries (
+                 user_id, delta_credits, reason, amount_cents, stripe_checkout_session_id, stripe_event_id
+               ) VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (stripe_event_id) DO NOTHING`,
+              [
+                userId,
+                pack.creditsGranted,
+                pack.billingType === "subscription_monthly" ? "stripe_subscription_cycle" : "stripe_pack_purchase",
+                typeof sessionObj?.amount_total === "number" ? sessionObj.amount_total : pack.priceCents,
+                sessionObj?.id ?? null,
+                eventId
+              ]
+            );
+          }
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => void 0);
+          console.error("[Stripe Webhook DB Error]", err.message);
+          return res.status(500).json({ error: "Failed to persist Stripe credit fulfillment." });
+        } finally {
+          client.release();
+        }
+      }
+    }
+    return res.json({ received: true, eventId, eventType });
   });
   app.get("/api/db/status", requireAdmin, async (req, res) => {
     if (!pgPool) {

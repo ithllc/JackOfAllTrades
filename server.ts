@@ -71,6 +71,19 @@ import {
   verifySessionToken,
   type AuthenticatedRequest,
 } from './src/lib/serverAuth.ts';
+import {
+  ACTION_CREDIT_RULES,
+  BILLING_CREDIT_PACKS,
+  DEFAULT_STARTER_CREDITS,
+  getBillingPackById,
+  resolveBillingEnforcementMode,
+} from './src/lib/billingScaffold.ts';
+import {
+  createStripeCheckoutSessionViaApi,
+  getStripeConfigStatus,
+  resolveSafeCheckoutOrigin,
+  verifyStripeWebhookSignature,
+} from './src/lib/serverStripe.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -168,8 +181,18 @@ function extractErrorDetails(err: unknown): { status: number; message: string } 
 
 async function createApp() {
   const app = express();
-  // Support 15-second frame buffers (up to 30 sampled JPEGs) + 3-shot high-contrast bursts
-  app.use(express.json({ limit: '25mb' }));
+  // Support 15-second frame buffers (up to 30 sampled JPEGs) + 3-shot high-contrast bursts.
+  // Preserve exact raw bytes strictly for Stripe webhook HMAC verification.
+  app.use(
+    express.json({
+      limit: '25mb',
+      verify: (req, _res, buf) => {
+        if ((req as Request).originalUrl?.startsWith('/api/billing/webhook')) {
+          (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf);
+        }
+      },
+    })
+  );
 
   // Role-Based Access Control middleware (ADR 008):
   // Non-blocking in `AUTH_ENFORCEMENT_MODE=scaffold` (default); enforces 401/403 in `enforced` mode.
@@ -180,11 +203,14 @@ async function createApp() {
   // Health & AGPL-3.0 Corresponding Source Disclosure Endpoints
   // ---------------------------------------------------------------------------
   app.get(['/api/health', '/healthz'], (_req: Request, res: Response) => {
+    const stripeStatus = getStripeConfigStatus();
     res.json({
       status: 'ok',
       service: 'jackofalltrades',
       license: 'AGPL-3.0-only',
       authEnforcementMode: resolveAuthEnforcementMode(process.env.AUTH_ENFORCEMENT_MODE),
+      billingEnforcementMode: stripeStatus.enforcementMode,
+      stripeConfigured: stripeStatus.configured,
       postgresConfigured: Boolean(pgPool),
       databaseTransport: cloudSqlConfig.transport,
       sqlConnectionName: cloudSqlConfig.connectionName,
@@ -314,6 +340,289 @@ async function createApp() {
       revokeSessionToken(bearer);
     }
     res.json({ status: 'signed_out' });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Stripe Payments, Pay-As-You-Go Credit Ledger & B2B2C Proof Scaffold (ADR 009)
+  // ---------------------------------------------------------------------------
+  app.get('/api/billing/catalog', (_req: Request, res: Response) => {
+    const stripe = getStripeConfigStatus();
+    res.json({
+      enforcementMode: stripe.enforcementMode,
+      stripeConfigured: stripe.configured,
+      starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+      packs: BILLING_CREDIT_PACKS,
+      actionCosts: ACTION_CREDIT_RULES,
+    });
+  });
+
+  app.get('/api/billing/config', (_req: Request, res: Response) => {
+    const stripe = getStripeConfigStatus();
+    res.json({
+      ...stripe,
+      webhookPath: '/api/billing/webhook',
+      checkoutPath: '/api/billing/checkout-session',
+      starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+    });
+  });
+
+  app.get('/api/billing/overview', requireAdmin, (_req: Request, res: Response) => {
+    const stripe = getStripeConfigStatus();
+    res.json({
+      stripe,
+      starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+      packs: BILLING_CREDIT_PACKS,
+      actionCosts: ACTION_CREDIT_RULES,
+      webhookPath: '/api/billing/webhook',
+      b2b2cAttributionChannels: [
+        {
+          channel: 'brand_qr_box',
+          label: 'Signed QR on Box / Assembly Manual',
+          proofStrength: 'Direct 1:1 SKU Attribution',
+          description: 'Customer scans brand-signed QR code; unlocks brand-sponsored free repair pass and logs verified completion.',
+        },
+        {
+          channel: 'support_portal_redirect',
+          label: 'Support / Return Portal Deflection Link',
+          proofStrength: 'Auditable Ticket & Return Aversion',
+          description: 'Embedded above "Start a Return" or IVR support; tracks sessions resolved without a subsequent ticket or RMA.',
+        },
+        {
+          channel: 'barcode_sku_scan',
+          label: 'Rating-Plate / UPC Barcode Identification',
+          proofStrength: 'Aggregated Brand ROI Proof',
+          description: 'Links organic repairs to exact OEM model numbers to generate anonymized deflection reports for brand sales.',
+        },
+        {
+          channel: 'organic_camera',
+          label: 'Before/After Visual Proof Certificate',
+          proofStrength: 'Tamper-Evident SHA-256 Receipt',
+          description: 'Optional post-fix confirmation snapshot verified by Gemini and hashed into brand_deflection_proofs.',
+        },
+      ],
+    });
+  });
+
+  app.get('/api/billing/wallet', requireEndUser, async (req: AuthenticatedRequest, res: Response) => {
+    const enforcementMode = resolveBillingEnforcementMode(process.env.BILLING_ENFORCEMENT_MODE);
+    const userId = req.authPrincipal?.userId;
+
+    if (!userId || !pgPool) {
+      return res.json({
+        userId: userId ?? 'guest_scaffold',
+        creditBalance: DEFAULT_STARTER_CREDITS,
+        starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+        subscriptionStatus: 'none',
+        enforcementMode,
+        sponsoredBrandPassActive: false,
+        ledger: [],
+      });
+    }
+
+    try {
+      const walletRes = await pgPool.query(
+        `SELECT user_id, credit_balance, starter_credits_granted, subscription_status
+           FROM user_credit_wallets
+          WHERE user_id = $1
+          LIMIT 1`,
+        [userId]
+      );
+      const ledgerRes = await pgPool.query(
+        `SELECT id, delta_credits, reason, amount_cents, created_at
+           FROM credit_ledger_entries
+          WHERE user_id = $1
+          ORDER BY created_at DESC
+          LIMIT 20`,
+        [userId]
+      );
+      const row = walletRes.rows[0];
+      return res.json({
+        userId,
+        creditBalance: row ? Number(row.credit_balance) : DEFAULT_STARTER_CREDITS,
+        starterCreditsGranted: row ? Number(row.starter_credits_granted) : DEFAULT_STARTER_CREDITS,
+        subscriptionStatus: row?.subscription_status ?? 'none',
+        enforcementMode,
+        sponsoredBrandPassActive: false,
+        ledger: ledgerRes.rows,
+      });
+    } catch {
+      return res.json({
+        userId,
+        creditBalance: DEFAULT_STARTER_CREDITS,
+        starterCreditsGranted: DEFAULT_STARTER_CREDITS,
+        subscriptionStatus: 'none',
+        enforcementMode,
+        sponsoredBrandPassActive: false,
+        ledger: [],
+      });
+    }
+  });
+
+  app.post('/api/billing/checkout-session', requireEndUser, async (req: AuthenticatedRequest, res: Response) => {
+    const packId = typeof req.body?.packId === 'string' ? req.body.packId.trim() : '';
+    const pack = getBillingPackById(packId);
+    if (!pack) {
+      return res.status(400).json({
+        error: 'Invalid or unknown credit pack selected.',
+        code: 'INVALID_PACK',
+        availablePacks: BILLING_CREDIT_PACKS.map((p) => p.id),
+      });
+    }
+
+    const origin = resolveSafeCheckoutOrigin({
+      appUrl: process.env.APP_URL,
+      requestHost: req.get('host'),
+      protocol: req.protocol,
+    });
+
+    const result = await createStripeCheckoutSessionViaApi({
+      packId: pack.id,
+      userId: req.authPrincipal?.userId ?? 'scaffold_preview_user',
+      userEmail: req.authPrincipal?.email ?? null,
+      origin,
+    });
+
+    if (result.code === 'STRIPE_SCAFFOLD_PENDING') {
+      return res.status(501).json({
+        error: result.error,
+        code: result.code,
+        pack: result.pack,
+      });
+    }
+
+    if (!result.ok) {
+      return res.status(502).json({
+        error: result.error || 'Could not create Stripe Checkout session.',
+        code: result.code,
+      });
+    }
+
+    return res.json({
+      sessionId: result.sessionId,
+      checkoutUrl: result.checkoutUrl,
+      pack: result.pack,
+    });
+  });
+
+  app.post('/api/billing/webhook', async (req: Request, res: Response) => {
+    const rawBody = (req as Request & { rawBody?: Buffer }).rawBody;
+    const signatureHeader = req.get('stripe-signature');
+    const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    if (!rawBody || rawBody.length === 0) {
+      return res.status(400).json({
+        error: 'Raw webhook request body is required for Stripe signature verification.',
+        code: 'MISSING_RAW_BODY',
+      });
+    }
+
+    const verification = verifyStripeWebhookSignature(rawBody, signatureHeader, webhookSecret);
+    if (!verification.valid) {
+      return res.status(400).json({
+        error: 'Invalid Stripe webhook signature.',
+        code: 'INVALID_WEBHOOK_SIGNATURE',
+        reason: verification.reason,
+      });
+    }
+
+    let event: {
+      id?: string;
+      type?: string;
+      data?: {
+        object?: {
+          id?: string;
+          customer?: string;
+          subscription?: string;
+          amount_total?: number;
+          metadata?: Record<string, string>;
+        };
+      };
+    };
+
+    try {
+      event = JSON.parse(rawBody.toString('utf8'));
+    } catch {
+      return res.status(400).json({ error: 'Malformed Stripe webhook JSON payload.' });
+    }
+
+    const eventId = typeof event.id === 'string' ? event.id : '';
+    const eventType = typeof event.type === 'string' ? event.type : '';
+    if (!eventId || !eventType) {
+      return res.status(400).json({ error: 'Stripe event id and type are required.' });
+    }
+
+    if (eventType === 'checkout.session.completed' && pgPool) {
+      const sessionObj = event.data?.object;
+      const meta = sessionObj?.metadata ?? {};
+      const userId = typeof meta.user_id === 'string' ? meta.user_id : '';
+      const pack = getBillingPackById(meta.pack_id);
+
+      if (userId && pack) {
+        const client = await pgPool.connect();
+        try {
+          await client.query('BEGIN');
+          const inserted = await client.query(
+            `INSERT INTO stripe_webhook_events (stripe_event_id, event_type, payload_summary)
+             VALUES ($1, $2, $3::jsonb)
+             ON CONFLICT (stripe_event_id) DO NOTHING
+             RETURNING stripe_event_id`,
+            [eventId, eventType, JSON.stringify({ packId: pack.id, credits: pack.creditsGranted })]
+          );
+
+          if (inserted.rows.length > 0) {
+            await client.query(
+              `INSERT INTO user_credit_wallets (user_id, stripe_customer_id, credit_balance, subscription_status, stripe_subscription_id)
+               VALUES ($1, $2, $3, $4, $5)
+               ON CONFLICT (user_id) DO UPDATE
+                 SET credit_balance = user_credit_wallets.credit_balance + EXCLUDED.credit_balance,
+                     stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, user_credit_wallets.stripe_customer_id),
+                     subscription_status = CASE
+                       WHEN EXCLUDED.subscription_status = 'active' THEN 'active'
+                       ELSE user_credit_wallets.subscription_status
+                     END,
+                     stripe_subscription_id = COALESCE(EXCLUDED.stripe_subscription_id, user_credit_wallets.stripe_subscription_id),
+                     updated_at = NOW()`,
+              [
+                userId,
+                sessionObj?.customer ?? null,
+                pack.creditsGranted,
+                pack.billingType === 'subscription_monthly' ? 'active' : 'none',
+                sessionObj?.subscription ?? null,
+              ]
+            );
+
+            await client.query(
+              `INSERT INTO credit_ledger_entries (
+                 user_id, delta_credits, reason, amount_cents, stripe_checkout_session_id, stripe_event_id
+               ) VALUES ($1, $2, $3, $4, $5, $6)
+               ON CONFLICT (stripe_event_id) DO NOTHING`,
+              [
+                userId,
+                pack.creditsGranted,
+                pack.billingType === 'subscription_monthly'
+                  ? 'stripe_subscription_cycle'
+                  : 'stripe_pack_purchase',
+                typeof sessionObj?.amount_total === 'number'
+                  ? sessionObj.amount_total
+                  : pack.priceCents,
+                sessionObj?.id ?? null,
+                eventId,
+              ]
+            );
+          }
+
+          await client.query('COMMIT');
+        } catch (err) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          console.error('[Stripe Webhook DB Error]', (err as Error).message);
+          return res.status(500).json({ error: 'Failed to persist Stripe credit fulfillment.' });
+        } finally {
+          client.release();
+        }
+      }
+    }
+
+    return res.json({ received: true, eventId, eventType });
   });
 
   app.get('/api/db/status', requireAdmin, async (req: Request, res: Response) => {

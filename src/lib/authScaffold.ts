@@ -185,6 +185,41 @@ export const ROUTE_ACCESS_POLICIES: readonly RouteAccessPolicy[] = [
     minimumRole: 'admin',
     description: 'Admin source & runbook inspector (AGPL-3.0 Corresponding Source)',
   },
+  {
+    method: 'GET',
+    path: '/api/billing/catalog',
+    audience: 'public',
+    minimumRole: 'anonymous',
+    description: 'Server-authoritative pay-as-you-go credit packs and action credit weights',
+  },
+  {
+    method: 'GET',
+    path: '/api/billing/wallet',
+    audience: 'end_user',
+    minimumRole: 'end_user',
+    description: 'Inspect caller credit balance and recent credit ledger entries',
+  },
+  {
+    method: 'POST',
+    path: '/api/billing/checkout-session',
+    audience: 'end_user',
+    minimumRole: 'end_user',
+    description: 'Create a server-priced Stripe Hosted Checkout session for a credit pack or plan',
+  },
+  {
+    method: 'POST',
+    path: '/api/billing/webhook',
+    audience: 'public',
+    minimumRole: 'anonymous',
+    description: 'Stripe-Signature HMAC-verified webhook for idempotent credit fulfillment',
+  },
+  {
+    method: 'GET',
+    path: '/api/billing/overview',
+    audience: 'admin',
+    minimumRole: 'admin',
+    description: 'Admin Stripe integration status, unit-economics table & B2B2C proof readiness',
+  },
 ] as const;
 
 export function getRoutePolicy(path: string): RouteAccessPolicy | undefined {

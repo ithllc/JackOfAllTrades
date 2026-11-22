@@ -583,5 +583,81 @@ ALTER TABLE diagnostic_sessions
 
 CREATE INDEX IF NOT EXISTS idx_diagnostic_sessions_user ON diagnostic_sessions (user_id);
 
+-- ============================================================================
+-- 9. STRIPE CREDIT LEDGER & B2B2C PROOF-OF-DEFLECTION SCAFFOLD (ADR 009)
+-- ============================================================================
+-- Provider-agnostic end-user credit wallet + idempotent Stripe webhook ledger +
+-- tamper-evident B2B2C brand attribution proof certificates.
+
+CREATE TABLE IF NOT EXISTS user_credit_wallets (
+    user_id                UUID PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
+    stripe_customer_id     TEXT UNIQUE,
+    credit_balance         INTEGER NOT NULL DEFAULT 2 CHECK (credit_balance >= 0),
+    starter_credits_granted INTEGER NOT NULL DEFAULT 2 CHECK (starter_credits_granted >= 0),
+    subscription_status    TEXT NOT NULL DEFAULT 'none'
+                               CHECK (subscription_status IN ('none', 'active', 'past_due', 'canceled')),
+    stripe_subscription_id TEXT UNIQUE,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+    stripe_event_id TEXT PRIMARY KEY,
+    event_type      TEXT NOT NULL,
+    processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    payload_summary JSONB
+);
+
+CREATE TABLE IF NOT EXISTS credit_ledger_entries (
+    id                         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id                    UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+    delta_credits              INTEGER NOT NULL,
+    reason                     TEXT NOT NULL
+                                   CHECK (reason IN (
+                                       'starter_grant',
+                                       'stripe_pack_purchase',
+                                       'stripe_subscription_cycle',
+                                       'scan_problem_charge',
+                                       'voice_assist_charge',
+                                       'generate_pip_charge',
+                                       'brand_sponsored_rebate',
+                                       'admin_adjustment',
+                                       'refund_reversal'
+                                   )),
+    amount_cents               INTEGER,
+    stripe_checkout_session_id TEXT,
+    stripe_event_id            TEXT UNIQUE,
+    diagnostic_session_id      UUID REFERENCES diagnostic_sessions(id) ON DELETE SET NULL,
+    created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_credit_ledger_user ON credit_ledger_entries (user_id, created_at DESC);
+
+-- Verifiable B2B2C Deflection Proof Certificates (links QR/portal/SKU repairs to brands)
+CREATE TABLE IF NOT EXISTS brand_deflection_proofs (
+    id                     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id             UUID NOT NULL REFERENCES diagnostic_sessions(id) ON DELETE CASCADE,
+    brand_id               INTEGER REFERENCES brands(id) ON DELETE SET NULL,
+    product_sku            TEXT NOT NULL,
+    attribution_channel    TEXT NOT NULL
+                               CHECK (attribution_channel IN (
+                                   'brand_qr_box',
+                                   'support_portal_redirect',
+                                   'barcode_sku_scan',
+                                   'organic_camera'
+                               )),
+    attribution_ref        TEXT,
+    before_issue_summary   TEXT NOT NULL,
+    after_verified_state   TEXT NOT NULL,
+    verified_by_vision     BOOLEAN NOT NULL DEFAULT FALSE,
+    proof_sha256           TEXT NOT NULL UNIQUE,
+    sponsored_credits_used INTEGER NOT NULL DEFAULT 0,
+    bounty_usd             NUMERIC(10,2) NOT NULL DEFAULT 30.00,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_brand_deflection_proofs_brand ON brand_deflection_proofs (brand_id, created_at DESC);
+
 COMMIT;
+
 

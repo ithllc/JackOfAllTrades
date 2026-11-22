@@ -7,7 +7,7 @@
 
 ---
 
-## 1. End-to-End System Topology (ADR 001 – ADR 008)
+## 1. End-to-End System Topology (ADR 001 – ADR 009)
 
 ```mermaid
 flowchart TB
@@ -335,7 +335,48 @@ flowchart TB
 
 ---
 
-## 8. Architecture Decision Records & Engineering Mitigations
+## 8. Stripe Payments, Credit Ledger & B2B2C Proof-of-Deflection Scaffold (ADR 009)
+
+Operating a multimodal Gemini 4 repair assistant without frontend usage caps creates an unbounded inference cost liability ("blank check"), while B2B2C brand bounties require tamper-evident proof tying completed repairs to specific OEM SKUs and deflected support interactions. Jack of All Trades solves both through a **dual-rail hybrid monetization scaffold**:
+
+1. **Frontend Pay-As-You-Go Repair Credits (Web PWA + Stripe Hosted Checkout):**
+   - Because Jack of All Trades ships as an installable Web PWA, routing payments through **Stripe Hosted Checkout** avoids 15%–30% native app-store commissions (~2.9% + $0.30 Stripe fee) and eliminates subscription fatigue for episodic DIY users.
+   - New accounts receive `2` free starter credits (`DEFAULT_STARTER_CREDITS`), Demo Mode costs `0` credits (cached WAVs), `Scan Problem` and `Hold to Explain` cost `1` credit each, and on-demand 6-second PiP clips (`gemini-omni-1.2-flash`) cost `2` credits.
+   - Clients submit only a `packId` (`starter_10`, `homeowner_30`, `pro_pack_100`, or optional `pro_unlimited_monthly`) to `POST /api/billing/checkout-session`; the Express server resolves all prices and credit grants strictly from `BILLING_CREDIT_PACKS`.
+   - `POST /api/billing/webhook` verifies Stripe's `Stripe-Signature` HMAC-SHA256 header against exact raw request bytes (`crypto.timingSafeEqual`, 300s replay tolerance) and credits `user_credit_wallets` + `credit_ledger_entries` inside an atomic, idempotent PostgreSQL transaction deduplicated by `stripe_webhook_events(stripe_event_id)`.
+   - Controlled by `BILLING_ENFORCEMENT_MODE` (`scaffold` default → `enforced` returns HTTP `402 Payment Required` when credits reach `0`).
+2. **Backend B2B2C Verifiable Proof-of-Deflection (`brand_deflection_proofs`):**
+   - Connects repairs directly to OEMs via four attribution channels: **Signed QR on Box/Manual** (`brand_qr_box`), **Support / Return Portal Deflection Links** (`support_portal_redirect`), **UPC/Rating-Plate Barcode Scans** (`barcode_sku_scan`), and **Before/After Visual Verification Certificates** (`organic_camera`).
+   - Each verified repair generates a deterministic SHA-256 certificate digest (`buildDeflectionProofHash`) persisted in `brand_deflection_proofs`. Participating brands fund prepaid sponsored credit pools so their customers repair for free while the OEM receives auditable deflection receipts.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as End User (Web PWA)
+    participant API as Express Billing Proxy (server.ts)
+    participant Stripe as Stripe Hosted Checkout + Webhooks
+    participant SQL as Cloud SQL (PostgreSQL 16)
+    participant Brand as Partner Brand / OEM Portal
+
+    User->>API: POST /api/billing/checkout-session { packId: "homeowner_30" }
+    API->>API: Resolve authoritative price ($12.99 / 30 credits) from BILLING_CREDIT_PACKS
+    API->>Stripe: POST /v1/checkout/sessions (server secret key + metadata)
+    Stripe-->>User: Redirect to PCI-compliant Stripe Hosted Checkout
+    User->>Stripe: Completes payment (Card / Apple Pay / Google Pay on Web)
+    Stripe->>API: POST /api/billing/webhook (raw bytes + Stripe-Signature HMAC)
+    API->>API: verifyStripeWebhookSignature(rawBody, header, STRIPE_WEBHOOK_SECRET)
+    API->>SQL: BEGIN -> INSERT stripe_webhook_events (ON CONFLICT DO NOTHING) -> UPSERT user_credit_wallets + credit_ledger_entries -> COMMIT
+
+    opt Brand-Sponsored QR / Return-Portal Repair
+        User->>API: Scan signed Brand QR (?brand=ikea&sku=BILLY-80) & confirm fix
+        API->>SQL: Record brand_deflection_proofs (SHA-256 before/after proof + $30 bounty)
+        Brand-->>SQL: Audits verified deflection certificates & funds sponsored pool
+    end
+```
+
+---
+
+## 9. Architecture Decision Records & Engineering Mitigations
 
 | ID | Architectural Problem | Adopted Design | Verification Standard |
 | :--- | :--- | :--- | :--- |
@@ -347,8 +388,10 @@ flowchart TB
 | **ADR 006 / Break 2** | "Scale" hallucination & hidden AR overlays covered by tall bottom sheets | Pixel-ratio measurement prompt (`24.26 mm` US quarter, `85.6 mm` card, `20 mm` thumb) returning `estimatedPartSizeMm`, `scaleMeasurementNote`, `targetBox`, and `anchorBox`, rendered via `<SpatialRepairOverlay/>` with animated directional SVG arrows and a compact sheet + **View AR** toggle | `resolveScaleCalibration()`, `normalizeBoxToPct()`, `SpatialRepairOverlay.tsx` |
 | **ADR 007** | Admin Ontology stayed static unless operators manually inserted rows | Automatic Cloud SQL write-back (`recordLiveDiagnosisToCloudSql`) logging every live Scan & Voice session, embedding frames via `gemini-embedding-2`, auto-inserting newly discovered parts, plus in-camera **Done — This Fixed It!** (`POST /api/ontology/confirm-fix`) and **Wrong Part or Size?** (`POST /api/ontology/feedback`) | `ontologyMapper.test.ts` + live `/api/ontology/tree` PostgreSQL verification |
 | **ADR 008** | Clickable brand logo in end-user PWA exposed `/admin` directly to end users; dual-audience login needed a clean security foundation | Removed all in-app admin links and `?admin=1` triggers; isolated `/admin` to direct URL access; added RBAC role/policy contract (`authScaffold.ts`), salted `scrypt` + HMAC-SHA256 middleware (`serverAuth.ts`), in-memory React `AuthProvider`, Cloud SQL `app_users`/`auth_sessions` schema, and enforced-mode `<AdminLoginGate />` | Unit tests (`authScaffold.test.ts`) + DOM isolation check + `401`/`403` middleware verification |
+| **ADR 009** | Unbounded free AI inference creates a blank-check cost risk, and B2B2C brands need auditable proof of deflected calls/returns | Web PWA Stripe Hosted Checkout pay-as-you-go credit packs (`billingScaffold.ts`), raw-body HMAC webhook verification (`serverStripe.ts`), provider-agnostic Cloud SQL credit ledger (`user_credit_wallets`, `credit_ledger_entries`, `stripe_webhook_events`), and tamper-evident `brand_deflection_proofs` certificates | Unit tests (`stripeBilling.test.ts`) + `/api/billing/*` smoke verification |
 | **Hardest Input** | Water-smeared lens + chrome glare + spraying water under a kitchen sink | Automatic downgrade from WebRTC video to 3-shot high-contrast burst photography + voice instruction | QA Test Case 1 (3G throttling / visual noise fallback) |
 | **UX Accessibility** | Technical camera telemetry overwhelms non-technical DIY users | Full-screen **Magic Window** UI (`LiveCameraView.tsx`) with only Scan, Push-to-Talk, and Flashlight controls + first-visit interactive `<DemoMode/>` | Unit tests (`makerLensState.test.ts`) + browser verification |
+
 
 
 
